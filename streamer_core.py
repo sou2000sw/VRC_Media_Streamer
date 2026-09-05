@@ -115,6 +115,11 @@ DEFAULT_CONFIG = {
     "overlay_clock_video": False,
     "overlay_clock_position": "top-right",
     "playback_mode": "video",
+    "live_audio_mic_device": "",
+    "live_audio_loopback_device": "",
+    "live_audio_mic_volume": 1.0,
+    "live_audio_loopback_volume": 0.7,
+    "live_audio_bitrate_kbps": 192,
     "radio_mode": False,
     "radio_bg_source": "card",
     # ラジオの曲頭・曲尾フェード秒数（0で無効・最大5秒）: タスク17
@@ -319,6 +324,159 @@ def normalize_radio_crossfade(value):
     if seconds != seconds or seconds <= 0:  # NaN も無効扱い
         return 0.0
     return float(min(RADIO_CROSSFADE_MAX_SECONDS, seconds))
+
+
+# --------------------------------------------------------------------------
+# タスク22: PC音声（ループバック）＆マイク取り込み（dshow経路）
+# --------------------------------------------------------------------------
+
+_dshow_audio_devices_cache = (0.0, [])
+
+
+def is_loopback_candidate(name: str) -> bool:
+    """デバイス名がPC出力音（ループバック）取り込みに使えそうかを判定 (UIヒント用)"""
+    if not name:
+        return False
+    name_lower = str(name).lower()
+    keywords = [
+        "stereo mix",
+        "ステレオ ミキサー",
+        "ステレオミキサー",
+        "what u hear",
+        "voicemeeter out",
+        "virtual desktop audio",
+        "cable output",
+        "virtual-audio-capturer",
+        "loopback",
+        "wave out mix",
+    ]
+    return any(kw in name_lower for kw in keywords)
+
+
+def decode_dshow_bytes(raw_bytes: bytes) -> str:
+    """dshow出力バイト列を utf-8 -> cp932 -> utf-8 (replace) の順でデコード"""
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return raw_bytes.decode("cp932")
+        except Exception:
+            return raw_bytes.decode("utf-8", errors="replace")
+
+
+def parse_dshow_audio_devices_output(output_text: str) -> list[dict]:
+    """ffmpeg -list_devices true -f dshow の stderr テキストをパース"""
+    devices = []
+    current_dev = None
+    for line in output_text.splitlines():
+        m_audio = re.search(r'"([^"]+)"\s+\(audio\)', line)
+        m_video = re.search(r'"([^"]+)"\s+\(video\)', line)
+        m_alt = re.search(r'Alternative name\s+"([^"]+)"', line)
+
+        if m_audio:
+            name = m_audio.group(1)
+            current_dev = {
+                "name": name,
+                "alt": "",
+                "loopback_hint": is_loopback_candidate(name)
+            }
+            devices.append(current_dev)
+        elif m_video:
+            current_dev = None
+        elif m_alt and current_dev is not None:
+            current_dev["alt"] = m_alt.group(1)
+            current_dev = None
+    return devices
+
+
+def enumerate_dshow_audio_devices(timeout=8, use_cache=True):
+    """dshow 経由で音声入力デバイス一覧を列挙"""
+    global _dshow_audio_devices_cache
+    now = time.time()
+    if use_cache and (now - _dshow_audio_devices_cache[0] < 30):
+        return _dshow_audio_devices_cache[1]
+
+    cmd = [get_ffmpeg_cmd(), "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW
+        )
+        _, stderr_bytes = proc.communicate(timeout=timeout)
+        text = decode_dshow_bytes(stderr_bytes or b"")
+        devices = parse_dshow_audio_devices_output(text)
+        _dshow_audio_devices_cache = (now, devices)
+        return devices
+    except subprocess.TimeoutExpired:
+        log_print("[dshow] Device enumeration timed out")
+        if 'proc' in locals():
+            kill_proc(proc)
+        return []
+    except Exception as e:
+        log_print(f"[dshow] Device enumeration failed: {e}")
+        return []
+
+
+def build_dshow_audio_inputs(mic_device=None, loopback_device=None,
+                             mic_volume=1.0, loopback_volume=0.7,
+                             start_index=1):
+    """dshow音声入力のコマンド引数・フィルタ・マップラベルを構築する純粋関数"""
+    mic_dev = str(mic_device).strip() if mic_device else ""
+    loop_dev = str(loopback_device).strip() if loopback_device else ""
+
+    def _fmt_vol(v):
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            fv = 1.0
+        fv = max(0.0, min(2.0, fv))
+        fv = round(fv, 2)
+        return str(fv)
+
+    active = []
+    if mic_dev:
+        active.append(("mic", mic_dev, _fmt_vol(mic_volume)))
+    if loop_dev:
+        active.append(("loopback", loop_dev, _fmt_vol(loopback_volume)))
+
+    if not active:
+        return ([], None, None)
+
+    if len(active) == 1:
+        dev_type, dev_name, vol_str = active[0]
+        idx = start_index
+        input_args = [
+            "-f", "dshow",
+            "-thread_queue_size", "1024",
+            "-audio_buffer_size", "50",
+            "-i", f"audio={dev_name}"
+        ]
+        if vol_str == "1.0":
+            return (input_args, None, f"{idx}:a:0")
+        else:
+            return (input_args, f"[{idx}:a]volume={vol_str}[aout]", "[aout]")
+
+    # 2件（マイクを先、ループバックを後の順で固定）
+    mic_name, mic_vol_str = active[0][1], active[0][2]
+    loop_name, loop_vol_str = active[1][1], active[1][2]
+    i = start_index
+    j = start_index + 1
+
+    input_args = [
+        "-f", "dshow",
+        "-thread_queue_size", "1024",
+        "-audio_buffer_size", "50",
+        "-i", f"audio={mic_name}",
+        "-f", "dshow",
+        "-thread_queue_size", "1024",
+        "-audio_buffer_size", "50",
+        "-i", f"audio={loop_name}"
+    ]
+    audio_filter = f"[{i}:a]volume={mic_vol_str}[amic];[{j}:a]volume={loop_vol_str}[apc];[amic][apc]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
+    audio_map = "[aout]"
+    return (input_args, audio_filter, audio_map)
 
 
 def build_radio_audio_filter(crossfade_seconds, duration=0, seek_seconds=0,
@@ -1394,6 +1552,10 @@ class StreamerCore:
             "radio_mode": (self.get_playback_mode() == "radio"),
             "radio_bg_source": str(self.config.get("radio_bg_source", "standby")),
             "radio_crossfade_duration": self.get_radio_crossfade_duration(),
+            "live_audio_mic_device": str(self.config.get("live_audio_mic_device", "")),
+            "live_audio_loopback_device": str(self.config.get("live_audio_loopback_device", "")),
+            "live_audio_mic_volume": float(self.config.get("live_audio_mic_volume", 1.0)),
+            "live_audio_loopback_volume": float(self.config.get("live_audio_loopback_volume", 0.7)),
             "standby_mode": str(self.config.get("standby_mode", "image")),
             "standby_image_path": str(self.config.get("standby_image_path", "")),
             "has_prev": has_prev,
@@ -1411,17 +1573,17 @@ class StreamerCore:
         }
 
     def get_playback_mode(self):
-        """現在の再生モード ('video' | 'radio' | 'slideshow') を取得"""
+        """現在の再生モード ('video' | 'radio' | 'slideshow' | 'live') を取得"""
         mode = self.config.get("playback_mode")
-        if mode in ("video", "radio", "slideshow"):
+        if mode in ("video", "radio", "slideshow", "live"):
             return mode
         if self.config.get("radio_mode", False):
             return "radio"
         return "video"
 
     def set_playback_mode(self, mode: str):
-        """再生モードを設定 ('video' | 'radio' | 'slideshow')"""
-        if mode not in ("video", "radio", "slideshow"):
+        """再生モードを設定 ('video' | 'radio' | 'slideshow' | 'live')"""
+        if mode not in ("video", "radio", "slideshow", "live"):
             log_print(f"[Core] Invalid playback mode: {mode}")
             return self.get_playback_mode()
 
@@ -3340,6 +3502,129 @@ class StreamerCore:
                          args=(proc, stop_event), daemon=True).start()
         return stop_event
 
+    def set_live_audio_devices(self, mic_device=None, loopback_device=None,
+                               mic_volume=None, loopback_volume=None):
+        """PC音声/マイク取り込みデバイス・音量を設定"""
+        if mic_device is not None:
+            self.config["live_audio_mic_device"] = str(mic_device)
+        if loopback_device is not None:
+            self.config["live_audio_loopback_device"] = str(loopback_device)
+        if mic_volume is not None:
+            try:
+                v = float(mic_volume)
+                self.config["live_audio_mic_volume"] = max(0.0, min(2.0, v))
+            except (TypeError, ValueError):
+                pass
+        if loopback_volume is not None:
+            try:
+                v = float(loopback_volume)
+                self.config["live_audio_loopback_volume"] = max(0.0, min(2.0, v))
+            except (TypeError, ValueError):
+                pass
+        self.save_config()
+        self.request_stream_reload()
+        return {
+            "live_audio_mic_device": self.config.get("live_audio_mic_device", ""),
+            "live_audio_loopback_device": self.config.get("live_audio_loopback_device", ""),
+            "live_audio_mic_volume": self.config.get("live_audio_mic_volume", 1.0),
+            "live_audio_loopback_volume": self.config.get("live_audio_loopback_volume", 0.7),
+        }
+
+    def play_live_audio(self):
+        """PC音声・マイク（dshow経路）を静止画背景でHLS/RTMPライブ配信"""
+        mic_dev = str(self.config.get("live_audio_mic_device", "")).strip()
+        loop_dev = str(self.config.get("live_audio_loopback_device", "")).strip()
+        if not mic_dev and not loop_dev:
+            log_print("[Player] Live audio capture warning: No devices selected")
+            self.status = "error"
+            self.status_detail = "ライブ音声デバイスが未選択です"
+            return None
+
+        if not self.ensure_stream_sink():
+            self.status = "error"
+            self.status_detail = "FFmpeg Error"
+            return None
+
+        # 背景静止画。generate_standby_image() は描画に失敗しても例外を出さず
+        # 進むことがあるため、パスの実在をここで必ず確かめる。None を
+        # os.path.abspath() に渡すと TypeError で監視ループ側に飛ぶ。
+        bg_image_path = self.generate_standby_image()
+        if not bg_image_path or not os.path.exists(bg_image_path):
+            log_print(f"[Player] Live audio: standby image unavailable ({bg_image_path})")
+            self.status = "error"
+            self.status_detail = "Live audio: background image unavailable"
+            return None
+
+        has_clock = bool(self.config.get("overlay_clock_enabled", False) or self.config.get("overlay_clock_video", False))
+        clock_filter = get_clock_filter_for_config(self.config) if has_clock else None
+
+        mic_vol = self.config.get("live_audio_mic_volume", 1.0)
+        loop_vol = self.config.get("live_audio_loopback_volume", 0.7)
+
+        input_args, audio_filter, audio_map = build_dshow_audio_inputs(
+            mic_device=mic_dev,
+            loopback_device=loop_dev,
+            mic_volume=mic_vol,
+            loopback_volume=loop_vol,
+            start_index=1
+        )
+
+        cmd = [
+            get_ffmpeg_cmd(), "-re", "-loop", "1", "-i", os.path.abspath(bg_image_path)
+        ]
+        cmd.extend(input_args)
+
+        if audio_filter and (has_clock and clock_filter):
+            cmd.extend(["-filter_complex", f"[0:v]{clock_filter}[vout];{audio_filter}", "-map", "[vout]", "-map", audio_map])
+        elif audio_filter and not (has_clock and clock_filter):
+            cmd.extend(["-filter_complex", audio_filter, "-map", "0:v:0", "-map", audio_map])
+        elif not audio_filter and (has_clock and clock_filter):
+            cmd.extend(["-vf", clock_filter, "-map", "0:v:0", "-map", audio_map])
+        else:
+            cmd.extend(["-map", "0:v:0", "-map", audio_map])
+
+        bitrate_kbps = str(int(self.config.get("live_audio_bitrate_kbps", 192)))
+        cmd.extend([
+            *build_video_encoder_opts(
+                self.get_video_encoder(),
+                v_kbps=800, max_kbps=1000, buf_kbps=800,
+                h264_profile="baseline", sc_threshold_zero=True,
+                gop_frames=15, fps=5),
+            "-c:a", "aac",
+            "-b:a", f"{bitrate_kbps}k",
+            "-ar", "44100",
+            "-fflags", "+nobuffer+flush_packets",
+            "-flush_packets", "1",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-max_interleave_delta", "0",
+            *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"
+        ])
+
+        log_print(f"[Player] Encoder path=live_audio mic='{mic_dev}' loopback='{loop_dev}' mic_vol={mic_vol} loopback_vol={loop_vol} b:a={bitrate_kbps}k")
+
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0,
+                creationflags=CREATE_NO_WINDOW
+            )
+        except Exception as e:
+            log_print(f"[Player] Error starting live audio sender: {e}")
+            self.status = "error"
+            self.status_detail = f"Live audio sender error: {e}"
+            return None
+
+        with self.process_lock:
+            self.send_proc = proc
+
+        stop_event = threading.Event()
+        threading.Thread(target=self.relay_stream_data,
+                         args=(proc, self.current_stdin, stop_event, False), daemon=True).start()
+        threading.Thread(target=self.watch_send_proc,
+                         args=(proc, stop_event), daemon=True).start()
+        return stop_event
+
     def add_to_queue(self, url):
         """URL（動画または画像）またはローカルファイルパスを解析してキューに追加"""
         with self.queue_lock:
@@ -3712,7 +3997,7 @@ class StreamerCore:
                         final_img = self._draw_notice_banner(final_img, notice_text)
 
                     final_img.save(STANDBY_IMAGE_PATH, "PNG")
-                    return
+                    return STANDBY_IMAGE_PATH
                 except Exception as e:
                     log_print(f"[Core] Error rendering custom standby image ({target_image_path}): {e}")
 
@@ -3749,7 +4034,7 @@ class StreamerCore:
                 img.save(STANDBY_IMAGE_PATH, "PNG")
             except Exception as e:
                 log_print(f"[Core] Failed to save fallback standby image: {e}")
-            return
+            return STANDBY_IMAGE_PATH
 
         # ==================== QRコード & URL 案内画面モード ====================
         is_tunnel_ready = bool(self.tunnel_raw_url and "trycloudflare.com" in self.tunnel_raw_url)
@@ -3882,6 +4167,7 @@ class StreamerCore:
             img.save(STANDBY_IMAGE_PATH, "PNG")
         except Exception as e:
             log_print(f"[Core] Failed to save standby image: {e}")
+        return STANDBY_IMAGE_PATH
 
     def play_standby_loop(self, empty_slideshow=False):
         """キューが空、またはスライドショー写真未登録時に待機画面（QRコード・URL付き静止画）をHLS配信"""
@@ -4010,6 +4296,80 @@ class StreamerCore:
         while self.is_running:
             try:
                 current_mode = self.get_playback_mode()
+
+                # ==================== モード0: ライブ音声取り込み ====================
+                if current_mode == "live":
+                    self.current_video = {"title": "ライブ音声取り込み", "url": "", "duration": 0, "type": "live_audio"}
+                    self.skip_event.clear()
+                    self.video_done_event.clear()
+                    self.status = "streaming"
+                    self.status_detail = "Live audio capture"
+
+                    # ★ライブモードには「曲の終わり」が無いので、失敗しても
+                    # すぐ同じ分岐へ戻ってくる。デバイスが掴めない状態
+                    # （抜かれた・他アプリが排他で握っている）だと ffmpeg が
+                    # 即死し、0.1秒間隔でプロセスを生成し続ける暴走になる。
+                    # 短命で終わった回数に応じて待ち時間を伸ばす。
+                    fail_streak = getattr(self, "_live_audio_fail_streak", 0)
+                    live_started_at = time.time()
+
+                    stop_event = self.play_live_audio()
+                    if stop_event is None:
+                        self._live_audio_fail_streak = min(fail_streak + 1, 10)
+                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                        continue
+
+                    while self.is_running and not self.skip_event.is_set():
+                        if self.get_playback_mode() != "live":
+                            break
+
+                        if self._reload_due():
+                            self.reload_stream_event.clear()
+                            stop_event.set()
+                            with self.process_lock:
+                                if self.send_proc:
+                                    kill_proc(self.send_proc)
+                                self.send_proc = None
+                            time.sleep(0.2)
+                            break
+
+                        with self.process_lock:
+                            proc = self.send_proc
+                            h_proc = self.hls_proc
+
+                        if proc and proc.poll() is not None:
+                            log_print(f"[Monitor] Live audio sender exited (exit={proc.returncode}).")
+                            self.status = "error"
+                            self.status_detail = "Live audio sender exited (check capture device)"
+                            break
+
+                        if h_proc and h_proc.poll() is not None:
+                            log_print("[Monitor] Receiver FFmpeg crashed or exited during live audio.")
+                            self.status = "error"
+                            self.status_detail = "Offline (Receiver Error)"
+                            break
+
+                        time.sleep(0.2)
+
+                    stop_event.set()
+                    with self.process_lock:
+                        if self.send_proc:
+                            kill_proc(self.send_proc)
+                        self.send_proc = None
+
+                    self.accumulated_pts += self.last_stream_duration + 0.1
+                    if self.skip_event.is_set():
+                        self.skip_event.clear()
+                    self.video_done_event.clear()
+
+                    # 3秒未満で終わった＝掴めていない。連続したぶんだけ待つ。
+                    if (time.time() - live_started_at) < 3.0:
+                        self._live_audio_fail_streak = min(fail_streak + 1, 10)
+                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                    else:
+                        self._live_audio_fail_streak = 0
+                        time.sleep(0.1)
+                    continue
 
                 # ==================== モード1: 写真スライドショー ====================
                 if current_mode == "slideshow":

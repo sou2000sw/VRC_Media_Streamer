@@ -323,6 +323,12 @@
                                     <i class="ri-slideshow-line text-xs"></i>
                                     <span>スライドショー</span>
                                 </button>
+                                <!-- ライブ音声取り込み（タスク22）。取り込みデバイスはホストPCにしか無く、
+                                     設定もlocalhost限定なので、ゲストにはボタンごと出さない。 -->
+                                <button id="modeLiveBtn" onclick="selectAddMode('live')" class="hidden px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition items-center gap-1">
+                                    <i class="ri-mic-line text-xs"></i>
+                                    <span>ライブ音声</span>
+                                </button>
                             </div>
                         </div>
 
@@ -717,6 +723,46 @@
                         </div>
                         <p class="text-[11px] text-zinc-500">※ラジオモードで曲の頭をフェードイン、終わりをフェードアウトさせ、変わり目のブツ切りをなくします。前後の曲を重ねる方式ではありません。</p>
                     </div>
+                </div>
+
+                <!-- ライブ音声取り込み（タスク22）。デバイス列挙も設定変更も localhost 限定なので、
+                     ゲストには 403 になる。押せるのに保存できないUIを出さないため、カードごと隠す。 -->
+                <div id="liveAudioCard" class="hidden bg-card border border-border rounded-lg p-4 flex-col gap-4">
+                    <div class="flex items-center gap-2 pb-2 border-b border-border">
+                        <i class="ri-mic-line text-emerald-400 text-base"></i>
+                        <h3 class="font-semibold text-xs text-zinc-200">ライブ音声取り込み（このPCからのみ）</h3>
+                        <button onclick="loadAudioDevices(true)" class="ml-auto flex items-center gap-1 px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 rounded text-[11px] transition" title="接続機器を再スキャンします">
+                            <i class="ri-refresh-line"></i>
+                            <span>デバイス再スキャン</span>
+                        </button>
+                    </div>
+
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">マイク入力（実況・MC）</label>
+                        <select id="liveAudioMicDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="">（使用しない）</option>
+                        </select>
+                        <div class="flex items-center gap-2">
+                            <input type="range" id="liveAudioMicVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                            <span id="liveAudioMicVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">PC出力音声（ループバック / BGM・ゲーム音）</label>
+                        <select id="liveAudioLoopbackDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="">（使用しない）</option>
+                        </select>
+                        <div class="flex items-center gap-2">
+                            <input type="range" id="liveAudioLoopbackVolume" min="0" max="2" step="0.05" value="0.7" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                            <span id="liveAudioLoopbackVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">0.70</span>
+                        </div>
+                    </div>
+
+                    <p id="liveAudioLoopbackHint" class="hidden text-[11px] text-amber-400/90">
+                        ⚠️ このPCにはループバック録音に使えるデバイスが見つかりませんでした。PC出力音声を配信するには、サウンドカードの「ステレオ ミキサー / What U Hear」を有効にするか、VB-CABLE / VB-Audio Voicemeeter などの仮想オーディオデバイスの導入が必要です。マイク入力だけなら追加導入なしで使えます。
+                    </p>
+                    <p class="text-[11px] text-zinc-500">※両方選ぶとリアルタイム合成（amix）されます。設定を変えると配信は自動で再起動します。音声のみの生配信はHLSだと9〜12秒遅れるため、会話用途では配信先をTopazChatにしてください。</p>
                 </div>
 
                 <!-- ホスト専用設定: ホストPC(localhost)からのみ表示・変更できる。
@@ -1515,6 +1561,23 @@
             const btnShareQr = document.getElementById('btnGoShareQr');
             if (btnShareQr) btnShareQr.classList.toggle('hidden', !showInfo);
 
+            // ライブ音声（タスク22）: 取り込みデバイスはホストPCにしか存在せず、
+            // 列挙も設定変更も localhost 限定。ゲストにはモードボタンごと見せない。
+            const btnModeLive = document.getElementById('modeLiveBtn');
+            if (btnModeLive) {
+                btnModeLive.classList.toggle('hidden', !isHost);
+                btnModeLive.classList.toggle('flex', isHost);
+            }
+            if (isHost && !liveAudioDevicesLoaded) {
+                loadAudioDevices(false);
+            } else if (!isHost) {
+                const liveCard = document.getElementById('liveAudioCard');
+                if (liveCard) {
+                    liveCard.classList.add('hidden');
+                    liveCard.classList.remove('flex');
+                }
+            }
+
             // 表示中のタブが隠れた場合はプレイヤーへ戻す（空白の画面が残らないように）
             if ((!showSettings && activeTabId === 'settings') || (!showInfo && activeTabId === 'info')) {
                 switchTab('player');
@@ -1858,9 +1921,18 @@
             const inactiveCls = "px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition flex items-center gap-1";
             const activeCls = "px-2 py-0.5 rounded bg-zinc-800 text-primary font-medium transition flex items-center gap-1";
 
+            const lBtn = document.getElementById('modeLiveBtn');
+
             if (vBtn) vBtn.className = (mode === 'video') ? activeCls : inactiveCls;
             if (rBtn) rBtn.className = (mode === 'radio') ? activeCls : inactiveCls;
             if (sBtn) sBtn.className = (mode === 'slideshow') ? activeCls : inactiveCls;
+            // ライブボタンだけは表示制御が別（ホスト限定）なので、hidden を落とさないように
+            // className を丸ごと差し替えず、状態クラスだけを付け替える。
+            if (lBtn) {
+                const wasHidden = lBtn.classList.contains('hidden');
+                lBtn.className = (mode === 'live') ? activeCls : inactiveCls;
+                if (wasHidden) lBtn.classList.add('hidden');
+            }
 
             if (desc) {
                 if (mode === 'video') {
@@ -1869,6 +1941,8 @@
                     desc.innerText = "📻 BGMラジオ: 音声のみ抽出しアルバムアート/スライドショーと合成（帯域約300kbps・超軽量）";
                 } else if (mode === 'slideshow') {
                     desc.innerText = "🖼️ スライドショーモード: 写真プール内の写真を自動巡回配信（動画キューとは完全分離）";
+                } else if (mode === 'live') {
+                    desc.innerText = "🎙️ ライブ音声取り込み: このPCのマイク/出力音声を待機画面に載せて配信（キューは消費しません）";
                 }
             }
         }
@@ -1953,6 +2027,7 @@
             guestCanSeeShareInfo = !!(data.permissions && data.permissions.allow_web_share_info === true);
             applyRemoteTabVisibility(isLocal);
             updateActiveEncoderLabel(data);
+            syncLiveAudioFromStatus(data);
             maybeShowSetupModal(data, isLocal);
 
             // Header Action buttons visibility
@@ -2753,6 +2828,142 @@
             } catch (e) {
                 showToast('変更に失敗しました', 'danger');
             }
+        }
+
+        // ===== ライブ音声取り込み（タスク22） =====
+        // デバイス列挙は ffmpeg のプロセス起動を伴い約1秒かかる（サーバー側で30秒キャッシュ）。
+        // ステータスポーリングから毎回叩かないよう、呼ぶのは初回とユーザー操作時だけにする。
+        let liveAudioDevicesLoaded = false;
+        let liveAudioUserChangedAt = 0;
+
+        function updateLiveAudioVolumeLabels() {
+            const mic = document.getElementById('liveAudioMicVolume');
+            const loop = document.getElementById('liveAudioLoopbackVolume');
+            const micLabel = document.getElementById('liveAudioMicVolumeLabel');
+            const loopLabel = document.getElementById('liveAudioLoopbackVolumeLabel');
+            if (mic && micLabel) micLabel.innerText = Number(mic.value).toFixed(2);
+            if (loop && loopLabel) loopLabel.innerText = Number(loop.value).toFixed(2);
+        }
+
+        async function loadAudioDevices(force = false) {
+            const card = document.getElementById('liveAudioCard');
+            if (!card) return;
+            if (!isLocalEnvironment()) {
+                card.classList.add('hidden');
+                card.classList.remove('flex');
+                return;
+            }
+            const micSel = document.getElementById('liveAudioMicDevice');
+            const loopSel = document.getElementById('liveAudioLoopbackDevice');
+            if (!micSel || !loopSel) return;
+
+            try {
+                const url = `${apiBase}/api/audio_devices${force ? '?refresh=1' : ''}`;
+                const res = await fetch(url, { cache: 'no-store' });
+                if (!res.ok) {
+                    // 403 はゲスト。カードごと隠す（押せるのに保存できない状態を作らない）。
+                    card.classList.add('hidden');
+                    card.classList.remove('flex');
+                    return;
+                }
+                const data = await res.json();
+                const devices = Array.isArray(data.devices) ? data.devices : [];
+
+                // 選択中の値は列挙し直しても保持する（配信中に勝手に外れないように）。
+                const keepMic = micSel.value;
+                const keepLoop = loopSel.value;
+
+                const fill = (sel, keep, loopbackOnlyHint) => {
+                    sel.innerHTML = '';
+                    const none = document.createElement('option');
+                    none.value = '';
+                    none.textContent = '（使用しない）';
+                    sel.appendChild(none);
+                    devices.forEach(d => {
+                        const opt = document.createElement('option');
+                        opt.value = d.name;
+                        opt.textContent = (loopbackOnlyHint && d.loopback_hint) ? `${d.name}  ★ループバック候補` : d.name;
+                        sel.appendChild(opt);
+                    });
+                    // 既に選ばれているデバイスが今回の列挙に無い場合（抜かれた等）でも、
+                    // 選択が黙って消えると原因が分からなくなるので、項目を復活させて残す。
+                    if (keep && !devices.some(d => d.name === keep)) {
+                        const missing = document.createElement('option');
+                        missing.value = keep;
+                        missing.textContent = `${keep}  （未検出）`;
+                        sel.appendChild(missing);
+                    }
+                    sel.value = keep || '';
+                };
+
+                fill(micSel, keepMic, false);
+                fill(loopSel, keepLoop, true);
+
+                const hint = document.getElementById('liveAudioLoopbackHint');
+                if (hint) {
+                    const hasLoopback = devices.some(d => d.loopback_hint);
+                    hint.classList.toggle('hidden', hasLoopback || devices.length === 0);
+                }
+
+                liveAudioDevicesLoaded = true;
+                card.classList.remove('hidden');
+                card.classList.add('flex');
+                if (force) showToast(`音声デバイスを${devices.length}件検出しました`, 'info');
+            } catch (e) {
+                card.classList.add('hidden');
+                card.classList.remove('flex');
+            }
+        }
+
+        async function applyLiveAudioSettings() {
+            liveAudioUserChangedAt = Date.now();
+            updateLiveAudioVolumeLabels();
+            const micSel = document.getElementById('liveAudioMicDevice');
+            const loopSel = document.getElementById('liveAudioLoopbackDevice');
+            const micVol = document.getElementById('liveAudioMicVolume');
+            const loopVol = document.getElementById('liveAudioLoopbackVolume');
+            if (!micSel || !loopSel || !micVol || !loopVol) return;
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'set_live_audio',
+                        mic_device: micSel.value,
+                        loopback_device: loopSel.value,
+                        mic_volume: Number(micVol.value),
+                        loopback_volume: Number(loopVol.value)
+                    })
+                });
+                if (res.ok) {
+                    showToast('ライブ音声設定を保存しました', 'success');
+                    checkServerHealth(true);
+                } else {
+                    showToast('ライブ音声設定の保存に失敗しました', 'danger');
+                }
+            } catch (e) {
+                showToast('ライブ音声設定の保存に失敗しました', 'danger');
+            }
+        }
+
+        // サーバー側の値をUIへ反映。ユーザーが今まさに触っている最中は上書きしない
+        // （スライダーを動かしている途中でポーリングに値を戻される事故を防ぐ）。
+        function syncLiveAudioFromStatus(data) {
+            if (!data) return;
+            if (Date.now() - liveAudioUserChangedAt < 4000) return;
+            const micSel = document.getElementById('liveAudioMicDevice');
+            const loopSel = document.getElementById('liveAudioLoopbackDevice');
+            const micVol = document.getElementById('liveAudioMicVolume');
+            const loopVol = document.getElementById('liveAudioLoopbackVolume');
+            if (micSel && typeof data.live_audio_mic_device === 'string' && liveAudioDevicesLoaded) {
+                if (micSel.value !== data.live_audio_mic_device) micSel.value = data.live_audio_mic_device;
+            }
+            if (loopSel && typeof data.live_audio_loopback_device === 'string' && liveAudioDevicesLoaded) {
+                if (loopSel.value !== data.live_audio_loopback_device) loopSel.value = data.live_audio_loopback_device;
+            }
+            if (micVol && typeof data.live_audio_mic_volume === 'number') micVol.value = data.live_audio_mic_volume;
+            if (loopVol && typeof data.live_audio_loopback_volume === 'number') loopVol.value = data.live_audio_loopback_volume;
+            updateLiveAudioVolumeLabels();
         }
 
         async function changeDuration(sec) {

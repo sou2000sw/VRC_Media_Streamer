@@ -29,7 +29,7 @@
 | **19** | 🛠️ CLI | **CLI 引数・環境設定オーバーライド機構の総点検・堅牢化** (CLI Overrides Overhaul) | **v2.9.0** | 🟢 **実装完了 ✅** |
 | **20** | 🌐 UI/権限 | **通常ブラウザ利用時のサーバー操作ボタン（再起動・起動）非表示化** (Button Visibility) | v2.6.0 | 🟢 **実装完了 ✅** |
 | **21** | 🛡️ Web制御 | **Webリモコン機能の無効化・ホスト専用スタンドアロンモード** (Disable Web Remote / Host-Only Mode) | develop | 🟢 **実装完了 ✅** |
-| **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | 未定 | 🔵 **検討中 📋** |
+| **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | develop | 🟡 **実装完了・VRC実機未確認** |
 | **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | 未定 | 🔵 **検討中 📋** |
 | **24** | 🎤 参加型 | **Webリモコンからの参加型カラオケ・楽器セッション機能** (Remote Karaoke & Session) | 未定 | 🔵 **検討中 📋** |
 
@@ -833,6 +833,101 @@ WebリモコンUI（`ui/index.html`）を通常のブラウザ（Chrome / Edge �
 ### 検討課題・留意点
 - **デバイス名の動的取得**: ホストPCに接続されているマイク・スピーカーのデバイス一覧を列挙（`ffmpeg -list_devices true -f dshow -i dummy` 等）し、GUIで選択できる仕組みが必要。
 - **TopazChat（低遅延）との併用**: 音声のみの生配信ではバッファ遅延（HLSの9〜12秒）が会話のボトルネックになるため、TopazChat（RTSP 1〜2秒）との併用が実用的。
+
+### 実装記録（2026-09-06 / ブランチ `feature/task22-audio-capture`）
+
+#### ★実測でひっくり返った設計前提（2026-09-06）
+
+上の「技術方式と実装設計」に事実誤認が2件あった。同梱 ffmpeg 8.1.2-full (gyan.dev) で実測して判明。
+
+1. **`-f wasapi` というデマクサは存在しない。** `ffmpeg -devices` で使える音声入力は
+   `dshow` と `openal` のみ。WASAPI ループバックを使いたければ ffmpeg 単体では不可能で、
+   Python 側（`pyaudiowpatch` 等）で掴んで PCM を stdin へ流す構成になる。**採用せず。**
+2. **「仮想オーディオミキサー不要でデスクトップ音声が録れる」も成立しない。**
+   開発機の `-list_devices` 実測では汎用の `Stereo Mix` も `virtual-audio-capturer` も存在せず、
+   ループバック相当は `What U Hear (Sound Blaster X5)`（ハード固有）、
+   `マイク (Virtual Desktop Audio)`、`Voicemeeter Out A1〜B3`（VB-Audio）のみだった。
+   dshow でPC出力音を録るには、ハード固有機能か第三者製仮想デバイスへの依存が必須。
+
+→ **方式は dshow 一本に確定。** 新規の pip 依存は追加していない。
+
+#### タスク23（画面共有）と地続きにするための構造
+
+タスク23は `ddagrab`/`gdigrab`（どちらも ffmpeg ネイティブ入力。同梱 ffmpeg に存在を確認済み）で
+「1本の ffmpeg にライブ映像入力とライブ音声入力を並べる」形になる。音声も dshow なら `-i` が1本増える
+だけで、A/V同期は ffmpeg 側のタイムスタンプが面倒を見る。Python PCM 経路を選ぶと同期・ドリフト・
+アンダーランを自前で持つことになり、タスク23で作り直しになるため避けた。
+
+そのため音声入力の組み立ては `build_dshow_audio_inputs()`（`self` に触らない純粋関数）へ切り出し、
+`play_live_audio()` は「映像＝静止画」という一事例として実装している。タスク23は映像ソースを
+差し替えるだけで済む。
+
+#### 実装したもの
+
+- `enumerate_dshow_audio_devices()` / `parse_dshow_audio_devices_output()` / `is_loopback_candidate()`
+- `build_dshow_audio_inputs()` — 0/1/2デバイス、`volume` と `amix=inputs=2` の組み立て
+- `StreamerCore.play_live_audio()` / `set_live_audio_devices()`、再生モード `"live"` の追加
+- `queue_monitor_loop` の「モード0: ライブ音声取り込み」分岐（キューを消費しない）
+- `GET /api/audio_devices`（localhost限定）、`POST /api/control` の `set_live_audio`（localhost限定）
+- **UI（`ui/index.html`）**: 再生モードピルに「ライブ音声」を追加、設定タブに
+  「ライブ音声取り込み」カード（マイク／ループバックのデバイス選択・音量スライダー2本・
+  デバイス再スキャン）。どちらもホストPC（localhost）からのみ表示する。
+  ★`plugin/ui/index.html` は `ui/index.html` と**バイト一致**していなければ
+  `test_host_only_mode.py::test_plugin_ui_is_in_sync` が落ちる。UIを触ったら必ずコピーすること。
+- `test_live_audio.py`（8ケース）
+
+#### ★踏み抜くと分かりにくい罠（実装時に潰したもの）
+
+- **`-vf` と `-filter_complex` は併用できない。** 時計オーバーレイ有効＋`amix` 有効のとき、
+  時計フィルタを `[0:v]<clock>[vout]` として同じ `-filter_complex` に統合しないと起動しない。
+  4通りの分岐すべてに回帰テストを置いた。
+- **`-shortest` を付けてはいけない。** ライブ入力に終端が無いため。
+- **`-max_interleave_delta 0` は必須。** ライブ入力2本は必ずドリフトし、既定の10秒を超えると
+  受信側HLS multiplexer がセグメント出力を止める（タスク17で実際に起きた事故と同じ経路）。
+- **`relay_stream_data` は `is_paced=False`。** 実時間駆動なのでペーシングを掛けない。
+- **`-thread_queue_size 1024` と `-audio_buffer_size 50` を各 dshow 入力に付ける。**
+  前者はライブ入力のフレーム落ち対策、後者は会話用途の遅延削減（ミリ秒）。
+- **デバイス名は日本語で返ってくる。** `-list_devices` の stderr は bytes で受け、
+  utf-8 → cp932 → replace の順でフォールバックする。`text=True` で Popen すると壊れる。
+- **ffmpeg 8.x は列挙結果の各行に `[in#0 @ 000001c2760f36c0] ` を前置する。** 行頭一致の
+  正規表現を書くと1件も取れない。
+- **`-list_devices` は必ず非ゼロ終了する**（最後に `Error opening input file dummy.`）。
+  returncode で成否を判定してはいけない。
+- **ライブモードには「曲の終わり」が無い。** デバイスを掴めないと ffmpeg が即死して同じ分岐へ
+  すぐ戻るため、短命終了（3秒未満）を数えて待ち時間を伸ばす後退（最大15秒）を入れている。
+  これが無いとプロセス生成の暴走になる。
+
+#### 実機スモークテスト（2026-09-06）
+
+実デバイス2本（`Microphone (3- Razer Seiren V3 Mini)` + `What U Hear (Sound Blaster X5)`）に対し、
+時計オーバーレイ＋`amix` を有効にした本番同等のコマンドを `-t 3 -f null -` で実行し、
+returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイスが開き、`drawtext` と `amix` が
+同一 `-filter_complex` 内で正しく合成されることを実測で確認済み。
+
+なお dshow の音声入力はデバイス稼働時間由来の巨大な開始タイムスタンプ（実測 `start 150410.02`）を
+返すが、`_ts_offset_opts()` は `-output_ts_offset` のみで `-copyts` を使わないため影響しない。
+
+#### ホストPCでの通し確認（2026-09-06）
+
+アプリを `--no-tunnel --port 8123` で起動し、UIから実際に操作して確認した。
+
+- `GET /api/audio_devices` が実機で17件を返し、日本語デバイス名が壊れず、
+  ループバック候補の判定も正しいことを確認。
+- 設定カードにデバイス18項目（「使用しない」含む）が並び、ループバック候補に
+  ★マークが付くことをDOM上で確認。
+- `set_live_audio` → `set_playback_mode: live` の順に叩き、
+  `status=streaming` / `status_detail=Live audio capture` になり、
+  HLSセグメントが生成され続けることを確認。
+- 生成された `seg_00015.ts` を `ffprobe` にかけ、
+  h264 + **aac 44100Hz stereo** の2ストリームが実際に入っていることを確認。
+
+→ ホスト側の経路は通し確認済み。**VRChatワールド内での視聴確認だけが未実施。**
+
+#### 未実装・引き続き必要なもの
+
+- **VRChat実機での視聴確認**（ホスト側の送出までは確認済み。ワールド内での再生は未確認）
+- **TopazChat併用時の実遅延の実測**（HLSの9〜12秒では会話が成立しないため、数値を取って記録する）
+- 背景は現状 待機画面の静止画のみ。ラジオカード背景・スライドショー背景は未対応。
 
 ---
 
