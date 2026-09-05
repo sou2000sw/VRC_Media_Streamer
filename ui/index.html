@@ -703,6 +703,22 @@
                     </div>
                 </div>
 
+                <div class="bg-card border border-border rounded-lg p-4 flex flex-col gap-4">
+                    <div class="flex items-center gap-2 pb-2 border-b border-border">
+                        <i class="ri-radio-2-line text-amber-400 text-base"></i>
+                        <h3 class="font-semibold text-xs text-zinc-200">ラジオ / BGM 設定</h3>
+                    </div>
+
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">曲間フェード秒数</label>
+                        <div class="flex items-center gap-2">
+                            <input type="number" id="settingRadioCrossfade" min="0" max="5" step="1" value="3" onchange="updateSettings()" class="w-24 bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary font-mono">
+                            <span class="text-xs text-zinc-400">秒（0で無効）</span>
+                        </div>
+                        <p class="text-[11px] text-zinc-500">※ラジオモードで曲の頭をフェードイン、終わりをフェードアウトさせ、変わり目のブツ切りをなくします。前後の曲を重ねる方式ではありません。</p>
+                    </div>
+                </div>
+
                 <!-- ホスト専用設定: ホストPC(localhost)からのみ表示・変更できる。
                      ゲストのブラウザに出すと「押せるのに403で保存できない」ので、UIごと隠す。 -->
                 <div id="hostSettingsCard" class="hidden bg-card border border-border rounded-lg p-4 flex-col gap-4">
@@ -2147,6 +2163,11 @@
                 const advEl = document.getElementById('settingImageAutoAdvance');
                 if (advEl) advEl.checked = data.image_auto_advance;
             }
+            if (data.radio_crossfade_duration !== undefined) {
+                const fadeEl = document.getElementById('settingRadioCrossfade');
+                // 入力中の値を毎ポーリングで奪わない（他の設定項目と同じ扱い）
+                if (fadeEl && document.activeElement !== fadeEl) fadeEl.value = data.radio_crossfade_duration;
+            }
 
             // Destination tab sync
             const dest = data.destination || {};
@@ -2922,6 +2943,9 @@
             const qrMode = document.getElementById('settingQrMode').value;
             const clockOverlay = document.getElementById('settingClockOverlay') ? document.getElementById('settingClockOverlay').checked : false;
             const duration = parseInt(document.getElementById('settingImageDuration').value) || 15;
+            let radioCrossfade = parseFloat(document.getElementById('settingRadioCrossfade')?.value);
+            if (!isFinite(radioCrossfade) || radioCrossfade < 0) radioCrossfade = 0;
+            if (radioCrossfade > 5) radioCrossfade = 5;
             const autoAdvance = document.getElementById('settingImageAutoAdvance').checked;
 
             const outputModeEl = document.getElementById('settingOutputMode');
@@ -2957,6 +2981,7 @@
                 overlay_clock_video: clockOverlay,
                 image_display_duration: duration,
                 image_auto_advance: autoAdvance,
+                radio_crossfade_duration: radioCrossfade,
                 output_mode: outputMode,
                 rtmp_video_bitrate_kbps: vBitrate,
                 rtmp_audio_bitrate_kbps: aBitrate,

@@ -117,6 +117,8 @@ DEFAULT_CONFIG = {
     "playback_mode": "video",
     "radio_mode": False,
     "radio_bg_source": "card",
+    # ラジオの曲頭・曲尾フェード秒数（0で無効・最大5秒）: タスク17
+    "radio_crossfade_duration": 3,
     "standby_mode": "image",
     "standby_image_path": "",
     "web_password": "",
@@ -285,6 +287,77 @@ def get_keyframe_opts(segment_seconds):
     """
     seg = max(1, int(segment_seconds or 3))
     return ["-force_key_frames", f"expr:gte(t,n_forced*{seg})"]
+
+
+# =============================================================================
+# ラジオモードの曲間フェード（タスク17）
+# =============================================================================
+# 曲の変わり目のブツ切りを消すための曲頭フェードイン／曲尾フェードアウト。
+#
+# ★「重ねる」クロスフェードは現構造では作れない。送出は 1曲 = 1本の送信FFmpegで、
+#   永続シンクの pipe:0 へ MPEG-TS を流し込んでいる（play_radio / relay_stream_data）。
+#   2本を同時に同じ pipe へ流せば多重化が壊れるため、前曲末尾と次曲頭を
+#   オーバーラップさせるには1本のFFmpegの中で作るしかなく、送出構造の再設計を伴う。
+#
+# 重ねなくても目的はほぼ達する。曲間に空く無音は 0.1 秒程度しかない:
+# 次曲のPTSは accumulated_pts から続くので、プロセス起動やキュー処理にかかった
+# 実時間はストリームの時間軸には現れない（耳に付いていたのは波形の断ち切りの方）。
+RADIO_CROSSFADE_MAX_SECONDS = 5
+
+# これ未満のフェードは掛けない。短い曲に長いフェードを掛けると
+# 「終始音量が動いていて落ち着かない」音になるため、曲長の1/4を上限に縮めたうえで、
+# 縮んだ結果が短すぎるならフェード自体をやめる。
+_RADIO_FADE_MIN_SECONDS = 0.5
+
+
+def normalize_radio_crossfade(value):
+    """設定値を 0〜5 秒へ丸める。数値でない値・負値は 0（無効）とみなす。"""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if seconds != seconds or seconds <= 0:  # NaN も無効扱い
+        return 0.0
+    return float(min(RADIO_CROSSFADE_MAX_SECONDS, seconds))
+
+
+def build_radio_audio_filter(crossfade_seconds, duration=0, seek_seconds=0,
+                             base="aresample=async=1"):
+    """ラジオ送出の -af 文字列を組み立てる。
+
+    seek_seconds > 0 は「設定変更のホットリロードで曲の途中から張り直した」場合。
+    ここでフェードインを掛けると、設定を保存するたびに再生中の曲の音量が
+    一度落ちて上がる（利用者には原因の分からない音量ゆらぎに見える）ので掛けない。
+
+    duration が 0（長さ不明）の曲にはフェードアウトを掛けられない。開始位置が
+    決まらないうえ、-shortest で入力が尽きる瞬間も事前には読めないため。
+    """
+    filters = [base] if base else []
+
+    fade = normalize_radio_crossfade(crossfade_seconds)
+    try:
+        total = max(0.0, float(duration or 0))
+    except (TypeError, ValueError):
+        total = 0.0
+    try:
+        seek = max(0.0, float(seek_seconds or 0))
+    except (TypeError, ValueError):
+        seek = 0.0
+
+    if fade > 0 and total > 0:
+        fade = min(fade, total / 4.0)
+    if fade < _RADIO_FADE_MIN_SECONDS:
+        return ",".join(filters)
+
+    if seek <= 0:
+        filters.append(f"afade=t=in:st=0:d={fade:g}")
+
+    if total > 0:
+        start = total - seek - fade
+        if start > 0:
+            filters.append(f"afade=t=out:st={start:.3f}:d={fade:g}")
+
+    return ",".join(filters)
 
 
 # =============================================================================
@@ -1320,6 +1393,7 @@ class StreamerCore:
             "photo_count": len(self.get_photos()),
             "radio_mode": (self.get_playback_mode() == "radio"),
             "radio_bg_source": str(self.config.get("radio_bg_source", "standby")),
+            "radio_crossfade_duration": self.get_radio_crossfade_duration(),
             "standby_mode": str(self.config.get("standby_mode", "image")),
             "standby_image_path": str(self.config.get("standby_image_path", "")),
             "has_prev": has_prev,
@@ -1381,6 +1455,10 @@ class StreamerCore:
     def set_radio_mode(self, enabled: bool):
         mode = "radio" if enabled else "video"
         return (self.set_playback_mode(mode) == "radio")
+
+    def get_radio_crossfade_duration(self):
+        """ラジオの曲頭・曲尾フェード秒数。0 なら掛けない（タスク17）。"""
+        return normalize_radio_crossfade(self.config.get("radio_crossfade_duration", 0))
 
     def set_radio_bg_source(self, source: str):
         if source in ("card", "standby", "slideshow"):
@@ -2680,9 +2758,17 @@ class StreamerCore:
         # ★送出経路ごとに画質が大きく違う（ラジオ200k / 写真1500k / 動画2500k）。
         # VRC側で「これだけ汚い」と感じたとき、どの経路を通ったのかが
         # 分からないと切り分けができないため、必ず名前とビットレートを残す。
+        # 曲間フェード（タスク17）。ホットリロードでの復帰(seek>0)では
+        # フェードインを掛けない ＝ 設定保存のたびに音量が揺れるのを防ぐ。
+        radio_af = build_radio_audio_filter(
+            self.get_radio_crossfade_duration(),
+            duration=duration,
+            seek_seconds=seek_seconds,
+        )
         log_print(
             f"[Player] Encoder path=radio 1920x1080@2fps v=200k(max250k/buf200k) "
-            f"baseline/ultrafast bg={'slideshow' if is_slideshow else self.config.get('radio_bg_source', 'card')}"
+            f"baseline/ultrafast bg={'slideshow' if is_slideshow else self.config.get('radio_bg_source', 'card')} "
+            f"af={radio_af}"
         )
         cmd.extend([
             "-c:v", "libx264",
@@ -2702,7 +2788,7 @@ class StreamerCore:
             "-c:a", "aac",
             "-b:a", "128k",
             "-ar", "44100",
-            "-af", "aresample=async=1",
+            "-af", radio_af,
             "-shortest",
             "-fflags", "+nobuffer+flush_packets",
             "-flush_packets", "1",

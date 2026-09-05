@@ -25,6 +25,7 @@
   "radio_mode": false,
   "playback_mode": "video",
   "radio_bg_source": "card",
+  "radio_crossfade_duration": 3,
   "standby_mode": "image",
   "standby_image_path": "",
   "web_password": "",

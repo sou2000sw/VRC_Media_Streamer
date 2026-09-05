@@ -334,6 +334,13 @@ class SettingsWindow(ctk.CTkToplevel):
         self.seg_radio_bg.set(radio_bg_val)
         self.seg_radio_bg.pack(fill="x", padx=15, pady=(2, 4))
 
+        self.lbl_radio_fade = ctk.CTkLabel(
+            sec5_body, text="🎚 Crossfade [sec] (曲間フェード秒数 / 0で無効・最大5):", anchor="w")
+        self.lbl_radio_fade.pack(fill="x", padx=15, pady=(6, 2))
+        self.entry_radio_fade = ctk.CTkEntry(sec5_body)
+        self.entry_radio_fade.insert(0, str(cfg.get("radio_crossfade_duration", 3)))
+        self.entry_radio_fade.pack(fill="x", padx=15, pady=(2, 4))
+
         self.lbl_radio_info = ctk.CTkLabel(
             sec5_body,
             text="💡 ラジオモード時は動画を落とさず帯域を約300kbps（通常比90%減）に極小化し、VRChatでのバッファ詰まりを防止します。",
@@ -551,7 +558,7 @@ class SettingsWindow(ctk.CTkToplevel):
   現在の設定JSONを取得。
 
 ■ POST /api/config
-  設定JSONを更新・保存 (例: {"loop_queue": true, "shuffle": true, "radio_mode": true, "radio_bg_source": "card", "image_display_duration": 15})
+  設定JSONを更新・保存 (例: {"loop_queue": true, "shuffle": true, "radio_mode": true, "radio_bg_source": "card", "radio_crossfade_duration": 3, "image_display_duration": 15})
 """
         self.api_textbox = ctk.CTkTextbox(self.api_ref_frame, height=260, font=ctk.CTkFont(family="Consolas", size=11))
         self.api_textbox.insert("1.0", api_doc_text)
@@ -668,6 +675,14 @@ class SettingsWindow(ctk.CTkToplevel):
             radio_mode = bool(self.switch_radio.get())
             web_password = self.entry_web_password.get().strip()
             
+            # 曲間フェードは空欄・非数値でも保存を止めない（0＝無効へ倒す）。
+            # ここで例外を投げると、無関係な項目を直しただけの保存まで失敗する。
+            try:
+                radio_fade = float(self.entry_radio_fade.get().strip())
+            except Exception:
+                radio_fade = 0.0
+            radio_fade = max(0.0, min(5.0, radio_fade))
+
             selected_bg = self.seg_radio_bg.get()
             if "Slideshow" in selected_bg:
                 radio_bg = "slideshow"
@@ -728,6 +743,7 @@ class SettingsWindow(ctk.CTkToplevel):
                 "playback_mode": "radio" if radio_mode else "video",
                 "radio_mode": radio_mode,
                 "radio_bg_source": radio_bg,
+                "radio_crossfade_duration": radio_fade,
                 "standby_mode": standby_mode,
                 "standby_image_path": self.current_standby_img_path,
                 "overlay_qr_enabled": qr_enabled,
