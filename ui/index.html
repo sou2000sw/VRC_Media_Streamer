@@ -1545,6 +1545,15 @@
             const apiBaseInput = document.getElementById('settingApiBase');
             if (apiBaseInput) apiBaseInput.value = apiBase;
 
+            // 画面共有カード（タスク23）: 触ったら「編集中」に入れる。
+            // 個々の要素に onchange を書くのではなく委譲で拾う。項目を足したときに
+            // 付け忘れると、その項目だけ巻き戻る——という気付きにくい壊れ方をするため。
+            const scCard = document.getElementById('screenCaptureCard');
+            if (scCard) {
+                scCard.addEventListener('change', markScreenCaptureEditing);
+                scCard.addEventListener('input', markScreenCaptureEditing);
+            }
+
             // Check URL parameters for ?pin= or ?password=
             try {
                 const params = new URLSearchParams(window.location.search);
@@ -3073,6 +3082,18 @@
         // ===== 画面共有（タスク23） =====
         let screenCaptureSourcesLoaded = false;
         let screenCaptureUserChangedAt = 0;
+        // ★このカードだけ「適用」ボタン方式なので、押すまでの間フォームを守る必要がある。
+        //   ライブ音声カードは onchange で即時送信するため liveAudioUserChangedAt が
+        //   毎回更新され、この問題が起きない。こちらは「適用」を押すまで何も記録されず、
+        //   /api/status のポーリング（約0.5秒）が選択をサーバー値へ巻き戻していた
+        //   （実測: ラジオを「ウィンドウ」にしても 517ms で「モニター」へ戻る）。
+        //   触った時点から一定時間は上書きしない。
+        let screenCaptureEditingUntil = 0;
+        const SCREEN_CAPTURE_EDIT_GRACE_MS = 20000;
+
+        function markScreenCaptureEditing() {
+            screenCaptureEditingUntil = Date.now() + SCREEN_CAPTURE_EDIT_GRACE_MS;
+        }
 
         function toggleScreenCaptureSourceFields(sourceType) {
             const displayGroup = document.getElementById('screenCaptureDisplayGroup');
@@ -3198,6 +3219,9 @@
                     })
                 });
                 if (res.ok) {
+                    // 保存できたので編集中の保護は解く。以降は screenCaptureUserChangedAt の
+                    // 4秒間だけ待って、サーバーの確定値に追随させる。
+                    screenCaptureEditingUntil = 0;
                     showToast('画面共有設定を保存しました', 'success');
                     checkServerHealth(true);
                 } else {
@@ -3211,6 +3235,8 @@
         function syncScreenCaptureFromStatus(data) {
             if (!data) return;
             if (Date.now() - screenCaptureUserChangedAt < 4000) return;
+            // ユーザーが選択中はサーバー値で上書きしない（「適用」を押す前に巻き戻さない）
+            if (Date.now() < screenCaptureEditingUntil) return;
 
             const sourceRadios = document.getElementsByName('screenCaptureSourceType');
             if (typeof data.screen_capture_source_type === 'string') {
