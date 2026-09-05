@@ -46,6 +46,15 @@ OUT_MODE_CHOICES = {
     "generic_rtmp": "Generic RTMP (上級者向け)",
 }
 
+# 映像エンコーダー（タスク18）。選んだものがそのPCで動かなければ libx264 へ退避する。
+ENCODER_CHOICES = {
+    "auto": "Auto (自動検出: NVENC → QSV → AMF → CPU)",
+    "libx264": "CPU / libx264 (最も互換性が高い)",
+    "h264_nvenc": "NVIDIA NVENC (GeForce / RTX)",
+    "h264_qsv": "Intel QSV (内蔵グラフィックス)",
+    "h264_amf": "AMD AMF (Radeon)",
+}
+
 # 設定ウィンドウ
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, parent, streamer_core):
@@ -108,6 +117,24 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         self.opt_output_mode.set(out_mode_val)
         self.opt_output_mode.pack(fill="x", padx=15, pady=(2, 6))
+
+        self.lbl_video_encoder = ctk.CTkLabel(sec2_body, text="⚡ 映像エンコーダー (video_encoder):", anchor="w")
+        self.lbl_video_encoder.pack(fill="x", padx=15, pady=(10, 0))
+
+        curr_encoder = str(cfg.get("video_encoder", "auto"))
+        self.opt_video_encoder = ctk.CTkOptionMenu(
+            sec2_body,
+            values=list(ENCODER_CHOICES.values())
+        )
+        self.opt_video_encoder.set(ENCODER_CHOICES.get(curr_encoder, ENCODER_CHOICES["auto"]))
+        self.opt_video_encoder.pack(fill="x", padx=15, pady=(2, 2))
+
+        self.lbl_video_encoder_desc = ctk.CTkLabel(
+            sec2_body,
+            text="※選んだGPUエンコーダーがこのPCで動かない場合は、自動的にCPU(libx264)へ退避します。\n　ラジオモード(静止画+音声)は元から極小負荷のため常にCPUのままです。",
+            font=ctk.CTkFont(size=11), text_color="#95A5A6", anchor="w", justify="left"
+        )
+        self.lbl_video_encoder_desc.pack(fill="x", padx=15, pady=(0, 6))
 
         # TopazChat エンドポイント（個人運営でホストが変わり得るため利用者が変更可能）
         self.lbl_topaz_endpoint = ctk.CTkLabel(
@@ -649,6 +676,13 @@ class SettingsWindow(ctk.CTkToplevel):
             else:
                 radio_bg = "card"
 
+            selected_encoder = self.opt_video_encoder.get()
+            video_encoder = "auto"
+            for key, text in ENCODER_CHOICES.items():
+                if selected_encoder == text:
+                    video_encoder = key
+                    break
+
             selected_out_mode = self.opt_output_mode.get()
             output_mode = "hls"
             for key, text in OUT_MODE_CHOICES.items():
@@ -707,6 +741,7 @@ class SettingsWindow(ctk.CTkToplevel):
                 "live_sync_duration_count": sync_count,
                 "loop_queue": loop_queue,
                 "shuffle": shuffle,
+                "video_encoder": video_encoder,
                 "enable_web_remote": bool(self.switch_web_remote.get()),
                 "allow_web_queue_add": bool(self.switch_web_add.get()),
                 "allow_web_queue_edit": bool(self.switch_web_edit.get()),

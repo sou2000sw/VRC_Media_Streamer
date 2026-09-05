@@ -748,6 +748,19 @@
                         </div>
 
                         <div class="flex flex-col gap-2">
+                            <label class="text-xs text-zinc-400">⚡ 映像エンコーダー</label>
+                            <select id="hostVideoEncoder" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                                <option value="auto">Auto（自動検出: NVENC → QSV → AMF → CPU）</option>
+                                <option value="libx264">CPU / libx264（最も互換性が高い）</option>
+                                <option value="h264_nvenc">NVIDIA NVENC（GeForce / RTX）</option>
+                                <option value="h264_qsv">Intel QSV（内蔵グラフィックス）</option>
+                                <option value="h264_amf">AMD AMF（Radeon）</option>
+                            </select>
+                            <p id="hostActiveEncoder" class="text-[11px] text-zinc-500"></p>
+                            <p class="text-[11px] text-zinc-500 -mt-1">※このPCで動かないGPUエンコーダーを選んだ場合は、自動的にCPU（libx264）へ退避します。ラジオモード（静止画＋音声）は元から極小負荷のため常にCPUのままです。</p>
+                        </div>
+
+                        <div class="flex flex-col gap-2">
                             <label class="text-xs text-zinc-400">待機画面</label>
                             <select id="hostStandbyMode" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
                                 <option value="image">🖼 待機画像を表示</option>
@@ -1923,6 +1936,7 @@
             // 未指定なら安全側＝非許可。サーバーが古い場合にゲストへ共有情報を出さない。
             guestCanSeeShareInfo = !!(data.permissions && data.permissions.allow_web_share_info === true);
             applyRemoteTabVisibility(isLocal);
+            updateActiveEncoderLabel(data);
             maybeShowSetupModal(data, isLocal);
 
             // Header Action buttons visibility
@@ -3371,6 +3385,23 @@
             if (label) label.innerText = reveal ? '隠す' : '表示';
         }
 
+        // 設定した値ではなく「実際に動いているエンコーダー」を出す。GPUが無い等で
+        // libx264 へ退避したとき、設定画面だけ見ても気づけないため。
+        function updateActiveEncoderLabel(data) {
+            const el = document.getElementById('hostActiveEncoder');
+            if (!el) return;
+            const active = data && data.active_video_encoder;
+            const requested = (data && data.video_encoder) || 'auto';
+            if (!active) { el.innerText = ''; return; }
+            if (requested !== 'auto' && requested !== active) {
+                el.innerText = '⚠ 現在の実動作: ' + active + '（' + requested + ' はこのPCで使えないため退避中）';
+                el.className = 'text-[11px] text-amber-400';
+            } else {
+                el.innerText = '現在の実動作: ' + active;
+                el.className = 'text-[11px] text-zinc-500';
+            }
+        }
+
         // トンネルが「誰にも何も配っていない」構成の検知に使う。/api/config からしか取れない。
         let lastHostOutputMode = 'hls';
         let lastHostRtmpFallback = true;
@@ -3419,6 +3450,7 @@
                 set('hostHlsSegment', cfg.hls_segment_time);
                 set('hostTransitionWait', cfg.video_transition_wait_seconds);
                 set('hostLiveSync', cfg.live_sync_duration_count);
+                set('hostVideoEncoder', cfg.video_encoder || 'auto');
                 set('hostStandbyMode', cfg.standby_mode || 'image');
                 set('hostLoopQueue', cfg.loop_queue);
                 set('hostShuffle', cfg.shuffle);
@@ -3472,6 +3504,7 @@
                 hls_segment_time: num('hostHlsSegment', 3),
                 video_transition_wait_seconds: num('hostTransitionWait', 1),
                 live_sync_duration_count: num('hostLiveSync', 4),
+                video_encoder: (document.getElementById('hostVideoEncoder') || {}).value || 'auto',
                 standby_mode: (document.getElementById('hostStandbyMode') || {}).value || 'image',
                 loop_queue: bool('hostLoopQueue'),
                 shuffle: bool('hostShuffle'),

@@ -27,8 +27,16 @@ def isolated_config_file(tmp_path, monkeypatch):
 
     # 既定値で種を蒔いておく。「config.json は存在する」前提で書かれたテストがあるため。
     # 利用者の実設定をコピーしないのは、テスト結果が手元の設定に左右されないようにするため。
+    seed = dict(streamer_core.DEFAULT_CONFIG)
+    # 映像エンコーダーは libx264 に固定する（既定は "auto"）。
+    # "auto" のままだと、開発機にNVIDIA GPUがあるかどうかで生成されるFFmpegコマンドが
+    # 変わり、同じテストが「GPU付きPCでだけ落ちる」。実際にそうなった:
+    # 再エンコード経路の判定を `"libx264" in cmd` で書いていた既存テスト3件が、
+    # auto が NVENC を選んだ環境で落ちた。エンコーダー自体の検証は
+    # test_hw_encoding.py が担当し、そちらは probe をモックして機種非依存にしてある。
+    seed["video_encoder"] = "libx264"
     with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(streamer_core.DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+        json.dump(seed, f, indent=2, ensure_ascii=False)
 
     monkeypatch.setattr(streamer_core, "CONFIG_FILE", temp_path, raising=False)
 

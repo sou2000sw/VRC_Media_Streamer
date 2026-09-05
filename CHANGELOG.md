@@ -1,5 +1,82 @@
 # 更新履歴 (CHANGELOG)
 
+## [Unreleased] - develop
+
+### ⚡ FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応 — タスク18
+- **追加**: `video_encoder`（既定 `"auto"`）。`auto` は NVENC → QSV → AMF の順に
+  **実際に動くものを探し**、全滅なら `libx264`。明示指定しても、そのPCで動かなければ
+  `libx264` へ退避する（利用者の設定を守って落ちるより、配信が続く方が価値が高い）。
+  切り替えはGUI・ホストWeb UIのセレクト、起動時の `--video-encoder`、
+  環境変数 `VRCMS_VIDEO_ENCODER` のいずれからでも可能。
+- **適用範囲**: 動画の再エンコード経路・写真・待機画面ループ・RTMP送出の4経路。
+  **ラジオモード（2fps / 200k）は libx264 のまま**。元から極小負荷で、GPUに投げる利点がない。
+- **退避したことが見える**: `/api/status` に `video_encoder`（設定値）と
+  `active_video_encoder`（実動作）の両方を載せ、食い違うときは設定画面に警告を出す。
+  片方しか出さないと、GPUが無くて退避したことに利用者が気づけない。
+
+#### 実測（2026-09-06 / Intel 12コア20スレッド + NVIDIA GPU, FFmpeg 8.1.2）
+
+アプリを実際に起動し、待機配信を60秒流したときの **ffmpeg 子プロセスのCPU時間**（中央値2回）:
+
+| エンコーダー | CPU / 60秒 | 1コア換算 |
+|---|---|---|
+| libx264（従来） | 36.39 秒 | 61% |
+| h264_nvenc | **25.54 秒** | **43%** |
+
+**1.4倍軽い（-30%）**。単体コマンドで測ると、動画の再エンコード経路（QR合成 / 2500k）で
+39.86 → 20.52 CPU秒（**1.9倍**）、静止画ループ（1500k@30fps）で 50.34 → 33.23 CPU秒（**1.5倍**）。
+残るCPUはデコード・スケール・色空間変換で、これはGPUに移らない。
+
+#### 実装で潰した罠（すべて実測で判明）
+
+> [!danger] `ffmpeg -encoders` の一覧は当てにならない
+> 同梱ビルドは GPU もドライバも無い環境で **h264_nvenc / h264_qsv / h264_amf を
+> 常に列挙する**。このPCでも4種すべてが一覧に出たが、実際に通ったのは NVENC と
+> libx264 だけだった（`h264_qsv` は "Error creating a MFX session: -9"、
+> `h264_amf` は "DLL amfrt64.dll failed to open"）。
+> 一覧を信じる実装は「**配信を始めた瞬間に落ちる**」設定を選ぶ。
+> → プローブは**本番と同じ引数で1080pを実際にエンコード**し、終了コードで判定する。
+
+> [!danger] x264の方言をHWエンコーダーへ渡すと起動できない
+> `-preset ultrafast` を NVENC に渡すと
+> `Unable to parse "preset" option value "ultrafast"` で即死する。
+> 「共通の引数に足し込む」設計は、HW選択時に配信不能を意味する。
+> → エンコーダーごとに**完全に別の一覧を返す**（`build_video_encoder_opts`）。
+> `-sc_threshold` も libx264 専用なのでHWには出さない。
+
+> [!warning] `-level 3.1` は 1080p で NVENC に拒否される
+> `InitializeEncoder failed: invalid param (8): Invalid Level`。
+> libx264 は同じ値を黙って辻褄合わせするので、共有すると
+> 「x264では動くのにNVENCだけ起動しない」になる。→ HW側は 4.1 へ引き上げる。
+
+> [!warning] AMF のプロファイル定数は綴りが違う
+> `-profile:v baseline` は `Undefined constant or missing '(' in 'baseline'`。
+> → AMFには `constrained_baseline` を渡す。
+> （このPCにAMD GPUは無く、DLL読み込み前のオプション解析エラーとして観測した）
+
+> [!important] テストが開発機のGPU有無で結果を変えていた
+> 再エンコード経路の判定を `"libx264" in cmd` で書いていた既存テスト3件が、
+> `auto` が NVENC を選んだ環境で落ちた。**同じテストが「GPU付きPCでだけ落ちる」**。
+> → `conftest.py` の種設定で `video_encoder` を `libx264` に固定した。
+> エンコーダー自体の検証は `test_hw_encoding.py` が担当し、そちらはプローブを
+> モックして機種非依存にしてある。
+
+#### 計測方法についての反省
+最初の計測で NVENC が「**127倍速い**」と出たが、**誤り**だった。
+`-level 3.1` でエンコーダーの初期化に失敗しており、0.31秒は
+**失敗にかかった時間**だった。出力を `-f null -` に捨てて終了コードも見ていなかったため、
+失敗を高速と読み違えた。
+→ ベンチマークは**成果物（出力バイト数と終了コード）を必ず検証する**こと。
+「速すぎる」は正しさの証拠ではなく、疑う理由である。
+
+#### 検証
+- `test_hw_encoding.py`（24件）を新設。既存スイートは 232 passed。
+- 実サーバー（`--output-mode hls --video-encoder auto`）で
+  `active_video_encoder = h264_nvenc`、稼働中の ffmpeg が `-c:v h264_nvenc`、
+  生成されたセグメントが h264 1920x1080（591KB）で再生可能なことを確認。
+
+---
+
 ## [2.9.8] - 2026-09-04
 
 ### 🛡️ Webリモコンの無効化（ホスト専用スタンドアロンモード）— タスク21

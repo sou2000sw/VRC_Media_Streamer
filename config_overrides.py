@@ -144,6 +144,9 @@ def add_config_arguments(parser):
                         help="Start in BGM/radio playback mode")
     parser.add_argument("--no-radio", action="store_true",
                         help="Start in normal video playback mode")
+    parser.add_argument("--video-encoder", type=str, default=None,
+                        choices=["auto", "libx264", "h264_nvenc", "h264_qsv", "h264_amf"],
+                        help="Video encoder for this session (default: config.json)")
     parser.add_argument("--host-only", action="store_true",
                         help="Disable the web remote (host PC only, task 21)")
     parser.add_argument("--web-remote", action="store_true",
@@ -208,6 +211,10 @@ def build_overrides(args, environ=None):
         apply({"enable_tunnel": True}, "cli")
     elif bool(getattr(args, "no_tunnel", False)):
         apply({"enable_tunnel": False}, "cli")
+
+    video_encoder = getattr(args, "video_encoder", None)
+    if video_encoder is not None:
+        apply({"video_encoder": str(video_encoder)}, "cli")
 
     # --host-only / --web-remote も同じ形。閉じる側を後に置き、両方指定なら閉じる方を採る
     # （安全側に倒す）。

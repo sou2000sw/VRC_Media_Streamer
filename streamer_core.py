@@ -149,6 +149,11 @@ DEFAULT_CONFIG = {
     "rtmp_fallback_after_failures": 3,
     "rtmp_retry_backoff_max_seconds": 300,
 
+    # --- 映像エンコーダー（タスク18）---
+    # "auto" = NVENC → QSV → AMF の順に実際に動くものを探し、全滅なら libx264。
+    # 明示指定しても、そのPCで動かなければ libx264 へ退避する（配信を止めない）。
+    "video_encoder": "auto",
+
     # 初回セットアップ（配信先とストリームキーの確認）を通過したか。
     # 既定の TopazChat はストリームキーが要る。キーは再生開始時に自動生成されるが、
     # それだとワールドに貼るURLが「最初の1本を再生するまで空」になり、
@@ -280,6 +285,193 @@ def get_keyframe_opts(segment_seconds):
     """
     seg = max(1, int(segment_seconds or 3))
     return ["-force_key_frames", f"expr:gte(t,n_forced*{seg})"]
+
+
+# =============================================================================
+# 映像エンコーダーの選択（タスク18: NVENC / QSV / AMF 対応）
+# =============================================================================
+# 既定は "auto"。起動時に**実際に1回エンコードしてみて**通ったものだけを使う。
+# `ffmpeg -encoders` の一覧は当てにならない: 同梱ビルドは h264_nvenc / h264_qsv /
+# h264_amf を常に「載せて」おり、GPUもドライバも無い環境でそのまま列挙される。
+# ★実測(2026-09-06 / このPC): 一覧には4種すべて出るが、実際に通るのは
+#   h264_nvenc と libx264 だけ。h264_qsv は "Error creating a MFX session: -9"、
+#   h264_amf は "DLL amfrt64.dll failed to open" で初期化に失敗した。
+VIDEO_ENCODERS = ("auto", "libx264", "h264_nvenc", "h264_qsv", "h264_amf")
+
+# auto のときに試す順番。NVENC が最も枯れていて低遅延指定も素直なため先頭。
+HW_ENCODER_PRIORITY = ("h264_nvenc", "h264_qsv", "h264_amf")
+
+# プローブ結果のキャッシュ。エンコーダーの可否は実行中に変わらない
+# （GPUの抜き差しは再起動を伴う）ので、プロセス内で1度だけ確かめる。
+_ENCODER_PROBE_CACHE = {}
+_ENCODER_PROBE_LOCK = threading.Lock()
+
+
+def build_video_encoder_opts(encoder, *, v_kbps, max_kbps, buf_kbps,
+                             h264_profile="baseline", sw_preset="ultrafast",
+                             sw_tune="zerolatency", level="3.1",
+                             gop_frames=None, fps=None, bf_zero=True,
+                             sc_threshold_zero=False):
+    """`-c:v` から始まる映像エンコード引数一式を組み立てる。
+
+    **エンコーダーごとに完全に別の一覧を返す。共通部分に足し込む形にしてはいけない。**
+    ★実測: x264 の値をNVENCに渡すと即座に落ちる
+      （`-preset ultrafast` → "Unable to parse preset option value ultrafast"）。
+    「とりあえず全部付ける」実装は、HWエンコーダーでは起動不能を意味する。
+
+    引数は「意味」で受け取り、方言への翻訳をここに閉じ込める。
+    呼び出し側（動画・写真・待機画面・RTMP送出）は方言を知らなくてよい。
+    """
+    rate = ["-b:v", f"{v_kbps}k", "-maxrate", f"{max_kbps}k", "-bufsize", f"{buf_kbps}k"]
+
+    if encoder == "h264_nvenc":
+        opts = [
+            "-c:v", "h264_nvenc",
+            # p1=最速。配信は実時間で足りればよく、画質はビットレートで決まる。
+            "-preset", "p1" if sw_tune == "zerolatency" else "p4",
+            "-tune", "ull" if sw_tune == "zerolatency" else "hq",
+            "-rc", "cbr",
+            "-profile:v", h264_profile,
+        ]
+        if level:
+            # ★NVENCは 1080p で level 3.1 を拒否する
+            #   ("InitializeEncoder failed: invalid param (8): Invalid Level")。
+            #   libx264 は黙って辻褄を合わせるので、同じ値を流用すると
+            #   「x264では動くのにNVENCだけ起動しない」になる。1080p の実力値へ上げる。
+            opts += ["-level", "4.1" if str(level) == "3.1" else str(level)]
+        opts += ["-pix_fmt", "yuv420p"] + rate
+        if bf_zero:
+            opts += ["-bf", "0"]
+        # -sc_threshold は libx264 専用。NVENC に渡すと弾かれるので出さない。
+    elif encoder == "h264_qsv":
+        # このPCにIntel GPUが無く実機確認できていない。誤っていてもプローブが
+        # 落として libx264 へ退避するため、配信が止まることはない。
+        opts = [
+            "-c:v", "h264_qsv",
+            "-preset", "veryfast",
+            "-profile:v", h264_profile,
+        ]
+        if level:
+            opts += ["-level", "4.1" if str(level) == "3.1" else str(level)]
+        # QSVはNV12で受ける。yuv420pを明示するとフォーマット不一致で落ちる環境がある。
+        opts += ["-pix_fmt", "nv12"] + rate
+        if bf_zero:
+            opts += ["-bf", "0"]
+    elif encoder == "h264_amf":
+        # 同上（AMD GPU無しのため未検証。プローブが可否を決める）。
+        opts = [
+            "-c:v", "h264_amf",
+            "-usage", "lowlatency" if sw_tune == "zerolatency" else "transcoding",
+            "-quality", "speed",
+            "-rc", "cbr",
+            # ★AMFのプロファイル定数は x264 と綴りが違う。"baseline" を渡すと
+            #   "Undefined constant or missing '(' in 'baseline'" で起動できない
+            #   （このPCではDLLが無く到達しないが、エラー文からは判別できた）。
+            "-profile:v", "constrained_baseline" if h264_profile == "baseline" else h264_profile,
+        ]
+        if level:
+            opts += ["-level", "4.1" if str(level) == "3.1" else str(level)]
+        opts += ["-pix_fmt", "yuv420p"] + rate
+        if bf_zero:
+            opts += ["-bf", "0"]
+    else:
+        # libx264（既定・フォールバック）。
+        # ここは既存の実装と1バイトも変えない。preset/tune/level の値は
+        # 過去の画質実測（CHANGELOG 2026-08-30）で決まったものなので、
+        # 「統一のため」に触らないこと。
+        opts = ["-c:v", "libx264", "-preset", sw_preset]
+        if sw_tune:
+            opts += ["-tune", sw_tune]
+        opts += ["-profile:v", h264_profile]
+        if level:
+            opts += ["-level", str(level)]
+        if bf_zero:
+            opts += ["-bf", "0"]
+        if sc_threshold_zero:
+            opts += ["-sc_threshold", "0"]
+        opts += ["-pix_fmt", "yuv420p"] + rate
+
+    if gop_frames:
+        opts += ["-g", str(gop_frames), "-keyint_min", str(gop_frames)]
+    if fps:
+        opts += ["-r", str(fps)]
+    return opts
+
+
+def probe_video_encoder(encoder, timeout=20):
+    """そのエンコーダーが**このPCで実際に動くか**を1回だけ確かめる（結果はキャッシュ）。
+
+    `ffmpeg -encoders` を見るだけでは不十分。同梱ビルドはGPUの有無に関わらず
+    h264_nvenc / h264_qsv / h264_amf を列挙するので、一覧を信じると
+    「配信を始めた瞬間に落ちる」設定を選んでしまう。
+
+    そこで **本番と同じ形の引数**で 1080p を数フレームだけ実際に encode する。
+    引数の方言違い（level・preset・pix_fmt）もここで一緒に検出できる。
+    """
+    if encoder == "libx264":
+        return True   # 同梱ビルドの必須エンコーダー。これが無ければ何も配信できない。
+    with _ENCODER_PROBE_LOCK:
+        if encoder in _ENCODER_PROBE_CACHE:
+            return _ENCODER_PROBE_CACHE[encoder]
+
+    cmd = [get_ffmpeg_cmd(), "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=0.2"]
+    cmd += build_video_encoder_opts(encoder, v_kbps=2500, max_kbps=3000, buf_kbps=2000)
+    cmd += ["-f", "null", "-"]
+
+    ok = False
+    detail = ""
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0
+        )
+        try:
+            _out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_proc(proc)
+            _out, err = "", "probe timed out"
+        # 終了コードだけで判定する。stderr の文言はFFmpegの版で変わるうえ、
+        # 成功時にも警告が出る。
+        ok = (proc.returncode == 0)
+        detail = (err or "").strip().splitlines()[0] if err else ""
+    except Exception as e:
+        ok, detail = False, str(e)
+
+    with _ENCODER_PROBE_LOCK:
+        _ENCODER_PROBE_CACHE[encoder] = ok
+    log_print(f"[Encoder] Probe {encoder}: {'available' if ok else 'unavailable'}"
+              + (f" ({detail})" if not ok and detail else ""))
+    return ok
+
+
+def resolve_video_encoder(requested):
+    """設定値を「実際に使うエンコーダー名」へ解決する。
+
+    - "auto": NVENC → QSV → AMF の順に試し、通ったものを使う。全滅なら libx264。
+    - 明示指定: そのエンコーダーが**動くことを確かめてから**使う。動かなければ
+      libx264 へ退避する。利用者が選んだ設定を尊重して落ちるより、
+      配信が続く方が価値が高い（設定画面には実際に使われている方を表示する）。
+    """
+    requested = str(requested or "auto").strip() or "auto"
+    if requested not in VIDEO_ENCODERS:
+        log_print(f"[Encoder] Unknown video_encoder {requested!r}; falling back to auto.")
+        requested = "auto"
+
+    if requested == "libx264":
+        return "libx264"
+    if requested == "auto":
+        for candidate in HW_ENCODER_PRIORITY:
+            if probe_video_encoder(candidate):
+                return candidate
+        return "libx264"
+    if probe_video_encoder(requested):
+        return requested
+    log_print(f"[Encoder] {requested} is not usable on this PC; using libx264 instead.")
+    return "libx264"
+
 
 
 def get_live_clock_drawtext_filter(x="w-tw-45", y="26", font_size=28, bold=True):
@@ -1025,6 +1217,20 @@ class StreamerCore:
             log_print(f"[Core] Failed to save config: {e}")
             return False
 
+    def get_video_encoder(self):
+        """今この瞬間に使う映像エンコーダー名。
+
+        解決結果はインスタンスに保持する。プローブは実エンコードを1回走らせるので、
+        再生のたびに呼ぶと切り替えが目に見えて遅くなる。設定が変わったときだけ
+        引き直す（設定画面で選び直した直後から効かせるため）。
+        """
+        requested = str(self.config.get("video_encoder", "auto") or "auto")
+        if getattr(self, "_video_encoder_requested", None) != requested:
+            self._video_encoder_requested = requested
+            self._video_encoder_resolved = resolve_video_encoder(requested)
+            log_print(f"[Encoder] video_encoder={requested} -> using {self._video_encoder_resolved}")
+        return self._video_encoder_resolved
+
     def is_web_remote_enabled(self):
         """Webリモコン（ゲスト向けの画面とAPI）を開いているか。タスク21。
 
@@ -1096,6 +1302,10 @@ class StreamerCore:
             "image_display_duration": int(self.config.get("image_display_duration", 15)),
             "image_auto_advance": bool(self.config.get("image_auto_advance", False)),
             "enable_web_remote": web_remote_enabled,
+            # 設定値と「実際に使われているもの」は食い違いうる（GPUが無い等）。
+            # 片方しか出さないと、退避したことが利用者から見えない。
+            "video_encoder": str(self.config.get("video_encoder", "auto")),
+            "active_video_encoder": self.get_video_encoder(),
             # QRはリモコンURLを焼いたものなので、リモコンが無効なら「消えている」状態を返す。
             # 設定値そのものは書き換えない（再度有効化したら元の設定に戻る）。
             "overlay_qr_enabled": web_remote_enabled and bool(self.config.get("overlay_qr_enabled", False) or self.config.get("overlay_qr_video", False) or self.config.get("overlay_qr_image", False)),
@@ -1569,10 +1779,12 @@ class StreamerCore:
                 # （ビットレートを2000kまで上げるのと同等の劣化を、帯域を増やさず被っていた）。
                 # 稼ぐはずのレイテンシは数フレーム分で、TopazChatの中継とAVProのバッファに
                 # 比べて無視できるため外す。エンコード速度も 8.6x→9.2x で悪化しない。
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-profile:v", "main", "-pix_fmt", "yuv420p",
-                "-b:v", f"{v_kbps}k", "-maxrate", f"{v_kbps}k", "-bufsize", f"{v_kbps * 2}k",
-                "-g", gop, "-keyint_min", gop, "-sc_threshold", "0",
+                *build_video_encoder_opts(
+                    self.get_video_encoder(),
+                    v_kbps=v_kbps, max_kbps=v_kbps, buf_kbps=v_kbps * 2,
+                    h264_profile="main", sw_preset="veryfast", sw_tune=None,
+                    level=None, bf_zero=False, sc_threshold_zero=True,
+                    gop_frames=gop),
                 "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ar", "44100", "-ac", "2",
                 "-max_muxing_queue_size", "1024",
                 "-f", "flv", url,
@@ -2657,15 +2869,10 @@ class StreamerCore:
             log_print(f"[Player] Encoder path=video/reencode v=2500k(max3000k/buf2000k) "
                       f"baseline/ultrafast reason={reason}")
             cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-profile:v", "baseline",
-                "-level", "3.1",
-                "-pix_fmt", "yuv420p",
-                "-b:v", "2500k",
-                "-maxrate", "3000k",
-                "-bufsize", "2000k",
+                *build_video_encoder_opts(
+                    self.get_video_encoder(),
+                    v_kbps=2500, max_kbps=3000, buf_kbps=2000,
+                    h264_profile="baseline", bf_zero=False),
                 "-c:a", "aac", "-b:a", "128k",
                 "-af", "aresample=async=1",
                 "-shortest",
@@ -3012,20 +3219,11 @@ class StreamerCore:
             cmd.extend(["-vf", clock_filter])
         log_print("[Player] Encoder path=image 1920x1080@30fps v=1500k(buf1000k) baseline/ultrafast g=30")
         cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-profile:v", "baseline",
-            "-level", "3.1",
-            "-bf", "0",
-            "-g", "30",
-            "-keyint_min", "30",
-            "-sc_threshold", "0",
-            "-pix_fmt", "yuv420p",
-            "-r", "30",
-            "-b:v", "1500k",
-            "-maxrate", "1500k",
-            "-bufsize", "1000k",
+            *build_video_encoder_opts(
+                self.get_video_encoder(),
+                v_kbps=1500, max_kbps=1500, buf_kbps=1000,
+                h264_profile="baseline", sc_threshold_zero=True,
+                gop_frames=30, fps=30),
             "-c:a", "aac", "-b:a", "64k",
             "-fflags", "+nobuffer+flush_packets",
             "-flush_packets", "1",
@@ -3646,20 +3844,11 @@ class StreamerCore:
             if has_clock and clock_filter:
                 cmd.extend(["-vf", clock_filter])
             cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-profile:v", "baseline",
-                "-level", "3.1",
-                "-bf", "0",
-                "-g", "30",
-                "-keyint_min", "30",
-                "-sc_threshold", "0",
-                "-pix_fmt", "yuv420p",
-                "-r", "30",
-                "-b:v", "1500k",
-                "-maxrate", "1500k",
-                "-bufsize", "1000k",
+                *build_video_encoder_opts(
+                    self.get_video_encoder(),
+                    v_kbps=1500, max_kbps=1500, buf_kbps=1000,
+                    h264_profile="baseline", sc_threshold_zero=True,
+                    gop_frames=30, fps=30),
                 "-c:a", "aac", "-b:a", "64k",
                 "-fflags", "+nobuffer+flush_packets",
                 "-flush_packets", "1",

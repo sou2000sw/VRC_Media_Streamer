@@ -43,6 +43,7 @@
   "rtmp_video_height": 720,
   "rtmp_fps": 30,
   "rtmp_gop_seconds": 2,
+  "video_encoder": "auto",
   "rtmp_fallback_to_hls": true,
   "rtmp_fallback_after_failures": 3,
   "rtmp_retry_backoff_max_seconds": 300,

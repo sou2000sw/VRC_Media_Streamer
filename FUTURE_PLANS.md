@@ -25,7 +25,7 @@
 | **15** | 🔄 外部依存 | **外部ソース（yt-dlp等）の自動更新・メンテナンス機能** (External Tools Auto-Update) | 未定 | 🔵 **検討中 📋** |
 | **16** | 🎨 GUI刷新 | **ホストソフトGUIのモダン化・リデザイン** (Host GUI Modernization) | v2.9.4 | 🟢 **実装完了 ✅** |
 | **17** | 🎵 ラジオ | **ラジオモード時のクロスフェード・滑らか切り替え** (Smooth Crossfade) | 未定 | ⚪ **実装予定 📝** |
-| **18** | ⚡ 性能 | **FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応** (HW Encoding) | 未定 | ⚪ **実装予定 📝** |
+| **18** | ⚡ 性能 | **FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応** (HW Encoding) | develop | 🟢 **実装完了 ✅** |
 | **19** | 🛠️ CLI | **CLI 引数・環境設定オーバーライド機構の総点検・堅牢化** (CLI Overrides Overhaul) | **v2.9.0** | 🟢 **実装完了 ✅** |
 | **20** | 🌐 UI/権限 | **通常ブラウザ利用時のサーバー操作ボタン（再起動・起動）非表示化** (Button Visibility) | v2.6.0 | 🟢 **実装完了 ✅** |
 | **21** | 🛡️ Web制御 | **Webリモコン機能の無効化・ホスト専用スタンドアロンモード** (Disable Web Remote / Host-Only Mode) | develop | 🟢 **実装完了 ✅** |
@@ -537,7 +537,7 @@ YouTube側のプレイヤー仕様変更や暗号化シグネチャ変更（n-si
 
 ---
 
-## 18. ⚡ FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応 (Hardware-Accelerated Video Encoding) 【実装予定 📝】
+## 18. ⚡ FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応 (Hardware-Accelerated Video Encoding) 【実装完了 ✅】
 
 ### 概要
 ホストPCで通常動画モード（1080p60 / 720p60）を高画質配信する際、CPU負荷を大幅に低減し、省電力かつ高フレームレート・低遅延を維持するため、GPUによるハードウェアエンコード（NVIDIA NVENC, Intel QSV, AMD AMF）を自動検出・選択可能にする機能。
@@ -559,10 +559,23 @@ YouTube側のプレイヤー仕様変更や暗号化シグネチャ変更（n-si
    - `config.json`: `"video_encoder": "auto"`
    - Webリモコン設定モーダル / ホスト設定画面に「動画エンコーダー（自動 / CPU / NVENC / QSV / AMF）」選択セレクトボックスを追加。
 
-### 変更対象予定ファイル
-- `streamer_core.py`（エンコーダー自動プローブ関数、FFmpeg 引数生成ロジックの動的切替）
-- `config.dist.json`（`video_encoder: "auto"` 追加）
-- `gui_streamer.py` / `ui/index.html`（エンコーダー選択UI）
+### 実装結果（develop）
+- **実測 1.4倍軽い**: 待機配信のFFmpeg CPUが 36.39 → 25.54 秒/60秒（1コアの61%→43%）。
+  単体では動画再エンコード経路 1.9倍・静止画ループ 1.5倍。詳細は CHANGELOG の同項目。
+- **可否判定は実エンコード**: `ffmpeg -encoders` は GPU が無くても3種すべてを列挙するため
+  一覧では判定できない（このPCでも一覧に4種出たが、実際に通ったのは NVENC と libx264 だけ）。
+- **エンコーダーごとに完全に別の引数一覧を返す**。x264 の `-preset ultrafast` を
+  NVENC に渡すと起動できない。`-level 3.1` も 1080p では NVENC に拒否される。
+- ラジオモードは仕様どおり libx264 のまま（2fps/200k で元から極小負荷）。
+- QSV / AMF はこのPCに該当GPUが無く**実機未検証**。誤っていてもプローブが落として
+  libx264 へ退避するため、配信が止まることはない。
+
+### 変更対象ファイル
+- `streamer_core.py`（エンコーダー自動プローブ、引数生成、4経路の差し替え、ステータス）
+- `config.dist.json` / `config_overrides.py`（既定値と `--video-encoder`）
+- `gui_streamer.py` / `ui/index.html` / `plugin/ui/index.html`（選択UIと実動作の表示）
+- `conftest.py`（テストが開発機のGPU有無で結果を変えないよう libx264 に固定）
+- `test_hw_encoding.py`（新規・24件）
 
 ---
 
