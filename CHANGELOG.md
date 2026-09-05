@@ -2,6 +2,76 @@
 
 ## [Unreleased] - develop
 
+### 🔧 ビルド検証が起動直後の窓で落ちる問題を修正
+- **修正**: `build_exe.py` の `verify_release()` が `/api/status` を1回しか叩かず、
+  応答が無いと**例外がそのまま外へ出てビルドが中断**していた。`GET /` と同じように待つ。
+- **原因（実測）**: `/api/status` は `GET /` より遅れて使えるようになる。ポートが開いた直後の
+  **約2秒間だけ**この経路が `RemoteDisconnected` で切れる。ログの
+  `[APIServer] Listening` と `[Encoder] Probe h264_nvenc` の間隔が2秒で、失敗窓と一致する
+  （タスク18のエンコーダープローブが起動経路で実エンコードを1回走らせるため）。
+- Webリモコンは起動直後の数秒だけ「オフライン」表示になりうるが、その後自動で回復する。
+
+### 🖥️ デスクトップ画面・ウィンドウ共有 — タスク23
+- **追加**: 再生モード `screen`。ホストPCの画面をVRChatへライブ配信する。
+  キャプチャ対象は**ディスプレイ単位（`ddagrab`）**と**ウィンドウ単位（`gdigrab`）**の
+  どちらからでも選べる。設定は `screen_capture_*` の8キー。
+  Webリモコンの設定タブ「画面共有（このPCからのみ）」から操作する。
+- **追加**: `GET /api/capture_sources`（**localhost限定**）。接続ディスプレイと
+  可視ウィンドウの一覧を返す。ウィンドウ名は個人情報になりうるためゲストには渡さない。
+- **追加**: `POST /api/control` の `set_screen_capture`（**localhost限定**）。
+- 音声はタスク22の設定をそのまま流用する（画面と一緒にPC音声・マイクが出る）。
+  音声デバイス未設定でも映像のみで配信は続く。
+
+> [!important] ウィンドウは「完全一致」でしか掴まない — 部分一致で救わないのは意図的
+> `gdigrab` の `title=` は完全一致のみ。実測でも Chrome がタブ切替により
+> `GitHub - Google Chrome` → `sou2000sw/VRC_Media_Streamer - Google Chrome` へ変わり、
+> 開けなくなることを確認した。ここで前方一致のフォールバックを入れると、
+> **似た名前の別ウィンドウ（パスワードマネージャ等）を誤って配信する**事故になりうる。
+> 見つからなければ `ウィンドウが見つかりません: <名前>` を出して止める。
+> UIに「一覧を再取得」ボタンとその旨の注意書きを置いた。
+
+- **`ddagrab` は `-f lavfi -i` の入力形で使う**: `-init_hw_device d3d11va` ＋
+  `-filter_complex` の中に置く形は、`hwmap=derive_device=cuda` が
+  `-40 (Function not implemented)` になり**起動しない**（同梱 ffmpeg 8.1.2-full で実測）。
+  `scale_cuda` も同じ理由で使えない。
+- **「GPUキャプチャだから低負荷」はそのままでは成立しない**: ゼロコピーが効くのは
+  無加工送出のときだけ。1080pスケールもLIVE時計オーバーレイも `hwdownload` を要求する。
+  実装は `hwdownload,format=bgra,...` 前提。`gdigrab` 側は CPU フレームなので**付けない**。
+- **キャプチャ寸法は奇数になりうる**（実測 `gdigrab desktop` = 5120x**1441**、
+  `title=VRChat` = 2021x1121）。yuv420p は偶数寸法を要求するため、
+  `scale=...:force_original_aspect_ratio=decrease` ＋ `pad` で偶数へ吸収する。
+- **`draw_mouse` の書式が両者で違う**: `ddagrab` は `draw_mouse=true|false`、
+  `gdigrab` は `-draw_mouse 1|0`。取り違えると起動しない。
+- **ディスプレイ枚数はプローブでしか分からない**: `ddagrab` に列挙APIは無く、
+  範囲外の `output_idx` は `Generic error in an external library` としか言わない。
+  `output_idx` を0から順に実起動して数える（60秒キャッシュ・実測3.4秒）。
+- **ctypes は `argtypes`/`restype` を全関数に指定する**: 省略すると64bitでHWNDが
+  `c_int` に切り詰められ、一部のウィンドウが理由も分からず一覧から消える。
+- 対象を見失ったときの**短命終了の後退**（1秒→最大15秒）を入れた。
+  これが無いとウィンドウを閉じた瞬間にプロセス生成の暴走になる。
+- **未確認**: VRChatワールド内での視聴、TopazChat併用時の実遅延、配信中の負荷。
+  手順は `docs/TASK23_実機テスト手順.md` にまとめた。
+  キャプチャ開始前のプレビュー確認は**未実装**。
+
+### 🎙️ PC出力音声・マイクの取り込み — タスク22
+- **追加**: 再生モード `live`。`dshow` 経由でマイクとPC出力音（ループバック）を
+  取り込み、待機画面を背景にHLS/RTMPへライブ配信する。両方選ぶと `amix` で合成。
+  設定は `live_audio_*` の5キー。
+- **追加**: `GET /api/audio_devices`・`POST /api/control` の `set_live_audio`
+  （どちらも**localhost限定**）。
+- **`-f wasapi` というデマクサは存在しない**: `ffmpeg -devices` で使える音声入力は
+  `dshow` と `openal` のみ。PC出力音を録るにはハード固有機能
+  （`What U Hear` 等）か第三者製の仮想オーディオデバイスが要る。
+- **`-vf` と `-filter_complex` は併用できない**: 時計オーバーレイ＋`amix` のとき、
+  時計を `[0:v]<clock>[vout]` として同じ `-filter_complex` に統合しないと起動しない。
+- **`-shortest` を付けない / `-max_interleave_delta 0` は必須**:
+  ライブ入力に終端が無く、2本は必ずドリフトする。既定の10秒を超えると
+  受信側HLSがセグメント出力を止める（タスク17で実際に起きた事故と同じ経路）。
+- **デバイス名は日本語で返る**: `-list_devices` の stderr は bytes で受け、
+  utf-8 → cp932 → replace の順でフォールバックする（`text=True` で Popen すると壊れる）。
+  また `-list_devices` は**必ず非ゼロ終了する**ので returncode で成否を判定してはいけない。
+- **未確認**: VRChatワールド内での視聴、TopazChat併用時の実遅延。
+
 ### 🎵 ラジオモードの曲間フェード — タスク17
 - **追加**: `radio_crossfade_duration`（既定 `3` 秒 / `0` で無効・最大5秒）。
   ラジオモードで曲の頭をフェードイン、終わりをフェードアウトし、
