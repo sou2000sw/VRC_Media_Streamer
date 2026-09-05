@@ -30,7 +30,7 @@
 | **20** | 🌐 UI/権限 | **通常ブラウザ利用時のサーバー操作ボタン（再起動・起動）非表示化** (Button Visibility) | v2.6.0 | 🟢 **実装完了 ✅** |
 | **21** | 🛡️ Web制御 | **Webリモコン機能の無効化・ホスト専用スタンドアロンモード** (Disable Web Remote / Host-Only Mode) | develop | 🟢 **実装完了 ✅** |
 | **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | develop | 🟡 **実装完了・VRC実機未確認** |
-| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | 未定 | 🔵 **検討中 📋** |
+| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | feature/task23-screen-share | 🟠 **実装準備中（方式実測済み）** |
 | **24** | 🎤 参加型 | **Webリモコンからの参加型カラオケ・楽器セッション機能** (Remote Karaoke & Session) | 未定 | 🔵 **検討中 📋** |
 
 ---
@@ -931,7 +931,7 @@ returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイス�
 
 ---
 
-## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【検討中 📋】
+## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【実装準備中 🟠】
 
 ### 概要
 ホストPCのデスクトップ画面全体、セカンダリディスプレイ、または特定のアプリケーションウィンドウ（ブラウザ、ゲーム、DAW、プレゼン資料等）をリアルタイムでキャプチャし、VRChatワールド内のプレイヤーへ低遅延で映像配信する画面共有機能。
@@ -958,6 +958,86 @@ returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイス�
 ### 検討課題・留意点
 - **解像度スケーリング**: 4K/WQHDディスプレイをそのまま配信すると帯域オーバーになるため、TopazChat推奨の 1080p/720p へのスケーリング（`scale=1920:1080:flags=bicubic`）を必須とする。
 - **セキュリティ・プライバシー保護**: 個人情報やパスワードの誤配信を防ぐため、特定ウィンドウ限定キャプチャ機能や、キャプチャ開始前のプレビュー・確認ダイアログの提供。
+
+### 実装準備の実測（2026-09-06 / ブランチ `feature/task23-screen-share`）
+
+同梱想定の ffmpeg 8.1.2-full (gyan.dev) を開発機（NVIDIA GPU / 2560x1440 ×2枚）で実測した結果。
+**上の「技術方式と実装設計」の記述には、実測で覆った点が2件ある。**
+
+#### 使えることを確認した入力
+
+| 方式 | 実測結果 |
+|---|---|
+| `-f lavfi -i ddagrab=output_idx=N:framerate=30` | ○ 画面0/1 とも 2560x1440 の **d3d11 ハードウェアフレーム**で取得 |
+| `-f gdigrab -i desktop` | ○ ただし**全画面の外接矩形** 5120x1441 が返る（マルチモニタ結合） |
+| `-f gdigrab -i "title=VRChat"` | ○ 2021x1121（ウィンドウの実サイズそのまま） |
+
+#### ★実測で覆った前提
+
+1. **「ddagrab は `-f lavfi -i` でも `-filter_complex` でも同じ」ではない。**
+   `-init_hw_device d3d11va -filter_complex "ddagrab=...,hwmap=derive_device=cuda,..."` は
+   `Failed to created derived device context: -40 (Function not implemented)` で**起動しない**。
+   このビルドは d3d11 → cuda の device derive を持たない。
+   → **`-f lavfi -i "ddagrab=..."` の入力形にすること。** この形なら
+   `-c:v h264_nvenc` が d3d11 フレームを直接受け取り、無変換で通る（実測 RC=0）。
+   `scale_cuda` も同じ理由で使えない。
+
+2. **「GPUキャプチャなのでCPU負荷極小」は、そのままでは成立しない。**
+   ゼロコピーが成立するのは **無加工でそのまま送るときだけ**。本機能では
+   ・TopazChat 向けの 1080p スケーリング（必須。素材は 2560x1440）
+   ・LIVE時計オーバーレイ（`drawtext`）
+   のどちらも `hwdownload` を挟まないと掛けられない。
+   → 実装は `[0:v]hwdownload,format=bgra,scale=...,format=yuv420p,<clock>[vout]` を前提に設計する。
+   ゼロコピーは「スケール無し・オーバーレイ無し」の特殊構成としてのみ成立する。
+
+#### 本番同等の通し確認（実測）
+
+タスク22の `build_dshow_audio_inputs()` / `get_clock_filter_for_config()` /
+`build_video_encoder_opts("h264_nvenc")` をそのまま呼び、映像を静止画から ddagrab へ
+差し替えた形（＝タスク22で意図した「映像ソースの差し替えだけ」）で 3 秒送出した。
+
+```
+ffmpeg -f lavfi -i ddagrab=output_idx=0:framerate=30
+       -f dshow -thread_queue_size 1024 -audio_buffer_size 50 -i audio=<マイク>
+       -f dshow -thread_queue_size 1024 -audio_buffer_size 50 -i audio=<ループバック>
+       -filter_complex "[0:v]hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=yuv420p,<drawtext>[vout];
+                        [1:a]volume=1.0[amic];[2:a]volume=0.7[apc];[amic][apc]amix=inputs=2:...[aout]"
+       -map [vout] -map [aout] <nvenc opts> -c:a aac -b:a 192k -ar 44100
+       -max_interleave_delta 0 -muxdelay 0 -muxpreload 0 -f mpegts ...
+```
+
+→ **RC=0 / 1.75MiB / ffprobe で h264 1920x1080 30fps ＋ aac 44100Hz stereo の2本を確認。**
+タスク22の設計（映像ソースだけ差し替える）が実際に成立することを実測で確認した。
+
+#### ★踏み抜きそうな罠（実装前に潰しておく点）
+
+- **キャプチャ解像度は奇数になりうる。** 実測で `gdigrab desktop` = 5120x**1441**、
+  `gdigrab title=VRChat` = 2021x1121。yuv420p は偶数寸法を要求するので、
+  スケール指定が無い経路には `scale=trunc(iw/2)*2:trunc(ih/2)*2` を必ず噛ませる。
+  「1080p固定にするから関係ない」ではなく、アスペクト維持のパディング経路でも同じ。
+- **`ddagrab` のディスプレイ列挙にきれいなエラーが無い。** `output_idx=2` は
+  `Error configuring filter graph: Generic error in an external library` としか言わない。
+  枚数はプローブ（`-t 0.5 -f null -` を idx 0 から順に試す）で決めるしかない。
+  `-list_devices` 相当は存在しない。
+- **`ddagrab` は画面が変化しないとフレームを出さない。** 実測で `dup=59 drop=6`。
+  出力fpsは `-r` で固定し、`dup_frames` の既定に頼る。可変fpsのまま HLS へ流さない。
+- **`-vf` と `-filter_complex` は併用できない**（タスク22と同じ罠）。音声 `amix` 有効時は
+  映像側チェーンも同じ `-filter_complex` に統合すること。
+- **`-shortest` を付けない / `-max_interleave_delta 0` は必須**（タスク22と同じ理由）。
+- **`relay_stream_data` は `is_paced=False`**（実時間駆動のため）。
+- **ウィンドウキャプチャは開始時の寸法で固定される。** 配信中に利用者がウィンドウを
+  リサイズしたときの挙動は未確認。UI 側で「開始後はサイズを変えない」旨の注意が要る。
+- **プライバシー**: `gdigrab desktop` は通知・パスワードマネージャ等も丸ごと映る。
+  既定はデスクトップ全体ではなく**ディスプレイ指定 or ウィンドウ指定**にし、
+  開始前にプレビューを見せる（上の「検討課題」の再確認）。
+
+#### 実装方針（この時点の決定）
+
+- 再生モード `"screen"` を追加し、`queue_monitor_loop` の「モード0」分岐を
+  ライブ音声と共通化する（どちらもキューを消費しない実時間ソース）。
+- 入力の組み立ては `build_screen_capture_input()`（`self` に触らない純粋関数）へ切り出し、
+  `build_dshow_audio_inputs()` と同じ粒度で単体テストする。
+- 音声はタスク22の設定をそのまま流用する（画面共有時にデスクトップ音も一緒に出るのが既定）。
 
 ---
 
