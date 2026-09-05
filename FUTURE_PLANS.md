@@ -30,7 +30,7 @@
 | **20** | 🌐 UI/権限 | **通常ブラウザ利用時のサーバー操作ボタン（再起動・起動）非表示化** (Button Visibility) | v2.6.0 | 🟢 **実装完了 ✅** |
 | **21** | 🛡️ Web制御 | **Webリモコン機能の無効化・ホスト専用スタンドアロンモード** (Disable Web Remote / Host-Only Mode) | develop | 🟢 **実装完了 ✅** |
 | **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | develop | 🟡 **実装完了・VRC実機未確認** |
-| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | feature/task23-screen-share | 🟠 **実装準備中（方式実測済み）** |
+| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | feature/task23-screen-share | 🟡 **実装完了・VRC実機未確認** |
 | **24** | 🎤 参加型 | **Webリモコンからの参加型カラオケ・楽器セッション機能** (Remote Karaoke & Session) | 未定 | 🔵 **検討中 📋** |
 
 ---
@@ -931,7 +931,7 @@ returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイス�
 
 ---
 
-## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【実装準備中 🟠】
+## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【実装完了・VRC実機未確認 🟡】
 
 ### 概要
 ホストPCのデスクトップ画面全体、セカンダリディスプレイ、または特定のアプリケーションウィンドウ（ブラウザ、ゲーム、DAW、プレゼン資料等）をリアルタイムでキャプチャし、VRChatワールド内のプレイヤーへ低遅延で映像配信する画面共有機能。
@@ -1038,6 +1038,61 @@ ffmpeg -f lavfi -i ddagrab=output_idx=0:framerate=30
 - 入力の組み立ては `build_screen_capture_input()`（`self` に触らない純粋関数）へ切り出し、
   `build_dshow_audio_inputs()` と同じ粒度で単体テストする。
 - 音声はタスク22の設定をそのまま流用する（画面共有時にデスクトップ音も一緒に出るのが既定）。
+
+### 実装したもの（2026-09-06）
+
+- `probe_ddagrab_display()` / `enumerate_capture_displays()` — ddagrab に列挙APIが無いため
+  `output_idx` を 0 から実際に起動して数える（最初の失敗で打ち切り・60秒キャッシュ）
+- `enumerate_capture_windows()` / `find_capture_window()` — ctypes で `EnumWindows`。
+  可視・非最小化・非cloaked・非ツールウィンドウ・160x120以上のみ。新規 pip 依存なし
+- `even_dimension()` / `build_screen_capture_input()` / `build_screen_video_filter()`（純粋関数）
+- `StreamerCore.play_screen_capture()` / `set_screen_capture_source()`、再生モード `"screen"` の追加
+- `queue_monitor_loop` の「モード0b: 画面共有」分岐（短命終了の後退つき）
+- `GET /api/capture_sources`（localhost限定）、`POST /api/control` の `set_screen_capture`（localhost限定）
+- **UI**: 再生モードピルに「画面共有」、設定タブに「画面共有」カード
+  （モニター／ウィンドウの切替・一覧再取得・解像度／fps／ビットレート・カーソル有無・注意書き2行）。
+  ★`plugin/ui/index.html` とのバイト一致を維持すること
+- `test_screen_capture.py`（14ケース）
+
+### 実機検証（2026-09-06）
+
+`python -m pytest` = **279 passed**。失敗2件（`test_transition` / `test_yt_dlp`）は
+**変更前のベースラインでも同じく落ちる**ネットワーク依存テストで、本変更とは無関係。
+
+自作テストは実物を触らないので、別途アプリのコードを直接呼んで実測した:
+
+- `enumerate_capture_displays()` → ディスプレイ2枚（各 2560x1440）を正しく検出（所要 3.4秒）
+- `enumerate_capture_windows()` → 可視ウィンドウ3件。日本語タイトル
+  （`#ゲームクリップ | bakabakka - Discord`）も壊れない
+- `find_capture_window()` → 完全一致は HIT、前方一致は **MISS**（意図どおり）
+- **モニター配信**: `ddagrab` + `hwdownload` + 時計オーバーレイ + NVENC →
+  rc=0 / 1.27MB / ffprobe で **h264 1280x720 20fps** を確認
+- **ウィンドウ配信**: 1294x1399（縦長）のウィンドウを `gdigrab` で取り込み、
+  `force_original_aspect_ratio=decrease` + `pad` で 720p へレターボックス →
+  rc=0 / 1.17MB / **h264 1280x720 20fps** を確認
+
+→ **ホスト側の送出は、モニター・ウィンドウの両方で通し確認済み。**
+
+### ★設計判断として残しておくこと
+
+- **ウィンドウは完全一致でしか掴めないので、部分一致のフォールバックを入れていない。**
+  実測で `GitHub - Google Chrome` がタブ切替により
+  `sou2000sw/VRC_Media_Streamer - Google Chrome` へ変わり、開けなくなることを確認した。
+  ここで前方一致に逃がすと、似た名前の別ウィンドウ（パスワードマネージャ等）を
+  映す事故になりうる。**見つからなければ諦めてエラーを出す**方を選んでいる。
+  UI には一覧の再取得ボタンとその旨の注意書きを置いた。
+- **ctypes は `argtypes`/`restype` を全関数に必ず指定する。** 省略すると 64bit で HWND が
+  `c_int` に切り詰められ、一部のウィンドウが理由も分からず一覧から消える（実装中に踏んだ）。
+- ディスプレイ列挙は ffmpeg を実起動するため 3.4秒かかる。60秒キャッシュしているが、
+  UI は「再取得」に待ち表示が要る。
+
+### 未実装・引き続き必要なもの
+
+- **VRChat実機での視聴確認**（ホスト側の送出までは確認済み。ワールド内での再生は未確認）
+- **TopazChat併用時の実遅延の実測**（プレゼン・実況用途で会話が成立するかは数値を取ってから）
+- キャプチャ開始前のプレビュー（「検討課題」に挙げた確認ダイアログ）は未実装。
+  現状は注意書きのみで、誤配信の最終防波堤になっていない
+- 画面共有中の負荷（CPU/GPU）の実測。1080p60 が現実的かは未測定
 
 ---
 

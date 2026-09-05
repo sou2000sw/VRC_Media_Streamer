@@ -120,6 +120,14 @@ DEFAULT_CONFIG = {
     "live_audio_mic_volume": 1.0,
     "live_audio_loopback_volume": 0.7,
     "live_audio_bitrate_kbps": 192,
+    "screen_capture_source_type": "display",   # "display" | "window"
+    "screen_capture_display_index": 0,
+    "screen_capture_window_title": "",
+    "screen_capture_framerate": 30,
+    "screen_capture_width": 1920,
+    "screen_capture_height": 1080,
+    "screen_capture_draw_mouse": True,
+    "screen_capture_bitrate_kbps": 4000,
     "radio_mode": False,
     "radio_bg_source": "card",
     # ラジオの曲頭・曲尾フェード秒数（0で無効・最大5秒）: タスク17
@@ -477,6 +485,259 @@ def build_dshow_audio_inputs(mic_device=None, loopback_device=None,
     audio_filter = f"[{i}:a]volume={mic_vol_str}[amic];[{j}:a]volume={loop_vol_str}[apc];[amic][apc]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
     audio_map = "[aout]"
     return (input_args, audio_filter, audio_map)
+
+
+_capture_displays_cache = (0.0, [])
+
+
+def probe_ddagrab_display(output_idx, timeout=8):
+    """ddagrab の output_idx が実在するかを1回試し、(ok, width, height) を返す。"""
+    cmd = [
+        get_ffmpeg_cmd(), "-hide_banner", "-f", "lavfi",
+        "-i", f"ddagrab=output_idx={output_idx}:framerate=5",
+        "-t", "0.3", "-f", "null", "-"
+    ]
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW
+        )
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            return (False, 0, 0)
+        err_text = decode_dshow_bytes(stderr_bytes)
+        m = re.search(r"Stream #0:0.*?, (\d+)x(\d+)", err_text)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            return (True, w, h)
+        return (True, 0, 0)
+    except Exception:
+        if proc:
+            kill_proc(proc)
+        return (False, 0, 0)
+
+
+def enumerate_capture_displays(max_outputs=8, use_cache=True):
+    """接続ディスプレイを ddagrab の output_idx 順に列挙する。"""
+    global _capture_displays_cache
+    now = time.time()
+    if use_cache and (now - _capture_displays_cache[0] < 60.0):
+        return list(_capture_displays_cache[1])
+
+    displays = []
+    for idx in range(max_outputs):
+        ok, w, h = probe_ddagrab_display(idx)
+        if not ok:
+            break
+        displays.append({
+            "index": idx,
+            "width": w,
+            "height": h,
+            "label": f"ディスプレイ{idx + 1} ({w}x{h})"
+        })
+
+    _capture_displays_cache = (now, displays)
+    return list(displays)
+
+
+def enumerate_capture_windows():
+    """キャプチャ候補になる可視トップレベルウィンドウを列挙する。"""
+    if sys.platform != "win32":
+        return []
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = wintypes.LONG
+
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+
+        EXCLUDE_TITLES = {
+            "Program Manager", "Windows 入力エクスペリエンス", "Windows Input Experience",
+            "Default IME", "MSCTFIME UI", "Discord Overlay", "NVIDIA GeForce Overlay"
+        }
+
+        results = []
+
+        def enum_windows_callback(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                if user32.IsIconic(hwnd):
+                    return True
+
+                ex_style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+                if ex_style & 0x00000080:  # WS_EX_TOOLWINDOW
+                    return True
+
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.strip()
+                if not title:
+                    return True
+
+                cloaked = ctypes.c_int(0)
+                dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                if cloaked.value != 0:
+                    return True
+
+                rect = RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return True
+
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w < 160 or h < 120:
+                    return True
+
+                if title in EXCLUDE_TITLES:
+                    return True
+
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+                results.append({
+                    "title": title,
+                    "width": int(w),
+                    "height": int(h),
+                    "pid": int(pid.value)
+                })
+            except Exception:
+                pass
+            return True
+
+        cb = WNDENUMPROC(enum_windows_callback)
+        user32.EnumWindows(cb, 0)
+
+        title_counts = {}
+        for r in results:
+            t = r["title"]
+            title_counts[t] = title_counts.get(t, 0) + 1
+
+        final_windows = []
+        for r in results:
+            final_windows.append({
+                "title": r["title"],
+                "width": r["width"],
+                "height": r["height"],
+                "pid": r["pid"],
+                "duplicate": (title_counts[r["title"]] > 1)
+            })
+
+        final_windows.sort(key=lambda x: x["title"])
+        return final_windows
+    except Exception:
+        return []
+
+
+def find_capture_window(title):
+    """保存されたタイトルのウィンドウが今も存在するかを完全一致で確かめる。"""
+    for w in enumerate_capture_windows():
+        if w.get("title") == title:
+            return w
+    return None
+
+
+def even_dimension(value, minimum=2):
+    """yuv420p 用に偶数へ切り下げる。"""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return minimum
+    if v < minimum:
+        return minimum
+    if v % 2 != 0:
+        v -= 1
+    return v
+
+
+def build_screen_capture_input(source_type="display", display_index=0, window_title="",
+                               framerate=30, draw_mouse=True):
+    """画面キャプチャ入力の ffmpeg 引数を組み立てる。(input_args, needs_hwdownload) を返す。"""
+    try:
+        fps = int(framerate)
+    except (TypeError, ValueError):
+        fps = 30
+    if fps < 1 or fps > 60:
+        fps = 30
+
+    if source_type == "window" and window_title:
+        dm = "1" if draw_mouse else "0"
+        input_args = [
+            "-f", "gdigrab", "-thread_queue_size", "1024",
+            "-framerate", str(fps), "-draw_mouse", dm,
+            "-i", f"title={window_title}"
+        ]
+        return (input_args, False)
+    else:
+        try:
+            idx = int(display_index)
+            if idx < 0:
+                idx = 0
+        except (TypeError, ValueError):
+            idx = 0
+        dm = "true" if draw_mouse else "false"
+        input_args = [
+            "-f", "lavfi", "-thread_queue_size", "1024",
+            "-i", f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
+        ]
+        return (input_args, True)
+
+
+def build_screen_video_filter(needs_hwdownload, out_width=1920, out_height=1080,
+                              clock_filter=None, in_label="0:v", out_label="vout"):
+    """[0:v] から [vout] までの映像フィルタチェーン1本を組み立てる。"""
+    w = even_dimension(out_width)
+    h = even_dimension(out_height)
+    parts = []
+    parts.append(f"[{in_label}]")
+    if needs_hwdownload:
+        parts.append("hwdownload,format=bgra,")
+    parts.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bicubic,")
+    parts.append(f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,")
+    parts.append("format=yuv420p")
+    if clock_filter:
+        parts.append("," + clock_filter)
+    parts.append(f"[{out_label}]")
+    return "".join(parts)
 
 
 def build_radio_audio_filter(crossfade_seconds, duration=0, seek_seconds=0,
@@ -1556,6 +1817,14 @@ class StreamerCore:
             "live_audio_loopback_device": str(self.config.get("live_audio_loopback_device", "")),
             "live_audio_mic_volume": float(self.config.get("live_audio_mic_volume", 1.0)),
             "live_audio_loopback_volume": float(self.config.get("live_audio_loopback_volume", 0.7)),
+            "screen_capture_source_type": str(self.config.get("screen_capture_source_type", "display")),
+            "screen_capture_display_index": int(self.config.get("screen_capture_display_index", 0)),
+            "screen_capture_window_title": str(self.config.get("screen_capture_window_title", "")),
+            "screen_capture_framerate": int(self.config.get("screen_capture_framerate", 30)),
+            "screen_capture_width": int(self.config.get("screen_capture_width", 1920)),
+            "screen_capture_height": int(self.config.get("screen_capture_height", 1080)),
+            "screen_capture_draw_mouse": bool(self.config.get("screen_capture_draw_mouse", True)),
+            "screen_capture_bitrate_kbps": int(self.config.get("screen_capture_bitrate_kbps", 4000)),
             "standby_mode": str(self.config.get("standby_mode", "image")),
             "standby_image_path": str(self.config.get("standby_image_path", "")),
             "has_prev": has_prev,
@@ -1573,17 +1842,17 @@ class StreamerCore:
         }
 
     def get_playback_mode(self):
-        """現在の再生モード ('video' | 'radio' | 'slideshow' | 'live') を取得"""
+        """現在の再生モード ('video' | 'radio' | 'slideshow' | 'live' | 'screen') を取得"""
         mode = self.config.get("playback_mode")
-        if mode in ("video", "radio", "slideshow", "live"):
+        if mode in ("video", "radio", "slideshow", "live", "screen"):
             return mode
         if self.config.get("radio_mode", False):
             return "radio"
         return "video"
 
     def set_playback_mode(self, mode: str):
-        """再生モードを設定 ('video' | 'radio' | 'slideshow' | 'live')"""
-        if mode not in ("video", "radio", "slideshow", "live"):
+        """再生モードを設定 ('video' | 'radio' | 'slideshow' | 'live' | 'screen')"""
+        if mode not in ("video", "radio", "slideshow", "live", "screen"):
             log_print(f"[Core] Invalid playback mode: {mode}")
             return self.get_playback_mode()
 
@@ -3530,6 +3799,62 @@ class StreamerCore:
             "live_audio_loopback_volume": self.config.get("live_audio_loopback_volume", 0.7),
         }
 
+    def set_screen_capture_source(self, source_type=None, display_index=None, window_title=None,
+                                  framerate=None, width=None, height=None,
+                                  draw_mouse=None, bitrate_kbps=None):
+        """画面キャプチャ設定（入力ソース・フレームレート・解像度等）を更新"""
+        if source_type in ("display", "window"):
+            self.config["screen_capture_source_type"] = source_type
+        if display_index is not None:
+            try:
+                idx = int(display_index)
+                self.config["screen_capture_display_index"] = max(0, min(7, idx))
+            except (TypeError, ValueError):
+                pass
+        if window_title is not None:
+            self.config["screen_capture_window_title"] = str(window_title)
+        if framerate is not None:
+            try:
+                fps = int(framerate)
+                self.config["screen_capture_framerate"] = max(1, min(60, fps))
+            except (TypeError, ValueError):
+                pass
+        if width is not None:
+            try:
+                w = int(width)
+                w_clamped = max(320, min(3840, w))
+                self.config["screen_capture_width"] = even_dimension(w_clamped)
+            except (TypeError, ValueError):
+                pass
+        if height is not None:
+            try:
+                h = int(height)
+                h_clamped = max(240, min(2160, h))
+                self.config["screen_capture_height"] = even_dimension(h_clamped)
+            except (TypeError, ValueError):
+                pass
+        if draw_mouse is not None:
+            self.config["screen_capture_draw_mouse"] = bool(draw_mouse)
+        if bitrate_kbps is not None:
+            try:
+                b = int(bitrate_kbps)
+                self.config["screen_capture_bitrate_kbps"] = max(500, min(20000, b))
+            except (TypeError, ValueError):
+                pass
+
+        self.save_config()
+        self.request_stream_reload()
+        return {
+            "source_type": self.config.get("screen_capture_source_type", "display"),
+            "display_index": self.config.get("screen_capture_display_index", 0),
+            "window_title": self.config.get("screen_capture_window_title", ""),
+            "framerate": self.config.get("screen_capture_framerate", 30),
+            "width": self.config.get("screen_capture_width", 1920),
+            "height": self.config.get("screen_capture_height", 1080),
+            "draw_mouse": self.config.get("screen_capture_draw_mouse", True),
+            "bitrate_kbps": self.config.get("screen_capture_bitrate_kbps", 4000),
+        }
+
     def play_live_audio(self):
         """PC音声・マイク（dshow経路）を静止画背景でHLS/RTMPライブ配信"""
         mic_dev = str(self.config.get("live_audio_mic_device", "")).strip()
@@ -3613,6 +3938,126 @@ class StreamerCore:
             log_print(f"[Player] Error starting live audio sender: {e}")
             self.status = "error"
             self.status_detail = f"Live audio sender error: {e}"
+            return None
+
+        with self.process_lock:
+            self.send_proc = proc
+
+        stop_event = threading.Event()
+        threading.Thread(target=self.relay_stream_data,
+                         args=(proc, self.current_stdin, stop_event, False), daemon=True).start()
+        threading.Thread(target=self.watch_send_proc,
+                         args=(proc, stop_event), daemon=True).start()
+        return stop_event
+
+    def play_screen_capture(self):
+        """ホストPCの画面（ディスプレイ or ウィンドウ）を音声つきでライブ配信"""
+        source_type = self.config.get("screen_capture_source_type", "display")
+        display_index = self.config.get("screen_capture_display_index", 0)
+        window_title = self.config.get("screen_capture_window_title", "")
+        framerate = self.config.get("screen_capture_framerate", 30)
+        width = self.config.get("screen_capture_width", 1920)
+        height = self.config.get("screen_capture_height", 1080)
+        draw_mouse = self.config.get("screen_capture_draw_mouse", True)
+        bitrate_kbps = self.config.get("screen_capture_bitrate_kbps", 4000)
+
+        if source_type == "window":
+            if not window_title:
+                self.status = "error"
+                self.status_detail = "キャプチャ対象のウィンドウが未選択です"
+                return None
+            win = find_capture_window(window_title)
+            if win is None:
+                log_print(f"[Player] Screen capture window not found: '{window_title}'")
+                self.status = "error"
+                self.status_detail = f"ウィンドウが見つかりません: {window_title}"
+                return None
+
+        if not self.ensure_stream_sink():
+            self.status = "error"
+            self.status_detail = "FFmpeg Error"
+            return None
+
+        has_clock = bool(self.config.get("overlay_clock_enabled", False) or self.config.get("overlay_clock_video", False))
+        clock_filter = get_clock_filter_for_config(self.config) if has_clock else None
+
+        mic_dev = self.config.get("live_audio_mic_device", "")
+        loop_dev = self.config.get("live_audio_loopback_device", "")
+        mic_vol = self.config.get("live_audio_mic_volume", 1.0)
+        loop_vol = self.config.get("live_audio_loopback_volume", 0.7)
+
+        input_args_a, audio_filter, audio_map = build_dshow_audio_inputs(
+            mic_device=mic_dev,
+            loopback_device=loop_dev,
+            mic_volume=mic_vol,
+            loopback_volume=loop_vol,
+            start_index=1
+        )
+
+        input_args_v, needs_hwdownload = build_screen_capture_input(
+            source_type=source_type,
+            display_index=display_index,
+            window_title=window_title,
+            framerate=framerate,
+            draw_mouse=draw_mouse
+        )
+
+        cmd = [get_ffmpeg_cmd()] + input_args_v + input_args_a
+
+        video_chain = build_screen_video_filter(needs_hwdownload, width, height, clock_filter)
+
+        if audio_filter:
+            cmd.extend(["-filter_complex", f"{video_chain};{audio_filter}"])
+        else:
+            cmd.extend(["-filter_complex", video_chain])
+
+        cmd.extend(["-map", "[vout]"])
+        if audio_map:
+            cmd.extend(["-map", audio_map])
+        else:
+            cmd.extend(["-an"])
+
+        try:
+            fps = int(framerate)
+        except (TypeError, ValueError):
+            fps = 30
+        fps = max(1, min(60, fps))
+
+        try:
+            b_kbps = int(bitrate_kbps)
+        except (TypeError, ValueError):
+            b_kbps = 4000
+        b_kbps = max(500, min(20000, b_kbps))
+
+        cmd.extend([
+            *build_video_encoder_opts(
+                self.get_video_encoder(),
+                v_kbps=b_kbps, max_kbps=int(b_kbps * 1.15), buf_kbps=b_kbps,
+                h264_profile="baseline", sc_threshold_zero=True,
+                gop_frames=fps * 2, fps=fps)
+        ])
+
+        if audio_map:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "44100"])
+
+        cmd.extend([
+            "-fflags", "+nobuffer+flush_packets", "-flush_packets", "1",
+            "-muxdelay", "0", "-muxpreload", "0", "-max_interleave_delta", "0",
+            *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"
+        ])
+
+        log_print(f"[Player] Encoder path=screen_capture source={source_type} display={display_index} window='{window_title}' fps={fps} size={width}x{height} b:v={b_kbps}k")
+
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0,
+                creationflags=CREATE_NO_WINDOW
+            )
+        except Exception as e:
+            log_print(f"[Player] Error starting screen capture sender: {e}")
+            self.status = "error"
+            self.status_detail = f"Screen capture sender error: {e}"
             return None
 
         with self.process_lock:
@@ -4368,6 +4813,74 @@ class StreamerCore:
                         time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
                     else:
                         self._live_audio_fail_streak = 0
+                        time.sleep(0.1)
+                    continue
+
+                # ==================== モード0b: 画面共有 ====================
+                if current_mode == "screen":
+                    self.current_video = {"title": "画面共有", "url": "", "duration": 0, "type": "screen_capture"}
+                    self.skip_event.clear()
+                    self.video_done_event.clear()
+                    self.status = "streaming"
+                    self.status_detail = "Screen capture"
+
+                    fail_streak = getattr(self, "_screen_capture_fail_streak", 0)
+                    screen_started_at = time.time()
+
+                    stop_event = self.play_screen_capture()
+                    if stop_event is None:
+                        self._screen_capture_fail_streak = min(fail_streak + 1, 10)
+                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                        continue
+
+                    while self.is_running and not self.skip_event.is_set():
+                        if self.get_playback_mode() != "screen":
+                            break
+
+                        if self._reload_due():
+                            self.reload_stream_event.clear()
+                            stop_event.set()
+                            with self.process_lock:
+                                if self.send_proc:
+                                    kill_proc(self.send_proc)
+                                self.send_proc = None
+                            time.sleep(0.2)
+                            break
+
+                        with self.process_lock:
+                            proc = self.send_proc
+                            h_proc = self.hls_proc
+
+                        if proc and proc.poll() is not None:
+                            log_print(f"[Monitor] Screen capture sender exited (exit={proc.returncode}).")
+                            self.status = "error"
+                            self.status_detail = "Screen capture sender exited"
+                            break
+
+                        if h_proc and h_proc.poll() is not None:
+                            log_print("[Monitor] Receiver FFmpeg crashed or exited during screen capture.")
+                            self.status = "error"
+                            self.status_detail = "Offline (Receiver Error)"
+                            break
+
+                        time.sleep(0.2)
+
+                    stop_event.set()
+                    with self.process_lock:
+                        if self.send_proc:
+                            kill_proc(self.send_proc)
+                        self.send_proc = None
+
+                    self.accumulated_pts += self.last_stream_duration + 0.1
+                    if self.skip_event.is_set():
+                        self.skip_event.clear()
+                    self.video_done_event.clear()
+
+                    if (time.time() - screen_started_at) < 3.0:
+                        self._screen_capture_fail_streak = min(fail_streak + 1, 10)
+                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                    else:
+                        self._screen_capture_fail_streak = 0
                         time.sleep(0.1)
                     continue
 
