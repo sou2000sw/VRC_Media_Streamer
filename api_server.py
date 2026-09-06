@@ -9,7 +9,7 @@ import time
 import ipaddress
 import hmac
 from urllib.parse import urlparse, parse_qs
-from streamer_core import BASE_PATH, HLS_DIR, StreamerCore, log_print, is_video_url_or_file, is_image_url_or_file, enumerate_dshow_audio_devices
+from streamer_core import BASE_PATH, HLS_DIR, StreamerCore, log_print, is_video_url_or_file, is_image_url_or_file, enumerate_dshow_audio_devices, enumerate_capture_displays, enumerate_capture_windows
 from version import APP_VERSION
 
 def _ui_html_candidates():
@@ -847,6 +847,30 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
             })
             return
 
+        elif path == "/api/capture_sources":
+            if not self.check_web_password_auth():
+                self.send_json_response(401, {
+                    "success": False,
+                    "error": "Unauthorized: Web password required or invalid.",
+                    "has_web_password": True
+                })
+                return
+            if not self.is_local_request():
+                self.send_json_response(403, {
+                    "error": "Forbidden: Capture source enumeration is restricted to localhost."
+                })
+                return
+            query_params = parse_qs(parsed.query)
+            use_cache = query_params.get("refresh", ["0"])[0] != "1"
+            displays = enumerate_capture_displays(use_cache=use_cache)
+            windows = enumerate_capture_windows()
+            self.send_json_response(200, {
+                "success": True,
+                "displays": displays,
+                "windows": windows
+            })
+            return
+
         # 3. API: QR Code Image
         elif path == "/api/qrcode":
             if not self.check_web_password_auth():
@@ -1202,7 +1226,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
             is_local = self.is_local_request()
 
             # 破壊的・全消去操作は常にローカルホスト限定
-            if action in ("clear_queue", "clear_photos", "stop", "set_live_audio") and not is_local:
+            if action in ("clear_queue", "clear_photos", "stop", "set_live_audio", "set_screen_capture") and not is_local:
                 self.send_json_response(403, {
                     "success": False,
                     "message": f"Forbidden: Action '{action}' is restricted to localhost."
@@ -1219,7 +1243,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     return
 
             # 再生制御操作の権限チェック
-            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode", "set_live_audio") and not is_local:
+            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode", "set_live_audio", "set_screen_capture") and not is_local:
                 if not self.streamer_core.config.get("allow_web_playback_control", True):
                     self.send_json_response(403, {
                         "success": False,
@@ -1256,6 +1280,18 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     "live_audio": res,
                     "message": "Live audio device settings updated."
                 })
+            elif action == "set_screen_capture":
+                res = self.streamer_core.set_screen_capture_source(
+                    source_type=body_json.get("source_type"),
+                    display_index=body_json.get("display_index"),
+                    window_title=body_json.get("window_title"),
+                    framerate=body_json.get("framerate"),
+                    width=body_json.get("width"),
+                    height=body_json.get("height"),
+                    draw_mouse=body_json.get("draw_mouse"),
+                    bitrate_kbps=body_json.get("bitrate_kbps"))
+                self.send_json_response(200, {"success": True, "screen_capture": res,
+                                              "message": "Screen capture source updated."})
             elif action == "set_radio_mode":
                 enabled = bool(body_json.get("enabled", True))
                 res = self.streamer_core.set_radio_mode(enabled)

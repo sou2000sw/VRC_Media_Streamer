@@ -30,7 +30,7 @@
 | **20** | 🌐 UI/権限 | **通常ブラウザ利用時のサーバー操作ボタン（再起動・起動）非表示化** (Button Visibility) | v2.6.0 | 🟢 **実装完了 ✅** |
 | **21** | 🛡️ Web制御 | **Webリモコン機能の無効化・ホスト専用スタンドアロンモード** (Disable Web Remote / Host-Only Mode) | develop | 🟢 **実装完了 ✅** |
 | **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | develop | 🟡 **実装完了・VRC実機未確認** |
-| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | 未定 | 🔵 **検討中 📋** |
+| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | feature/task23-screen-share | 🟡 **実装完了・VRC実機未確認** |
 | **24** | 🎤 参加型 | **Webリモコンからの参加型カラオケ・楽器セッション機能** (Remote Karaoke & Session) | 未定 | 🔵 **検討中 📋** |
 
 ---
@@ -923,6 +923,18 @@ returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイス�
 
 → ホスト側の経路は通し確認済み。**VRChatワールド内での視聴確認だけが未実施。**
 
+#### ★実機で判明した最大の落とし穴（2026-09-06）
+
+**共有元ウィンドウを隠すと、そのアプリが描画を止める。** 配信がカクついて見えるが
+アプリの不具合ではない。VRChatを共有元と同じモニタにフルスクリーンで置くと必ず起きる。
+
+実測（同一ビルド・同一設定・TopazChatのRTSPを直接解析）: 背面 1.4fps / 見えている 29.6fps。
+
+原因究明を何周も遠回りした理由は**測り方の誤り**だった。ffmpeg の `dup=` は
+`ddagrab` が内部で複製するぶんを数えないため「29.8fps 出ている」と誤認した。
+**実効fpsは「絵が実際に変わっているか」で数えること。** 詳細は
+`docs/TASK23_実機テスト手順.md` の冒頭に記載した。
+
 #### 未実装・引き続き必要なもの
 
 - **VRChat実機での視聴確認**（ホスト側の送出までは確認済み。ワールド内での再生は未確認）
@@ -931,7 +943,7 @@ returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイス�
 
 ---
 
-## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【検討中 📋】
+## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【実装完了・VRC実機未確認 🟡】
 
 ### 概要
 ホストPCのデスクトップ画面全体、セカンダリディスプレイ、または特定のアプリケーションウィンドウ（ブラウザ、ゲーム、DAW、プレゼン資料等）をリアルタイムでキャプチャし、VRChatワールド内のプレイヤーへ低遅延で映像配信する画面共有機能。
@@ -958,6 +970,141 @@ returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイス�
 ### 検討課題・留意点
 - **解像度スケーリング**: 4K/WQHDディスプレイをそのまま配信すると帯域オーバーになるため、TopazChat推奨の 1080p/720p へのスケーリング（`scale=1920:1080:flags=bicubic`）を必須とする。
 - **セキュリティ・プライバシー保護**: 個人情報やパスワードの誤配信を防ぐため、特定ウィンドウ限定キャプチャ機能や、キャプチャ開始前のプレビュー・確認ダイアログの提供。
+
+### 実装準備の実測（2026-09-06 / ブランチ `feature/task23-screen-share`）
+
+同梱想定の ffmpeg 8.1.2-full (gyan.dev) を開発機（NVIDIA GPU / 2560x1440 ×2枚）で実測した結果。
+**上の「技術方式と実装設計」の記述には、実測で覆った点が2件ある。**
+
+#### 使えることを確認した入力
+
+| 方式 | 実測結果 |
+|---|---|
+| `-f lavfi -i ddagrab=output_idx=N:framerate=30` | ○ 画面0/1 とも 2560x1440 の **d3d11 ハードウェアフレーム**で取得 |
+| `-f gdigrab -i desktop` | ○ ただし**全画面の外接矩形** 5120x1441 が返る（マルチモニタ結合） |
+| `-f gdigrab -i "title=VRChat"` | ○ 2021x1121（ウィンドウの実サイズそのまま） |
+
+#### ★実測で覆った前提
+
+1. **「ddagrab は `-f lavfi -i` でも `-filter_complex` でも同じ」ではない。**
+   `-init_hw_device d3d11va -filter_complex "ddagrab=...,hwmap=derive_device=cuda,..."` は
+   `Failed to created derived device context: -40 (Function not implemented)` で**起動しない**。
+   このビルドは d3d11 → cuda の device derive を持たない。
+   → **`-f lavfi -i "ddagrab=..."` の入力形にすること。** この形なら
+   `-c:v h264_nvenc` が d3d11 フレームを直接受け取り、無変換で通る（実測 RC=0）。
+   `scale_cuda` も同じ理由で使えない。
+
+2. **「GPUキャプチャなのでCPU負荷極小」は、そのままでは成立しない。**
+   ゼロコピーが成立するのは **無加工でそのまま送るときだけ**。本機能では
+   ・TopazChat 向けの 1080p スケーリング（必須。素材は 2560x1440）
+   ・LIVE時計オーバーレイ（`drawtext`）
+   のどちらも `hwdownload` を挟まないと掛けられない。
+   → 実装は `[0:v]hwdownload,format=bgra,scale=...,format=yuv420p,<clock>[vout]` を前提に設計する。
+   ゼロコピーは「スケール無し・オーバーレイ無し」の特殊構成としてのみ成立する。
+
+#### 本番同等の通し確認（実測）
+
+タスク22の `build_dshow_audio_inputs()` / `get_clock_filter_for_config()` /
+`build_video_encoder_opts("h264_nvenc")` をそのまま呼び、映像を静止画から ddagrab へ
+差し替えた形（＝タスク22で意図した「映像ソースの差し替えだけ」）で 3 秒送出した。
+
+```
+ffmpeg -f lavfi -i ddagrab=output_idx=0:framerate=30
+       -f dshow -thread_queue_size 1024 -audio_buffer_size 50 -i audio=<マイク>
+       -f dshow -thread_queue_size 1024 -audio_buffer_size 50 -i audio=<ループバック>
+       -filter_complex "[0:v]hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=yuv420p,<drawtext>[vout];
+                        [1:a]volume=1.0[amic];[2:a]volume=0.7[apc];[amic][apc]amix=inputs=2:...[aout]"
+       -map [vout] -map [aout] <nvenc opts> -c:a aac -b:a 192k -ar 44100
+       -max_interleave_delta 0 -muxdelay 0 -muxpreload 0 -f mpegts ...
+```
+
+→ **RC=0 / 1.75MiB / ffprobe で h264 1920x1080 30fps ＋ aac 44100Hz stereo の2本を確認。**
+タスク22の設計（映像ソースだけ差し替える）が実際に成立することを実測で確認した。
+
+#### ★踏み抜きそうな罠（実装前に潰しておく点）
+
+- **キャプチャ解像度は奇数になりうる。** 実測で `gdigrab desktop` = 5120x**1441**、
+  `gdigrab title=VRChat` = 2021x1121。yuv420p は偶数寸法を要求するので、
+  スケール指定が無い経路には `scale=trunc(iw/2)*2:trunc(ih/2)*2` を必ず噛ませる。
+  「1080p固定にするから関係ない」ではなく、アスペクト維持のパディング経路でも同じ。
+- **`ddagrab` のディスプレイ列挙にきれいなエラーが無い。** `output_idx=2` は
+  `Error configuring filter graph: Generic error in an external library` としか言わない。
+  枚数はプローブ（`-t 0.5 -f null -` を idx 0 から順に試す）で決めるしかない。
+  `-list_devices` 相当は存在しない。
+- **`ddagrab` は画面が変化しないとフレームを出さない。** 実測で `dup=59 drop=6`。
+  出力fpsは `-r` で固定し、`dup_frames` の既定に頼る。可変fpsのまま HLS へ流さない。
+- **`-vf` と `-filter_complex` は併用できない**（タスク22と同じ罠）。音声 `amix` 有効時は
+  映像側チェーンも同じ `-filter_complex` に統合すること。
+- **`-shortest` を付けない / `-max_interleave_delta 0` は必須**（タスク22と同じ理由）。
+- **`relay_stream_data` は `is_paced=False`**（実時間駆動のため）。
+- **ウィンドウキャプチャは開始時の寸法で固定される。** 配信中に利用者がウィンドウを
+  リサイズしたときの挙動は未確認。UI 側で「開始後はサイズを変えない」旨の注意が要る。
+- **プライバシー**: `gdigrab desktop` は通知・パスワードマネージャ等も丸ごと映る。
+  既定はデスクトップ全体ではなく**ディスプレイ指定 or ウィンドウ指定**にし、
+  開始前にプレビューを見せる（上の「検討課題」の再確認）。
+
+#### 実装方針（この時点の決定）
+
+- 再生モード `"screen"` を追加し、`queue_monitor_loop` の「モード0」分岐を
+  ライブ音声と共通化する（どちらもキューを消費しない実時間ソース）。
+- 入力の組み立ては `build_screen_capture_input()`（`self` に触らない純粋関数）へ切り出し、
+  `build_dshow_audio_inputs()` と同じ粒度で単体テストする。
+- 音声はタスク22の設定をそのまま流用する（画面共有時にデスクトップ音も一緒に出るのが既定）。
+
+### 実装したもの（2026-09-06）
+
+- `probe_ddagrab_display()` / `enumerate_capture_displays()` — ddagrab に列挙APIが無いため
+  `output_idx` を 0 から実際に起動して数える（最初の失敗で打ち切り・60秒キャッシュ）
+- `enumerate_capture_windows()` / `find_capture_window()` — ctypes で `EnumWindows`。
+  可視・非最小化・非cloaked・非ツールウィンドウ・160x120以上のみ。新規 pip 依存なし
+- `even_dimension()` / `build_screen_capture_input()` / `build_screen_video_filter()`（純粋関数）
+- `StreamerCore.play_screen_capture()` / `set_screen_capture_source()`、再生モード `"screen"` の追加
+- `queue_monitor_loop` の「モード0b: 画面共有」分岐（短命終了の後退つき）
+- `GET /api/capture_sources`（localhost限定）、`POST /api/control` の `set_screen_capture`（localhost限定）
+- **UI**: 再生モードピルに「画面共有」、設定タブに「画面共有」カード
+  （モニター／ウィンドウの切替・一覧再取得・解像度／fps／ビットレート・カーソル有無・注意書き2行）。
+  ★`plugin/ui/index.html` とのバイト一致を維持すること
+- `test_screen_capture.py`（14ケース）
+
+### 実機検証（2026-09-06）
+
+`python -m pytest` = **279 passed**。失敗2件（`test_transition` / `test_yt_dlp`）は
+**変更前のベースラインでも同じく落ちる**ネットワーク依存テストで、本変更とは無関係。
+
+自作テストは実物を触らないので、別途アプリのコードを直接呼んで実測した:
+
+- `enumerate_capture_displays()` → ディスプレイ2枚（各 2560x1440）を正しく検出（所要 3.4秒）
+- `enumerate_capture_windows()` → 可視ウィンドウ3件。日本語タイトル
+  （`#ゲームクリップ | bakabakka - Discord`）も壊れない
+- `find_capture_window()` → 完全一致は HIT、前方一致は **MISS**（意図どおり）
+- **モニター配信**: `ddagrab` + `hwdownload` + 時計オーバーレイ + NVENC →
+  rc=0 / 1.27MB / ffprobe で **h264 1280x720 20fps** を確認
+- **ウィンドウ配信**: 1294x1399（縦長）のウィンドウを `gdigrab` で取り込み、
+  `force_original_aspect_ratio=decrease` + `pad` で 720p へレターボックス →
+  rc=0 / 1.17MB / **h264 1280x720 20fps** を確認
+
+→ **ホスト側の送出は、モニター・ウィンドウの両方で通し確認済み。**
+
+### ★設計判断として残しておくこと
+
+- **ウィンドウは完全一致でしか掴めないので、部分一致のフォールバックを入れていない。**
+  実測で `GitHub - Google Chrome` がタブ切替により
+  `sou2000sw/VRC_Media_Streamer - Google Chrome` へ変わり、開けなくなることを確認した。
+  ここで前方一致に逃がすと、似た名前の別ウィンドウ（パスワードマネージャ等）を
+  映す事故になりうる。**見つからなければ諦めてエラーを出す**方を選んでいる。
+  UI には一覧の再取得ボタンとその旨の注意書きを置いた。
+- **ctypes は `argtypes`/`restype` を全関数に必ず指定する。** 省略すると 64bit で HWND が
+  `c_int` に切り詰められ、一部のウィンドウが理由も分からず一覧から消える（実装中に踏んだ）。
+- ディスプレイ列挙は ffmpeg を実起動するため 3.4秒かかる。60秒キャッシュしているが、
+  UI は「再取得」に待ち表示が要る。
+
+### 未実装・引き続き必要なもの
+
+- **VRChat実機での視聴確認**（ホスト側の送出までは確認済み。ワールド内での再生は未確認）
+- **TopazChat併用時の実遅延の実測**（プレゼン・実況用途で会話が成立するかは数値を取ってから）
+- キャプチャ開始前のプレビュー（「検討課題」に挙げた確認ダイアログ）は未実装。
+  現状は注意書きのみで、誤配信の最終防波堤になっていない
+- 画面共有中の負荷（CPU/GPU）の実測。1080p60 が現実的かは未測定
 
 ---
 

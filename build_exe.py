@@ -432,8 +432,25 @@ def verify_release(target_dir, port=8991, timeout=45):
                 return False
 
         # 3. CORS ヘッダが重複していないか (複数の ACAO はブラウザの CORS を失敗させる)
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=3) as r:
-            acao = r.headers.get_all("Access-Control-Allow-Origin") or []
+        #    ★/api/status は GET / より遅れて使えるようになる。ポートが開いた直後の
+        #      約2秒間、この経路だけが RemoteDisconnected で切れる（実測: Listening の
+        #      2秒後に出る `[Encoder] Probe ...` と窓が一致する。エンコーダープローブが
+        #      起動経路で実エンコードを1回走らせるため）。
+        #      GET / と同じようにここも待つ。1回だけ叩くと、ビルドが機嫌次第で落ちる。
+        acao = None
+        deadline = time.time() + timeout
+        last_err = None
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=5) as r:
+                    acao = r.headers.get_all("Access-Control-Allow-Origin") or []
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(1)
+        if acao is None:
+            print(f"[FAIL] /api/status did not respond within {timeout}s: {last_err}", flush=True)
+            return False
         if len(acao) != 1:
             print(f"[FAIL] Access-Control-Allow-Origin appears {len(acao)} times (must be exactly 1).", flush=True)
             return False
