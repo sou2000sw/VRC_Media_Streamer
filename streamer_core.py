@@ -747,6 +747,179 @@ def get_window_rect_by_hwnd(hwnd):
         return None
 
 
+_ddagrab_output_map_cache = {}
+
+
+def enumerate_display_monitors():
+    """接続モニタの矩形を列挙する。[{left, top, width, height, primary}] を返す。"""
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _RECT),
+                        ("rcWork", _RECT), ("dwFlags", wintypes.DWORD)]
+
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                                  ctypes.POINTER(_RECT), wintypes.LPARAM)
+        u.EnumDisplayMonitors.argtypes = [wintypes.HDC, ctypes.POINTER(_RECT), PROC, wintypes.LPARAM]
+        u.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MONITORINFO)]
+
+        out = []
+
+        def _cb(hmon, hdc, lprc, lparam):
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcMonitor
+                out.append({"hmon": int(hmon), "left": int(r.left), "top": int(r.top),
+                            "width": int(r.right - r.left), "height": int(r.bottom - r.top),
+                            "primary": bool(mi.dwFlags & 1)})
+            return True
+
+        u.EnumDisplayMonitors(None, None, PROC(_cb), 0)
+        return out
+    except Exception:
+        return []
+
+
+def get_monitor_for_window(hwnd):
+    """ウィンドウが乗っているモニタの矩形。見つからなければ None。"""
+    if sys.platform != "win32" or not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        u.MonitorFromWindow.restype = wintypes.HMONITOR
+        hm = int(u.MonitorFromWindow(wintypes.HWND(int(hwnd)), 2))  # MONITOR_DEFAULTTONEAREST
+        for m in enumerate_display_monitors():
+            if m["hmon"] == hm:
+                return m
+    except Exception:
+        pass
+    return None
+
+
+def clamp_rect_to_monitor(left, top, width, height, monitor):
+    """ウィンドウ矩形をモニタ矩形の内側へ収め、偶数寸法にする。
+
+    ★ddagrab は「その出力の内側」しか切り出せない。モニタをはみ出す指定は
+      起動できない（実測: ウィンドウ幅2568 > モニタ幅2560、オフセット -1 で失敗）。
+    """
+    mx, my = monitor["left"], monitor["top"]
+    mw, mh = monitor["width"], monitor["height"]
+    x = max(mx, int(left))
+    y = max(my, int(top))
+    w = min(int(left) + int(width), mx + mw) - x
+    h = min(int(top) + int(height), my + mh) - y
+    w -= w % 2
+    h -= h % 2
+    return (x, y, max(0, w), max(0, h))
+
+
+def _capture_thumb(args, tag):
+    """1フレームだけ取り出して 32x18 のグレースケール列を返す（照合用）。"""
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), f"_vrcms_probe_{tag}.png")
+    try:
+        p = subprocess.run([get_ffmpeg_cmd(), "-hide_banner", *args, "-frames:v", "1", "-y", path],
+                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+        if p.returncode != 0 or not os.path.exists(path):
+            return None
+        from PIL import Image
+        with Image.open(path) as im:
+            return list(im.convert("L").resize((32, 18)).getdata())
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def resolve_ddagrab_output_for_monitor(monitor, max_outputs=8):
+    """モニタに対応する ddagrab の output_idx を、実際の絵を照合して決める。
+
+    ★順番の一致を仮定してはいけない。取り違えると**別のモニタをそのまま配信する**。
+      ddagrab は出力の位置を返さないので、モニタ矩形と突き合わせる術が無い。
+      そこで gdigrab でそのモニタを1枚撮り、各 ddagrab 出力の同じ位置と
+      見比べて、いちばん近いものを採用する（実測の差: 正解 17.6 / 不正解 107.7 と
+      6倍の開きがあり、判定は安定する）。結果はモニタ原点をキーに覚える。
+    """
+    key = (monitor["left"], monitor["top"], monitor["width"], monitor["height"])
+    if key in _ddagrab_output_map_cache:
+        return _ddagrab_output_map_cache[key]
+
+    mx, my = monitor["left"], monitor["top"]
+    # モニタ中央の 640x360 を照合窓にする（端は壁紙で似がちなので中央を使う）
+    pw, ph = 640, 360
+    px = mx + max(0, (monitor["width"] - pw) // 2)
+    py = my + max(0, (monitor["height"] - ph) // 2)
+    ref = _capture_thumb(["-f", "gdigrab", "-framerate", "5",
+                          "-offset_x", str(px), "-offset_y", str(py),
+                          "-video_size", f"{pw}x{ph}", "-i", "desktop"], "ref")
+    if ref is None:
+        return None
+
+    best_idx, best_diff = None, None
+    for idx in range(max_outputs):
+        got = _capture_thumb(["-f", "lavfi", "-i",
+                              f"ddagrab=output_idx={idx}:framerate=5:video_size={pw}x{ph}"
+                              f":offset_x={px - mx}:offset_y={py - my}",
+                              "-vf", "hwdownload,format=bgra"], f"dda{idx}")
+        if got is None:
+            break
+        d = sum(abs(a - b) for a, b in zip(ref, got)) / len(ref)
+        if best_diff is None or d < best_diff:
+            best_idx, best_diff = idx, d
+
+    # 明らかに似ていなければ諦める（gdigrab 経路へ退避させる）
+    if best_idx is None or best_diff is None or best_diff > 60:
+        log_print(f"[Capture] ddagrab output mapping failed (best diff={best_diff}).")
+        return None
+    log_print(f"[Capture] Monitor origin=({mx},{my}) -> ddagrab output_idx={best_idx} (diff={best_diff:.1f})")
+    _ddagrab_output_map_cache[key] = best_idx
+    return best_idx
+
+
+def resolve_window_capture_plan(win):
+    """ウィンドウ取り込みの取り方を決める。
+
+    戻り値は ("ddagrab", output_idx, ox, oy, w, h) か ("gdigrab", x, y, w, h)。
+
+    ★既定を ddagrab にするのは速度のため。gdigrab(BitBlt) は切り出しが大きいほど
+      遅くなり、実測で 2568x1401 では実効 23.7fps（30fps指定に対し複製38）まで落ちて
+      カクつきとして見えた。同じ範囲でも ddagrab は 29.5fps を維持する
+      （640x360 まで小さくすれば gdigrab でも 29.5fps 出るので、サイズ依存であることも確認済み）。
+    """
+    if not win:
+        return None
+    mon = get_monitor_for_window(win.get("hwnd"))
+    if mon:
+        x, y, w, h = clamp_rect_to_monitor(win["left"], win["top"], win["width"], win["height"], mon)
+        if w >= 16 and h >= 16:
+            idx = resolve_ddagrab_output_for_monitor(mon)
+            if idx is not None:
+                return ("ddagrab", idx, x - mon["left"], y - mon["top"], w, h)
+    # 退避: 合成済みデスクトップからの切り出し（遅いが絵は正しい）
+    x, y, w, h = clamp_window_capture_rect(win["left"], win["top"], win["width"], win["height"])
+    w -= w % 2
+    h -= h % 2
+    if w < 16 or h < 16:
+        return None
+    return ("gdigrab", x, y, w, h)
+
+
 def get_virtual_screen_rect():
     """仮想デスクトップ全体の矩形 (left, top, width, height)。
 
@@ -790,7 +963,7 @@ def clamp_window_capture_rect(left, top, width, height, virtual_rect=None):
 
 
 def build_screen_capture_input(source_type="display", display_index=0, window_title="",
-                               framerate=30, draw_mouse=True, window_rect=None):
+                               framerate=30, draw_mouse=True, window_plan=None):
     """画面キャプチャ入力の ffmpeg 引数を組み立てる。(input_args, needs_hwdownload) を返す。
 
     ★ウィンドウ取り込みに `gdigrab -i "title=..."` を使ってはいけない。
@@ -809,9 +982,19 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
     if fps < 1 or fps > 60:
         fps = 30
 
-    if source_type == "window" and window_title and window_rect:
-        x, y, w, h = clamp_window_capture_rect(*window_rect)
-        if w >= 16 and h >= 16:
+    if source_type == "window" and window_title and window_plan:
+        kind = window_plan[0]
+        if kind == "ddagrab":
+            _, idx, ox, oy, w, h = window_plan
+            dm = "true" if draw_mouse else "false"
+            input_args = [
+                "-f", "lavfi", "-thread_queue_size", "1024",
+                "-i", (f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
+                       f":video_size={w}x{h}:offset_x={ox}:offset_y={oy}")
+            ]
+            return (input_args, True)
+        if kind == "gdigrab":
+            _, x, y, w, h = window_plan
             dm = "1" if draw_mouse else "0"
             # ★offset_x/offset_y は仮想画面の**絶対座標**。原点からの相対値を
             #   渡すと `extends outside window area` で起動しない（実測で確認）。
@@ -4132,10 +4315,12 @@ class StreamerCore:
         # ★ウィンドウ矩形は「配信を始める瞬間」の値を使う。以降ウィンドウを
         #   動かしても切り出し位置は追従しない（追従させるには送出の張り直しが
         #   要り、そのたびに画が飛ぶ）。動かしたら「適用」で取り直す運用にする。
-        window_rect = None
-        if win:
-            window_rect = (win.get("left", 0), win.get("top", 0),
-                           win.get("width", 0), win.get("height", 0))
+        window_plan = resolve_window_capture_plan(win) if win else None
+        if source_type == "window" and window_plan is None:
+            log_print("[Player] Screen capture: could not resolve window capture plan.")
+            self.status = "error"
+            self.status_detail = "ウィンドウの取り込み方を決められませんでした"
+            return None
 
         input_args_v, needs_hwdownload = build_screen_capture_input(
             source_type=source_type,
@@ -4143,8 +4328,10 @@ class StreamerCore:
             window_title=window_title,
             framerate=framerate,
             draw_mouse=draw_mouse,
-            window_rect=window_rect
+            window_plan=window_plan
         )
+        if window_plan:
+            log_print(f"[Player] Window capture via {window_plan[0]} {window_plan[1:]}")
 
         cmd = [get_ffmpeg_cmd()] + input_args_v + input_args_a
 

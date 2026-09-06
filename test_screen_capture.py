@@ -38,40 +38,57 @@ def test_build_screen_capture_input_display_draw_mouse_false():
     assert "draw_mouse=false" in joined
 
 
-def test_build_screen_capture_input_window():
-    """ウィンドウ取り込みは「デスクトップをウィンドウ矩形で切り出す」形になる。
+def test_build_screen_capture_input_window_ddagrab():
+    """ウィンドウ取り込みの既定は ddagrab の切り出し（速度のため）。
 
-    ★`title=` を使ってはいけない。GPU合成されたウィンドウが真っ黒/真っ白になる
-      （実測: Chrome と Electron は mean=0.0、Unity は mean=255.0）。
+    ★gdigrab(BitBlt) は切り出しが大きいほど遅い。実測で 2568x1401 では
+      実効23.7fps まで落ち、カクつきとして見えた。ddagrab は同じ範囲で29.5fps。
     """
     args, needs_hwdownload = build_screen_capture_input(
         source_type="window", window_title="メモ帳", framerate=30, draw_mouse=True,
-        window_rect=(100, 50, 800, 600))
-    assert needs_hwdownload is False
-    assert "-f" in args and "gdigrab" in args
-    idx_i = args.index("-i")
-    assert args[idx_i + 1] == "desktop"
-    assert args[args.index("-offset_x") + 1] == "100"
-    assert args[args.index("-offset_y") + 1] == "50"
-    assert args[args.index("-video_size") + 1] == "800x600"
-    assert args[args.index("-draw_mouse") + 1] == "1"
-
-    # ★回帰ガード: title= 経路へ戻したら落とす
+        window_plan=("ddagrab", 1, 10, 20, 800, 600))
+    assert needs_hwdownload is True
+    joined = " ".join(args)
+    assert "ddagrab=output_idx=1" in joined
+    assert "video_size=800x600" in joined
+    assert "offset_x=10" in joined and "offset_y=20" in joined
+    assert "draw_mouse=true" in joined
+    # ★回帰ガード: title= 経路へ戻したら落とす（GPU合成ウィンドウが真っ黒になる）
     assert not any(str(a).startswith("title=") for a in args)
 
-    args0, _ = build_screen_capture_input(
-        source_type="window", window_title="メモ帳", framerate=30, draw_mouse=False,
-        window_rect=(100, 50, 800, 600))
-    assert args0[args0.index("-draw_mouse") + 1] == "0"
 
-
-def test_build_screen_capture_input_window_without_rect_falls_back():
-    """矩形が取れないウィンドウは掴めない。ディスプレイ取り込みへ落とす。"""
+def test_build_screen_capture_input_window_gdigrab_fallback():
+    """ddagrab に載せられないときは合成済みデスクトップの切り出しへ退避する。"""
     args, needs_hwdownload = build_screen_capture_input(
-        source_type="window", window_title="メモ帳", framerate=30, window_rect=None)
+        source_type="window", window_title="メモ帳", framerate=30, draw_mouse=False,
+        window_plan=("gdigrab", 100, 50, 800, 600))
+    assert needs_hwdownload is False
+    assert args[args.index("-i") + 1] == "desktop"
+    assert args[args.index("-offset_x") + 1] == "100"
+    assert args[args.index("-video_size") + 1] == "800x600"
+    assert args[args.index("-draw_mouse") + 1] == "0"
+    assert not any(str(a).startswith("title=") for a in args)
+
+
+def test_build_screen_capture_input_window_without_plan_falls_back():
+    """取り込み方が決まらないウィンドウはディスプレイ取り込みへ落とす。"""
+    args, needs_hwdownload = build_screen_capture_input(
+        source_type="window", window_title="メモ帳", framerate=30, window_plan=None)
     assert needs_hwdownload is True
     assert "lavfi" in args
     assert not any(str(a).startswith("title=") for a in args)
+
+
+def test_clamp_rect_to_monitor():
+    """モニタ矩形でクランプし偶数寸法にする。
+
+    ★ddagrab はその出力の内側しか切り出せない。実測でウィンドウ幅2568が
+      モニタ幅2560を超え、オフセット -1 と併せて起動に失敗した。
+    """
+    from streamer_core import clamp_rect_to_monitor
+    mon = {"left": -2560, "top": 1, "width": 2560, "height": 1440}
+    assert clamp_rect_to_monitor(-2568, -7, 2576, 1408, mon) == (-2560, 1, 2560, 1400)
+    assert clamp_rect_to_monitor(-2000, 100, 800, 600, mon) == (-2000, 100, 800, 600)
 
 
 def test_clamp_window_capture_rect():
@@ -87,12 +104,6 @@ def test_clamp_window_capture_rect():
     assert clamp_window_capture_rect(672, 296, 1216, 808, virt) == (672, 296, 1216, 808)
     # 右下がはみ出すケース
     assert clamp_window_capture_rect(2000, 1200, 1000, 1000, virt) == (2000, 1200, 560, 241)
-
-
-def test_build_screen_capture_input_window_empty_title_fallback():
-    args, needs_hwdownload = build_screen_capture_input(source_type="window", window_title="", framerate=30, draw_mouse=True)
-    assert needs_hwdownload is True
-    assert "-f" in args and "lavfi" in args
 
 
 def test_build_screen_capture_input_framerate_clamping():
