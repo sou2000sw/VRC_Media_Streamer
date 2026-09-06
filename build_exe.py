@@ -21,7 +21,7 @@ from version import APP_VERSION  # バージョンの正本は version.py（UI�
 # 配布物に含めてはいけない実行時生成物・作業ファイル。
 # hls_output/ には利用者がアップロードした写真が溜まるため、同梱するとプライバシー漏洩になる。
 EXCLUDED_DIRS = {"hls_output", "__pycache__", ".pytest_cache", ".git", "build"}
-EXCLUDED_FILE_SUFFIXES = (".log", ".pyc", ".pyo", ".tmp", ".prebuild")
+EXCLUDED_FILE_SUFFIXES = (".log", ".pyc", ".pyo", ".tmp")
 
 
 def iter_packagable_files(root_dir):
@@ -88,37 +88,17 @@ def sync_plugin_root_assets(plugin_root):
     return copied
 
 
-def load_dist_config(overrides=None):
-    """配布用テンプレート config.dist.json を読み、上書き値を適用して返す。"""
-    template = os.path.abspath("config.dist.json")
-    if not os.path.exists(template):
-        return None
-    with open(template, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    if overrides:
-        cfg.update(overrides)
-    return cfg
-
-
-def write_dist_config(dest_path, overrides=None, preserve_existing=False):
+def write_dist_config(dest_path, overrides=None):
     """配布用テンプレート config.dist.json から設定ファイルを生成する。
 
     開発中の作業用 config.json をそのまま同梱すると、開発者のローカル設定
     (ポート・トンネル無効・ラジオ背景など) が配布物の既定値になってしまうため、
     配布用テンプレートを正本として分離している。
-
-    ★preserve_existing=True のとき、既にファイルがあれば触らない。
-      releases/ のフォルダをそのまま実運用に使う場合、ここを毎回上書きすると
-      ビルドのたびに**ストリームキーまで消えてワールド用URLが変わる**。
-      配布ZIPには別途テンプレートを詰めるので、配布物の清潔さは保たれる。
     """
     template = os.path.abspath("config.dist.json")
     if not os.path.exists(template):
         print("[WARN] config.dist.json not found; skipping config generation.", flush=True)
         return False
-    if preserve_existing and os.path.exists(dest_path):
-        print(f"[OK] Kept existing config.json (運用設定を温存): {dest_path}", flush=True)
-        return True
     with open(template, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     if overrides:
@@ -326,9 +306,8 @@ def create_versioned_release(version=APP_VERSION):
     copy_media_tools(target_dir, os.path.basename(target_dir) + "/")
 
     # 3. config.json の生成 (配布用テンプレート config.dist.json から)
-    #    ★既にあるなら残す。releases/ をそのまま運用フォルダに使う運用のため。
-    if write_dist_config(os.path.join(target_dir, "config.json"), preserve_existing=True):
-        print("[OK] config.json ready", flush=True)
+    if write_dist_config(os.path.join(target_dir, "config.json")):
+        print("[OK] Generated config.json from config.dist.json", flush=True)
 
     # 4. ドキュメント類のコピー
     #    正本はリポジトリ直下に置く。dist/ は .gitignore 対象のビルド成果物であり、
@@ -360,16 +339,9 @@ def create_versioned_release(version=APP_VERSION):
     zip_path = os.path.join(releases_root, f"{release_dir_name}.zip")
     print(f"Creating ZIP archive: {zip_path} ...", flush=True)
     try:
-        dist_cfg = load_dist_config()
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for file_path in iter_packagable_files(target_dir):
                 arcname = os.path.relpath(file_path, releases_root)
-                # ★配布ZIPには運用中の config.json を入れない。
-                #   ストリームキーは実質パスワードで、配ると配信を乗っ取られる。
-                if os.path.basename(file_path).lower() == "config.json" and dist_cfg is not None:
-                    zf.writestr(arcname, json.dumps(dist_cfg, ensure_ascii=False, indent=2))
-                    print("[OK] ZIP内の config.json はテンプレートに差し替えた", flush=True)
-                    continue
                 zf.write(file_path, arcname)
         print(f"[OK] Successfully generated ZIP: {zip_path}", flush=True)
     except Exception as e:
@@ -379,16 +351,6 @@ def create_versioned_release(version=APP_VERSION):
     package_plugin(version)
 
     # 8. 配布物のスモークテスト
-    #    ★検証はEXEを実際に起動するので config.json が書き換わる（ストリームキーの
-    #      生成など）。releases/ を運用フォルダとして使う前提なので、先に控えを取り、
-    #      検証後に戻す。控えは verify_release の後始末で消える。
-    _cfg = os.path.join(target_dir, "config.json")
-    if os.path.exists(_cfg):
-        try:
-            shutil.copy2(_cfg, _cfg + ".prebuild")
-        except Exception as e:
-            print(f"[WARN] config.json の控えを取れなかった: {e}", flush=True)
-
     if not verify_release(target_dir):
         print("[FAIL] Release verification failed. See errors above.", flush=True)
         sys.exit(1)
@@ -556,20 +518,9 @@ def verify_release(target_dir, port=8991, timeout=45):
             if os.path.isdir(stale):
                 print(f"[WARN] Could not remove runtime artifacts: {stale}", flush=True)
 
-        # ★検証起動はEXEを実際に動かすので config.json が書き換わる
-        #   （ストリームキーの生成など）。運用設定を壊さないよう、
-        #   検証前に取った控えへ戻す。控えが無いときだけテンプレートから作る。
-        cfg_path = os.path.join(target_dir, "config.json")
-        backup = cfg_path + ".prebuild"
-        if os.path.exists(backup):
-            try:
-                shutil.copy2(backup, cfg_path)
-                os.remove(backup)
-                print("[OK] 検証前の config.json へ復帰した", flush=True)
-            except Exception as e:
-                print(f"[WARN] config.json の復帰に失敗: {e}", flush=True)
-        else:
-            write_dist_config(cfg_path)
+        # 検証起動によって config.json に実行時の値が書き戻されていないか確認し、
+        # 差異があればテンプレートから生成し直す。
+        write_dist_config(os.path.join(target_dir, "config.json"))
 
 
 def build(version=APP_VERSION):
