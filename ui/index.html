@@ -763,6 +763,28 @@
                         </div>
                     </div>
 
+                    <!-- アプリ単位の音声（タスク25）。Discordと同じく、選んだウィンドウの
+                         プロセスが鳴らしている音だけをWASAPIプロセスループバックで取り込む。 -->
+                    <div class="flex flex-col gap-2 pt-3 border-t border-border">
+                        <label class="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                            <input type="checkbox" id="liveAudioAppEnabled" onchange="applyLiveAudioAppSettings()" class="accent-emerald-400">
+                            <span>アプリ単位の音声（選んだウィンドウの音だけ）</span>
+                        </label>
+                        <select id="liveAudioAppWindow" onchange="applyLiveAudioAppSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="">（選択してください）</option>
+                        </select>
+                        <div class="flex items-center gap-2">
+                            <input type="range" id="liveAudioAppVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioAppSettings()" class="flex-1 accent-emerald-400">
+                            <span id="liveAudioAppVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
+                        </div>
+                        <p id="liveAudioAppUnavailable" class="hidden text-[11px] text-amber-400/90">
+                            &#9888; アプリ単位の音声取り込みに必要な補助プログラム（app_audio_capture.exe）が見つかりません。この項目を有効にしても、従来のPC出力音声／マイクだけで配信されます。
+                        </p>
+                        <p class="text-[11px] text-zinc-500">
+                            ※選んだウィンドウのプロセス（とその子プロセス）が鳴らしている音だけを取り込みます。ブラウザやDiscordのように音を別プロセスが出すアプリでも取り込めますが、ストアアプリなど一部は取り込めないことがあります。対象が見つからないときは自動で従来の経路に切り替わり、配信は止まりません。
+                        </p>
+                    </div>
+
                     <p id="liveAudioLoopbackHint" class="hidden text-[11px] text-amber-400/90">
                         ⚠️ このPCにはループバック録音に使えるデバイスが見つかりませんでした。PC出力音声を配信するには、サウンドカードの「ステレオ ミキサー / What U Hear」を有効にするか、VB-CABLE / VB-Audio Voicemeeter などの仮想オーディオデバイスの導入が必要です。マイク入力だけなら追加導入なしで使えます。
                     </p>
@@ -2956,9 +2978,14 @@
             const loopLabel = document.getElementById('liveAudioLoopbackVolumeLabel');
             if (mic && micLabel) micLabel.innerText = Number(mic.value).toFixed(2);
             if (loop && loopLabel) loopLabel.innerText = Number(loop.value).toFixed(2);
+            const app = document.getElementById('liveAudioAppVolume');
+            const appLabel = document.getElementById('liveAudioAppVolumeLabel');
+            if (app && appLabel) appLabel.innerText = Number(app.value).toFixed(2);
         }
 
         async function loadAudioDevices(force = false) {
+            // アプリ音声のウィンドウ一覧も同じ操作で更新する（別ボタンを増やさない）。
+            loadAppAudioWindows(force);
             const card = document.getElementById('liveAudioCard');
             if (!card) return;
             if (!isLocalEnvironment()) {
@@ -3076,6 +3103,86 @@
             }
             if (micVol && typeof data.live_audio_mic_volume === 'number') micVol.value = data.live_audio_mic_volume;
             if (loopVol && typeof data.live_audio_loopback_volume === 'number') loopVol.value = data.live_audio_loopback_volume;
+            updateLiveAudioVolumeLabels();
+            syncLiveAudioAppFromStatus(data);
+        }
+
+        // ===== アプリ単位の音声（タスク25） =====
+        // ウィンドウ一覧は画面共有と同じ /api/capture_sources を使い回す。
+        // 列挙のコストを二重に払う理由がない。
+        let appAudioWindowsLoaded = false;
+
+        async function loadAppAudioWindows(force = false) {
+            const sel = document.getElementById('liveAudioAppWindow');
+            if (!sel || !isLocalEnvironment()) return;
+            try {
+                const url = `${apiBase}/api/capture_sources${force ? '?refresh=1' : ''}`;
+                const res = await fetch(url, { cache: 'no-store' });
+                if (!res.ok) return;
+                const data = await res.json();
+                const windows = Array.isArray(data.windows) ? data.windows : [];
+                const keep = sel.value;
+                sel.innerHTML = '';
+                const none = document.createElement('option');
+                none.value = '';
+                none.textContent = '（選択してください）';
+                sel.appendChild(none);
+                windows.forEach(w => {
+                    const opt = document.createElement('option');
+                    opt.value = w.title;
+                    opt.textContent = w.duplicate ? `${w.title}（同名が複数）` : w.title;
+                    sel.appendChild(opt);
+                });
+                if (keep) sel.value = keep;
+                appAudioWindowsLoaded = true;
+            } catch (e) { /* 列挙に失敗しても配信操作は続けられるので黙って諦める */ }
+        }
+
+        async function applyLiveAudioAppSettings() {
+            liveAudioUserChangedAt = Date.now();
+            updateLiveAudioVolumeLabels();
+            const en = document.getElementById('liveAudioAppEnabled');
+            const win = document.getElementById('liveAudioAppWindow');
+            const vol = document.getElementById('liveAudioAppVolume');
+            if (!en || !win || !vol) return;
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'set_live_audio_app',
+                        enabled: en.checked,
+                        window_title: win.value,
+                        volume: Number(vol.value)
+                    })
+                });
+                if (res.ok) {
+                    showToast('アプリ音声設定を保存しました', 'success');
+                    checkServerHealth(true);
+                } else {
+                    showToast('アプリ音声設定の保存に失敗しました', 'danger');
+                }
+            } catch (e) {
+                showToast('アプリ音声設定の保存に失敗しました', 'danger');
+            }
+        }
+
+        function syncLiveAudioAppFromStatus(data) {
+            if (!data) return;
+            if (Date.now() - liveAudioUserChangedAt < 4000) return;
+            const en = document.getElementById('liveAudioAppEnabled');
+            const win = document.getElementById('liveAudioAppWindow');
+            const vol = document.getElementById('liveAudioAppVolume');
+            const warn = document.getElementById('liveAudioAppUnavailable');
+            if (en && typeof data.live_audio_app_enabled === 'boolean') en.checked = data.live_audio_app_enabled;
+            if (win && typeof data.live_audio_app_window_title === 'string' && appAudioWindowsLoaded) {
+                if (win.value !== data.live_audio_app_window_title) win.value = data.live_audio_app_window_title;
+            }
+            if (vol && typeof data.live_audio_app_volume === 'number') vol.value = data.live_audio_app_volume;
+            // 補助exeが無い環境では、有効にしても効かないことを明示する。
+            if (warn && typeof data.app_audio_available === 'boolean') {
+                warn.classList.toggle('hidden', data.app_audio_available);
+            }
             updateLiveAudioVolumeLabels();
         }
 

@@ -199,6 +199,19 @@ def get_ffprobe_source():
     """
     return _find_bundled_tool("ffprobe")
 
+def get_app_audio_capture_source():
+    """アプリ単位の音声取り込み補助exe（タスク25）のパスを取得。
+
+    .gitignore が *.exe を全除外しているためリポジトリには入らない。
+    native/app_audio_capture/build.bat でビルドした成果物をここから拾う。
+    無ければ同梱を省く（実行時に自動で従来のdshow経路へ落ちる）。
+    """
+    local = os.path.abspath(os.path.join(
+        "native", "app_audio_capture", "build", "app_audio_capture.exe"))
+    if os.path.exists(local):
+        return local
+    return _find_bundled_tool("app_audio_capture")
+
 def copy_media_tools(target_dir, label):
     """ffmpeg.exe / ffprobe.exe を配布先へコピーする"""
     for name, finder in (("ffmpeg", get_ffmpeg_source), ("ffprobe", get_ffprobe_source)):
@@ -208,6 +221,16 @@ def copy_media_tools(target_dir, label):
             print(f"[OK] Copied {name}.exe -> {label}", flush=True)
         else:
             print(f"[WARN] {name}.exe was not found to package.", flush=True)
+
+    # 補助exeは「無ければ機能が無効になるだけ」なので、欠けても配布は止めない。
+    app_audio = get_app_audio_capture_source()
+    if app_audio and os.path.exists(app_audio):
+        shutil.copy2(app_audio, os.path.join(target_dir, "app_audio_capture.exe"))
+        print(f"[OK] Copied app_audio_capture.exe -> {label}", flush=True)
+    else:
+        print("[WARN] app_audio_capture.exe was not found. "
+              "アプリ単位の音声取り込みは無効のまま配布されます "
+              "(native/app_audio_capture/build.bat でビルドしてください)。", flush=True)
 
 def package_plugin(version=APP_VERSION):
     """plugin/ フォルダの資材を整理し、VRCBeacon用プラグインZIPパッケージを生成"""

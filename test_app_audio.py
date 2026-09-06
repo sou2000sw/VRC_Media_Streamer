@@ -209,3 +209,83 @@ def test_reap_helper_noop_without_helper():
     with patch("streamer_core.kill_proc") as kp:
         core.reap_app_audio_helper(sender, None)
     kp.assert_not_called()
+
+
+# ---------------------------------------------------------------- 配線（結合）
+
+def _fake_helper():
+    """補助exeの代役。stdout は「これが子プロセスへ渡ったか」を見るための目印。"""
+    helper = MagicMock()
+    helper.stdout = MagicMock()
+    return helper
+
+
+def _run_screen_capture(monkeypatch, core, helper):
+    """play_screen_capture を実プロセスなしで走らせ、組み立てられたコマンドを返す。"""
+    import streamer_core as sc
+    captured = {}
+
+    class _FakeProc:
+        returncode = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def _fake_popen(cmd, *a, **kw):
+        captured["cmd"] = cmd
+        captured["stdin"] = kw.get("stdin")
+        return _FakeProc()
+
+    monkeypatch.setattr(core, "ensure_stream_sink", lambda: True)
+    monkeypatch.setattr(core, "get_video_encoder", lambda: "libx264")
+    monkeypatch.setattr(sc.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(core, "relay_stream_data", lambda *a, **k: None)
+    monkeypatch.setattr(core, "watch_send_proc", lambda *a, **k: None)
+    monkeypatch.setattr(core, "reap_app_audio_helper", lambda *a, **k: None)
+    monkeypatch.setattr(core, "start_app_audio_capture", lambda: helper)
+    core.play_screen_capture()
+    return captured
+
+
+def test_screen_capture_feeds_app_audio_through_stdin(monkeypatch):
+    """アプリ音声が有効なら、生PCM入力が入り、補助exeの stdout が子の stdin になる。"""
+    core = _core()
+    helper = _fake_helper()
+    try:
+        core.config["live_audio_mic_device"] = ""
+        core.config["live_audio_loopback_device"] = ""
+        core.config["screen_capture_source_type"] = "display"
+        core.config["screen_capture_display_index"] = 0
+        cap = _run_screen_capture(monkeypatch, core, helper)
+
+        cmd = cap.get("cmd")
+        assert cmd is not None, "送出プロセスが組み立てられていない"
+        joined = " ".join(str(c) for c in cmd)
+        assert "s16le" in joined, "アプリ音声の生PCM入力が入っていない"
+        assert "pipe:0" in joined, "stdin から読む指定になっていない"
+        # 無音トラックで埋められていないこと（アプリ音声が本物の音声トラック）
+        assert "anullsrc" not in joined
+        assert cap.get("stdin") is helper.stdout, "補助exeの stdout が子の stdin に渡っていない"
+        helper.stdout.close.assert_called_once()
+    finally:
+        core.shutdown()
+
+
+def test_screen_capture_falls_back_when_helper_unavailable(monkeypatch):
+    """補助exeが使えないときは従来経路へ落ち、配信は止まらない。"""
+    core = _core()
+    try:
+        core.config["live_audio_mic_device"] = ""
+        core.config["live_audio_loopback_device"] = ""
+        core.config["screen_capture_source_type"] = "display"
+        core.config["screen_capture_display_index"] = 0
+        cap = _run_screen_capture(monkeypatch, core, None)
+
+        cmd = cap.get("cmd")
+        assert cmd is not None, "補助exeが無いと配信が組み立てられていない（fail-soft でない）"
+        joined = " ".join(str(c) for c in cmd)
+        assert "pipe:0" not in joined, "補助exeが無いのに stdin から読もうとしている（無音で固まる）"
+        assert "anullsrc" in joined, "音声トラックが無い（RTMP経路でカクつく）"
+    finally:
+        core.shutdown()
