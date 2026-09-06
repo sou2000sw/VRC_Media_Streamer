@@ -769,6 +769,14 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
         if self.reject_if_web_remote_disabled(path, accept_header):
             return
 
+        # 0-a. タスク27: 参加型カラオケの WebSocket。
+        # ★他のどの分岐よりも前に置く。ここから先は HTTP の応答ではなく、
+        #   接続を握ったまま返らない別プロトコルになる。
+        if path == "/ws/audio_session":
+            from karaoke_ws import handle_audio_session
+            handle_audio_session(self)
+            return
+
         # 0. API: Auth Check
         if path == "/api/auth":
             configured_pw = str(self.streamer_core.config.get("web_password", "")).strip() if self.streamer_core else ""
@@ -868,6 +876,36 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 "success": True,
                 "displays": displays,
                 "windows": windows
+            })
+            return
+
+        # 2-b. タスク27: 参加型カラオケの状態（ホスト卓の表示用）
+        elif path == "/api/karaoke":
+            if not self.check_web_password_auth():
+                self.send_json_response(401, {
+                    "success": False,
+                    "error": "Unauthorized: Web password required or invalid.",
+                    "has_web_password": True
+                })
+                return
+            if not self.streamer_core:
+                self.send_json_response(503, {"success": False, "error": "core not ready"})
+                return
+            if not self.is_local_request():
+                # ★ゲストには参加者一覧を見せない。誰が居るか・どのくらい繋がりが
+                #   悪いかは、ホストの卓の情報であって参加者どうしで共有する話ではない。
+                #   参加できるかどうかだけ返す。
+                self.send_json_response(200, {
+                    "success": True,
+                    "host_view": False,
+                    "enabled": bool(self.streamer_core.karaoke.enabled),
+                    "approval_required": bool(self.streamer_core.karaoke.approval_required),
+                })
+                return
+            self.send_json_response(200, {
+                "success": True,
+                "host_view": True,
+                "karaoke": self.streamer_core.karaoke.status_snapshot(),
             })
             return
 
@@ -1429,6 +1467,82 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 })
             else:
                 self.send_json_response(500, {"success": False, "message": "Failed to save configuration"})
+            return
+
+        # 3-b. API: 参加型カラオケのホスト卓（タスク27 / ローカルホスト限定）
+        #
+        # ★ゲストに開けてはいけない。ここは「誰の声を配信に乗せるか」を決める場所で、
+        #   開ければ参加者が自分で自分を承認できてしまい、承認制が意味を失う。
+        elif path == "/api/karaoke":
+            if not self.is_local_request():
+                self.send_json_response(403, {
+                    "success": False,
+                    "message": "Forbidden: Karaoke host control is restricted to localhost."
+                })
+                return
+            if not self.streamer_core:
+                self.send_json_response(500, {"success": False, "message": "Streamer core not available"})
+                return
+
+            session = self.streamer_core.karaoke
+            action = str(body_json.get("action", "")).strip().lower()
+
+            if action == "settings":
+                settings = self.streamer_core.set_karaoke_settings(
+                    enabled=body_json.get("enabled"),
+                    approval_required=body_json.get("approval_required"),
+                    latency_mode=body_json.get("latency_mode"),
+                    master_volume=body_json.get("master_volume"),
+                    reverb=body_json.get("reverb"),
+                    offset_ms=body_json.get("offset_ms"),
+                )
+                self.send_json_response(200, {"success": True, "settings": settings,
+                                              "karaoke": session.status_snapshot()})
+                return
+
+            if action in ("grant", "deny", "kick", "mix"):
+                target = str(body_json.get("id", "")).strip()
+                if not target or not session.get(target):
+                    self.send_json_response(404, {"success": False,
+                                                  "message": "その参加者は見つかりません（すでに退出した可能性があります）"})
+                    return
+                if action == "grant":
+                    session.set_state(target, "active")
+                elif action == "deny":
+                    session.set_state(target, "denied")
+                elif action == "kick":
+                    # ★状態を denied にしてから消す。接続スレッドはこの状態変化を
+                    #   見て本人へ通知し、自分で畳む。ここでソケットを直接閉じると
+                    #   相手には理由の分からない切断になる。
+                    session.set_state(target, "denied")
+                elif action == "mix":
+                    session.set_mix(target,
+                                    volume=body_json.get("volume"),
+                                    pan=body_json.get("pan"),
+                                    host_muted=body_json.get("host_muted"))
+                self.send_json_response(200, {"success": True,
+                                              "karaoke": session.status_snapshot()})
+                return
+
+            if action in ("record_start", "record_stop"):
+                if action == "record_start":
+                    path_saved = session.start_recording()
+                    if not path_saved:
+                        self.send_json_response(500, {"success": False,
+                                                      "message": "録音を開始できませんでした"})
+                        return
+                else:
+                    path_saved = session.stop_recording()
+                self.send_json_response(200, {
+                    "success": True,
+                    "recording": session.is_recording,
+                    "path": os.path.basename(path_saved or ""),
+                    "karaoke": session.status_snapshot(),
+                })
+                return
+
+            self.send_json_response(400, {"success": False,
+                                          "message": f"Unknown karaoke action: {action!r}"})
             return
 
         # 4. API: Destination (配信先操作 / ローカルホスト限定)

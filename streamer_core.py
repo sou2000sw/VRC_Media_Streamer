@@ -32,6 +32,14 @@ else:
     APP_DIR = BASE_PATH
 
 from version import APP_VERSION
+# タスク27: 参加型カラオケ。remote_mic 側は streamer_core を先頭で import しない
+# （相互 import になるため）ので、ここから片方向に読むだけで安全。
+import remote_mic
+from remote_mic import (
+    KaraokeSession, build_remote_mic_input,
+    KARAOKE_BASE_DELAY_MS, LATENCY_MODES as KARAOKE_LATENCY_MODES,
+    REVERB_PRESETS as KARAOKE_REVERB_PRESETS,
+)
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 HLS_DIR = os.path.join(APP_DIR, "hls_output")
@@ -139,6 +147,15 @@ DEFAULT_CONFIG = {
     # ★"card"（サムネイルカード）は入れない。あれはYouTubeのメタデータから作るもので、
     #   ライブ音声には元データが無い。
     "live_audio_bg_source": "standby",  # "standby" | "slideshow"
+    # タスク27: 参加型カラオケ・セッション（Webリモコンからのリモートマイク）
+    # ★既定はすべて「閉じている」側。不特定多数に開く機能なので、
+    #   知らないうちに他人の声が配信へ乗る状態を初期値にしてはいけない。
+    "karaoke_enabled": False,
+    "karaoke_approval_required": True,   # 挙手→ホスト承認（荒らし対策）
+    "karaoke_latency_mode": "low",       # "low"(40ms) | "stable"(120ms)
+    "karaoke_master_volume": 1.0,        # 歌声バス全体（0.0〜2.0）
+    "karaoke_reverb": "off",             # "off" | "weak" | "mid" | "strong"
+    "karaoke_offset_ms": 0,              # 遅延補正（-500〜+500）
     "screen_capture_source_type": "display",   # "display" | "window"
     "screen_capture_display_index": 0,
     "screen_capture_window_title": "",
@@ -565,15 +582,29 @@ def build_audio_inputs(app_enabled=False, app_volume=1.0,
                        mic_device=None, loopback_device=None,
                        mic_volume=1.0, loopback_volume=0.7,
                        start_index=1,
-                       app_rate=APP_AUDIO_RATE, app_channels=APP_AUDIO_CHANNELS):
+                       app_rate=APP_AUDIO_RATE, app_channels=APP_AUDIO_CHANNELS,
+                       remote_mic_pipe=None, remote_mic_volume=1.0,
+                       bgm_delay_ms=0):
     """アプリ音声＋dshow(マイク/ループバック)をまとめた入力・フィルタ・マップを組む。
 
     アプリ音声が無効なら build_dshow_audio_inputs() をそのまま返す（既存挙動を維持）。
     有効なときは **アプリ音声を必ず先頭（start_index）** に置く。順番を固定しないと
     入力インデックスの採番が呼び出し側ごとにずれて、無音や取り違えの原因になる。
+
+    remote_mic_pipe（タスク27・参加型カラオケ）を渡したときだけ、Web リモコンから
+    届く歌声のバスを **最後尾** に足す。既存の採番を一切動かさないための位置。
     """
     mic_dev = str(mic_device).strip() if mic_device else ""
     loop_dev = str(loopback_device).strip() if loopback_device else ""
+
+    if remote_mic_pipe:
+        return build_audio_inputs_with_remote_mic(
+            app_enabled=app_enabled, app_volume=app_volume,
+            mic_device=mic_dev, loopback_device=loop_dev,
+            mic_volume=mic_volume, loopback_volume=loopback_volume,
+            start_index=start_index, app_rate=app_rate, app_channels=app_channels,
+            remote_mic_pipe=remote_mic_pipe, remote_mic_volume=remote_mic_volume,
+            bgm_delay_ms=bgm_delay_ms)
 
     if not app_enabled:
         return build_dshow_audio_inputs(
@@ -607,6 +638,86 @@ def build_audio_inputs(app_enabled=False, app_volume=1.0,
 
     mix = ("".join(labels) +
            f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0[aout]")
+    return (input_args, ";".join(filters) + ";" + mix, "[aout]")
+
+
+def build_audio_inputs_with_remote_mic(app_enabled=False, app_volume=1.0,
+                                       mic_device=None, loopback_device=None,
+                                       mic_volume=1.0, loopback_volume=0.7,
+                                       start_index=1,
+                                       app_rate=APP_AUDIO_RATE,
+                                       app_channels=APP_AUDIO_CHANNELS,
+                                       remote_mic_pipe=None, remote_mic_volume=1.0,
+                                       bgm_delay_ms=0):
+    """タスク27: 参加型カラオケの歌声バスを足した入力・フィルタ・マップを組む。
+
+    ★amix の normalize を切る理由と、その埋め合わせ
+      `amix` は既定 (`normalize=1`) で **入力本数ぶん音量を割る**。ここへ歌声を
+      1 本足すと、それだけでホストが今まで合わせてきた伴奏やマイクの音量が
+      2/3 に落ちる。「カラオケを有効にしたら伴奏が小さくなった」という
+      理不尽な副作用になるので、normalize=0 にしたうえで、**従来 amix が
+      掛けていた 1/n を各入力の volume へ明示的に載せる**。こうすると
+      伴奏側の聞こえ方は有効化の前後で変わらず、歌声だけが素の音量で乗る。
+
+    ★bgm_delay_ms（伴奏側の下駄）
+      歌声はネットワーク分だけ必ず遅れて届くので、素直に組むと「歌声を遅らせる」
+      方向にしか直せない。伴奏側を先に一定量遅らせておくことで、遅延補正
+      スライダを ±方向に効かせられる（remote_mic.py の設計判断 2 を参照）。
+    """
+    mic_dev = str(mic_device).strip() if mic_device else ""
+    loop_dev = str(loopback_device).strip() if loopback_device else ""
+
+    input_args = []
+    idx = start_index
+    # (入力index, ラベル, 音量) の並び。歌声以外＝「伴奏側」としてまとめて扱う。
+    bgm_sources = []
+
+    if app_enabled:
+        input_args += build_app_audio_input(app_rate, app_channels)
+        bgm_sources.append((idx, "aapp", float(app_volume)))
+        idx += 1
+    if mic_dev:
+        input_args += ["-f", "dshow", "-thread_queue_size", "1024",
+                       "-audio_buffer_size", "50", "-i", f"audio={mic_dev}"]
+        bgm_sources.append((idx, "amic", float(mic_volume)))
+        idx += 1
+    if loop_dev:
+        input_args += ["-f", "dshow", "-thread_queue_size", "1024",
+                       "-audio_buffer_size", "50", "-i", f"audio={loop_dev}"]
+        bgm_sources.append((idx, "apc", float(loopback_volume)))
+        idx += 1
+
+    remote_idx = idx
+    input_args += build_remote_mic_input(remote_mic_pipe)
+
+    # 従来 amix が掛けていた 1/n（伴奏側の本数で決まる）を先に載せておく。
+    n_bgm = len(bgm_sources)
+    compensate = (1.0 / n_bgm) if n_bgm > 1 else 1.0
+    try:
+        delay_ms = max(0, int(bgm_delay_ms))
+    except (TypeError, ValueError):
+        delay_ms = 0
+    # all=1 でチャンネル数に関係なく同じ量を掛ける。モノラルのマイクとステレオの
+    # ループバックが混ざるので、チャンネルごとに書き並べる形は使えない。
+    delay_filter = f",adelay={delay_ms}:all=1" if delay_ms > 0 else ""
+
+    filters = []
+    labels = []
+    for src_idx, label, vol in bgm_sources:
+        vol_str = _fmt_audio_volume(vol * compensate)
+        filters.append(f"[{src_idx}:a]volume={vol_str}{delay_filter}[{label}]")
+        labels.append(f"[{label}]")
+
+    filters.append(f"[{remote_idx}:a]volume={_fmt_audio_volume(remote_mic_volume)}[armic]")
+    labels.append("[armic]")
+
+    if len(labels) == 1:
+        # 歌声だけ。amix を挟むと無駄に遅延が乗るので直接 [aout] にする。
+        return (input_args, filters[0].replace("[armic]", "[aout]"), "[aout]")
+
+    mix = ("".join(labels) +
+           f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0:"
+           f"normalize=0[aout]")
     return (input_args, ";".join(filters) + ";" + mix, "[aout]")
 
 
@@ -2180,6 +2291,75 @@ class StreamerCore:
         self.reload_requested_at = 0.0       # 直近の要求時刻（デバウンス判定用）
         self.reload_first_requested_at = 0.0 # 未処理の要求列の先頭時刻（先送り上限用）
         self.current_video_start_time = None
+
+        # タスク27: 参加型カラオケ。セッションは配信の有無と無関係に 1 本だけ持つ
+        # （参加者は配信が止まっても繋ぎっぱなしでよい）。FFmpeg への出口だけが
+        # 配信のたびに開閉する。
+        self.karaoke = KaraokeSession(recordings_dir=os.path.join(APP_DIR, "recordings"))
+        self.karaoke.configure(
+            enabled=bool(self.config.get("karaoke_enabled", False)),
+            approval_required=bool(self.config.get("karaoke_approval_required", True)),
+            latency_mode=str(self.config.get("karaoke_latency_mode", "low")),
+            master_volume=self.config.get("karaoke_master_volume", 1.0),
+            reverb=str(self.config.get("karaoke_reverb", "off")),
+            offset_ms=self.config.get("karaoke_offset_ms", 0),
+        )
+        if self.karaoke.enabled:
+            self.karaoke.ensure_mixer()
+
+    # ----------------------------------------------------------------------
+    # タスク27: 参加型カラオケ
+    # ----------------------------------------------------------------------
+    def set_karaoke_settings(self, enabled=None, approval_required=None,
+                             latency_mode=None, master_volume=None,
+                             reverb=None, offset_ms=None):
+        """カラオケ設定を更新して config へ焼く。戻り値は現在の設定。
+
+        ★音量・PAN・リバーブ・遅延補正は **配信中に変えても配信は途切れない**。
+          ミックスを Python 側で行っているので、FFmpeg のフィルタグラフを
+          作り直す必要がないため。
+        """
+        settings = self.karaoke.configure(
+            enabled=enabled, approval_required=approval_required,
+            latency_mode=latency_mode, master_volume=master_volume,
+            reverb=reverb, offset_ms=offset_ms)
+        self.config["karaoke_enabled"] = settings["enabled"]
+        self.config["karaoke_approval_required"] = settings["approval_required"]
+        self.config["karaoke_latency_mode"] = settings["latency_mode"]
+        self.config["karaoke_master_volume"] = settings["master_volume"]
+        self.config["karaoke_reverb"] = settings["reverb"]
+        self.config["karaoke_offset_ms"] = settings["offset_ms"]
+        self.save_config()
+
+        if settings["enabled"]:
+            self.karaoke.ensure_mixer()
+        else:
+            # 無効化＝参加者を切り、出口も畳む。繋ぎっぱなしにすると
+            # 「切ったはずなのに声が乗る」事故になる。
+            self.karaoke.stop()
+            for pid in list(self.karaoke.participants.keys()):
+                self.karaoke.remove_participant(pid)
+        return settings
+
+    def start_karaoke_pipe(self):
+        """配信を起こす直前に呼ぶ。カラオケ無効なら None。
+
+        ★FFmpeg より先に呼ぶ必要がある（Python がパイプのサーバ側）。
+        """
+        if not self.karaoke.enabled:
+            return None
+        pipe = self.karaoke.open_sink()
+        if not pipe:
+            log_print("[Karaoke] パイプを開けませんでした -> 歌声なしで配信を続行")
+        return pipe
+
+    def reap_karaoke_pipe(self, sender_proc):
+        """送出FFmpegが終わったら出口だけ閉じる（参加者の接続は残す）。"""
+        try:
+            sender_proc.wait()
+        except Exception:
+            pass
+        self.karaoke.close_sink()
 
     def request_stream_reload(self):
         """ストリームの再構築を要求する。連続呼び出しはデバウンスされ1回にまとまる。"""
@@ -4728,8 +4908,11 @@ class StreamerCore:
         mic_dev = str(self.config.get("live_audio_mic_device", "")).strip()
         loop_dev = str(self.config.get("live_audio_loopback_device", "")).strip()
         # タスク25: アプリ音声だけでも成立するので、3つとも無いときだけ弾く。
+        # タスク27: 参加型カラオケが有効なら、ホスト側に取り込み機材が1つも無くても
+        #   「Webから届く歌声だけを流す」構成が成立する（スマホ1台のラジオ枠）。
         app_on = bool(self.config.get("live_audio_app_enabled", False))
-        if not mic_dev and not loop_dev and not app_on:
+        karaoke_on = bool(self.karaoke.enabled)
+        if not mic_dev and not loop_dev and not app_on and not karaoke_on:
             log_print("[Player] Live audio capture warning: No devices selected")
             self.status = "error"
             self.status_detail = "ライブ音声デバイスが未選択です"
@@ -4794,6 +4977,13 @@ class StreamerCore:
         app_helper = self.start_app_audio_capture()
         app_vol = self.config.get("live_audio_app_volume", 1.0)
 
+        # タスク27: 歌声の名前付きパイプ。★FFmpeg を起こす前に開くこと。
+        #   こちらがパイプのサーバなので、先に FFmpeg を向けると即死する。
+        karaoke_pipe = self.start_karaoke_pipe()
+        # 伴奏側の下駄は、歌声が実際に乗るときだけ履かせる。カラオケを使わない
+        # 配信にまで 500ms の遅れを持ち込む理由はない。
+        bgm_delay = KARAOKE_BASE_DELAY_MS if karaoke_pipe else 0
+
         input_args, audio_filter, audio_map = build_audio_inputs(
             app_enabled=bool(app_helper),
             app_volume=app_vol,
@@ -4801,7 +4991,13 @@ class StreamerCore:
             loopback_device=loop_dev,
             mic_volume=mic_vol,
             loopback_volume=loop_vol,
-            start_index=1
+            start_index=1,
+            remote_mic_pipe=karaoke_pipe,
+            # ★ここは常に 1.0。歌声バスのマスタ音量は Python 側のミキサで掛けている。
+            #   FFmpeg のフィルタ値は起動時に固定されてしまい生放送中に動かせないので、
+            #   両方で掛けると「UIのスライダが二重に効く／効かない」ことになる。
+            remote_mic_volume=1.0,
+            bgm_delay_ms=bgm_delay,
         )
 
         # ★入口のガードは「設定上どれか有効か」しか見ていない。アプリ音声だけを
@@ -4814,6 +5010,7 @@ class StreamerCore:
         if not audio_map:
             log_print("[Player] Live audio: 利用できる音声ソースがありません")
             kill_proc(app_helper)
+            self.karaoke.close_sink()
             self.status = "error"
             self.status_detail = "音声ソースが利用できません（対象ウィンドウやデバイスを確認してください）"
             return None
@@ -4850,7 +5047,8 @@ class StreamerCore:
 
         log_print(f"[Player] Encoder path=live_audio mic='{mic_dev}' loopback='{loop_dev}' "
                   f"mic_vol={mic_vol} loopback_vol={loop_vol} b:a={bitrate_kbps}k "
-                  f"bg={'slideshow(concat)' if slideshow_manifest_path else bg_source + '(still)'}")
+                  f"bg={'slideshow(concat)' if slideshow_manifest_path else bg_source + '(still)'} "
+                  f"karaoke={'on pipe=' + str(karaoke_pipe) if karaoke_pipe else 'off'}")
 
         try:
             # ★stderr を捨てない。今回、送出FFmpegが即死する不具合を追ったとき、
@@ -4865,6 +5063,7 @@ class StreamerCore:
         except Exception as e:
             log_print(f"[Player] Error starting live audio sender: {e}")
             kill_proc(app_helper)
+            self.karaoke.close_sink()
             self.status = "error"
             self.status_detail = f"Live audio sender error: {e}"
             return None
@@ -4881,6 +5080,11 @@ class StreamerCore:
         if app_helper:
             threading.Thread(target=self.reap_app_audio_helper,
                              args=(proc, app_helper), daemon=True).start()
+        if karaoke_pipe:
+            # 送出FFmpegの寿命に紐づけて出口を閉じる。停止経路は多数あるので、
+            # 個別に手を入れるのではなくここ 1 箇所で回収する（補助exeと同じ作法）。
+            threading.Thread(target=self.reap_karaoke_pipe,
+                             args=(proc,), daemon=True).start()
 
         threading.Thread(target=self.pump_sender_stderr,
                          args=(proc, "live_audio"), daemon=True).start()
@@ -6268,6 +6472,12 @@ class StreamerCore:
     def shutdown(self):
         log_print("[Core] Shutting down StreamerCore...")
         self.is_running = False
+        # タスク27: 参加者の接続とミキサを畳む。名前付きパイプのハンドルが
+        # 残ったままだと、次回起動時に同名で作れず（作れても掴めず）に詰まる。
+        try:
+            self.karaoke.stop()
+        except Exception as e:
+            log_print(f"[Karaoke] shutdown error: {e}")
         with self.process_lock:
             if self.current_stdin:
                 try:
