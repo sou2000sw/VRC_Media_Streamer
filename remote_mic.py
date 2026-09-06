@@ -742,27 +742,40 @@ class KaraokeSession:
         return True
 
     def open_sink(self):
-        """FFmpeg 用の名前付きパイプを開き、パイプ名を返す（失敗なら None）。
+        """FFmpeg 用の名前付きパイプを開き、(パイプ名, sink) を返す（失敗なら (None, None)）。
 
         ★FFmpeg を起こす **前に** 呼ぶこと。こちらがパイプのサーバなので、
           存在しないパイプに FFmpeg を向けると即死する。
+
+        ★毎回 **新しいパイプを作る**（前のを使い回さない）
+          配信の張り直しでは「前の送出FFmpegを殺す」→「すぐ次を起こす」が起きる。
+          前の回収スレッド（reap）は殺した相手の wait() から戻ってから出口を閉じるので、
+          使い回すと **次の配信が掴んだパイプを前の回収が閉じてしまう**競合になる。
+          毎回作れば、回収は自分が渡された sink だけを閉じればよく、競合が消える。
         """
         with self._lock:
-            if self.sink:
-                return self.sink.name
+            old = self.sink
             sink = NamedPipeSink()
             if not sink.start():
-                return None
+                return (None, None)
             self.sink = sink
+        if old:
+            old.stop()
         self.ensure_mixer()
-        return sink.name
+        return (sink.name, sink)
 
-    def close_sink(self):
-        """出口だけ閉じる。参加者の接続とミキサはそのまま残す。"""
+    def close_sink(self, sink=None):
+        """出口だけ閉じる。参加者の接続とミキサはそのまま残す。
+
+        sink を渡した場合、それが **今の出口でなければ何もしない**。
+        古い配信の回収スレッドが、次の配信の出口を巻き添えにしないため。
+        """
         with self._lock:
-            sink, self.sink = self.sink, None
-        if sink:
-            sink.stop()
+            if sink is not None and self.sink is not sink:
+                return
+            current, self.sink = self.sink, None
+        if current:
+            current.stop()
             log_print("[Karaoke] pipe closed")
 
     def stop(self):

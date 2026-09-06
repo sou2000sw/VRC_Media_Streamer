@@ -2342,24 +2342,29 @@ class StreamerCore:
         return settings
 
     def start_karaoke_pipe(self):
-        """配信を起こす直前に呼ぶ。カラオケ無効なら None。
+        """配信を起こす直前に呼ぶ。(パイプ名, sink) を返す。カラオケ無効なら (None, None)。
 
         ★FFmpeg より先に呼ぶ必要がある（Python がパイプのサーバ側）。
         """
         if not self.karaoke.enabled:
-            return None
-        pipe = self.karaoke.open_sink()
+            return (None, None)
+        pipe, sink = self.karaoke.open_sink()
         if not pipe:
             log_print("[Karaoke] パイプを開けませんでした -> 歌声なしで配信を続行")
-        return pipe
+        return (pipe, sink)
 
-    def reap_karaoke_pipe(self, sender_proc):
-        """送出FFmpegが終わったら出口だけ閉じる（参加者の接続は残す）。"""
+    def reap_karaoke_pipe(self, sender_proc, sink):
+        """送出FFmpegが終わったら出口だけ閉じる（参加者の接続は残す）。
+
+        ★自分が起こした配信の出口だけを閉じる。配信の張り直しでは
+          「前を殺す」→「すぐ次を起こす」が続けて起きるので、無条件に閉じると
+          次の配信が掴んだパイプを巻き添えにする。
+        """
         try:
             sender_proc.wait()
         except Exception:
             pass
-        self.karaoke.close_sink()
+        self.karaoke.close_sink(sink)
 
     def request_stream_reload(self):
         """ストリームの再構築を要求する。連続呼び出しはデバウンスされ1回にまとまる。"""
@@ -4979,7 +4984,7 @@ class StreamerCore:
 
         # タスク27: 歌声の名前付きパイプ。★FFmpeg を起こす前に開くこと。
         #   こちらがパイプのサーバなので、先に FFmpeg を向けると即死する。
-        karaoke_pipe = self.start_karaoke_pipe()
+        karaoke_pipe, karaoke_sink = self.start_karaoke_pipe()
         # 伴奏側の下駄は、歌声が実際に乗るときだけ履かせる。カラオケを使わない
         # 配信にまで 500ms の遅れを持ち込む理由はない。
         bgm_delay = KARAOKE_BASE_DELAY_MS if karaoke_pipe else 0
@@ -5010,7 +5015,7 @@ class StreamerCore:
         if not audio_map:
             log_print("[Player] Live audio: 利用できる音声ソースがありません")
             kill_proc(app_helper)
-            self.karaoke.close_sink()
+            self.karaoke.close_sink(karaoke_sink)
             self.status = "error"
             self.status_detail = "音声ソースが利用できません（対象ウィンドウやデバイスを確認してください）"
             return None
@@ -5063,7 +5068,7 @@ class StreamerCore:
         except Exception as e:
             log_print(f"[Player] Error starting live audio sender: {e}")
             kill_proc(app_helper)
-            self.karaoke.close_sink()
+            self.karaoke.close_sink(karaoke_sink)
             self.status = "error"
             self.status_detail = f"Live audio sender error: {e}"
             return None
@@ -5084,7 +5089,7 @@ class StreamerCore:
             # 送出FFmpegの寿命に紐づけて出口を閉じる。停止経路は多数あるので、
             # 個別に手を入れるのではなくここ 1 箇所で回収する（補助exeと同じ作法）。
             threading.Thread(target=self.reap_karaoke_pipe,
-                             args=(proc,), daemon=True).start()
+                             args=(proc, karaoke_sink), daemon=True).start()
 
         threading.Thread(target=self.pump_sender_stderr,
                          args=(proc, "live_audio"), daemon=True).start()

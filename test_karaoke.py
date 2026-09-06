@@ -697,3 +697,59 @@ def test_ui_escapes_participant_names():
     """表示名は参加者が自由に決める。そのまま埋めると HTML を注入できる。"""
     html = _ui_html()
     assert "karaokeEscape(p.name)" in html
+
+
+# ---------------------------------------------------------------------------
+# 11. 配信の張り直し（出口の付け替え）
+#
+# ★配信の停止・再開では「前の送出FFmpegを殺す」->「すぐ次を起こす」が続けて起きる。
+#   前の回収スレッドは殺した相手の wait() から戻ってから出口を閉じるので、
+#   出口を使い回すと **次の配信が掴んだパイプを前の回収が閉じてしまう**。
+# ---------------------------------------------------------------------------
+def test_open_sink_creates_a_fresh_pipe_each_time(session):
+    """張り直しのたびに新しいパイプ名になること（使い回さない）。"""
+    name1, sink1 = session.open_sink()
+    if name1 is None:
+        pytest.skip("名前付きパイプを作れない環境")
+    name2, sink2 = session.open_sink()
+    assert sink1 is not sink2
+    assert name1 != name2, "パイプ名が使い回されている"
+    session.close_sink()
+
+
+def test_stale_reaper_does_not_close_the_new_pipe(session):
+    """古い配信の回収が、次の配信の出口を巻き添えにしないこと。"""
+    name1, sink1 = session.open_sink()
+    if name1 is None:
+        pytest.skip("名前付きパイプを作れない環境")
+    name2, sink2 = session.open_sink()
+
+    # 前の配信の回収スレッドが遅れて発火した、という状況
+    session.close_sink(sink1)
+    assert session.sink is sink2, "新しい出口まで閉じられている"
+
+    # 自分の出口なら閉じる
+    session.close_sink(sink2)
+    assert session.sink is None
+
+
+def test_close_sink_without_argument_closes_current(session):
+    """引数なしの close_sink は今の出口を閉じる（停止・無効化の経路）。"""
+    name, sink = session.open_sink()
+    if name is None:
+        pytest.skip("名前付きパイプを作れない環境")
+    session.close_sink()
+    assert session.sink is None
+
+
+def test_mixer_survives_sink_replacement(session):
+    """出口を付け替えてもミキサは回り続けること（参加者は繋がったまま）。"""
+    session.configure(approval_required=False)
+    session.add_participant("id1", "Taro")
+    name, sink = session.open_sink()
+    if name is None:
+        pytest.skip("名前付きパイプを作れない環境")
+    assert session.running
+    session.open_sink()
+    assert session.running, "出口の付け替えでミキサが止まっている"
+    assert session.get("id1") is not None, "参加者まで消えている"
