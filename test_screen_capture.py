@@ -192,3 +192,40 @@ def test_find_capture_window_exact_match():
         # 部分一致のタイトルは None
         found_partial = find_capture_window("メモ帳")
         assert found_partial is None
+
+
+def test_ddagrab_output_mapping_requires_clear_winner(monkeypatch):
+    """モニタ→ddagrab出力の対応付けは「次点の2倍以上離れている」ときだけ確定する。
+
+    ★取り違えると別のモニタをそのまま配信する事故になる。実際に、絶対値で
+      線を引いていた実装が diff=31.4 で誤った出力を選んだ。迷ったら None を返し、
+      呼び出し側が gdigrab（絶対座標指定なので取り違えない）へ退避する。
+    """
+    mon = {"left": 0, "top": 0, "width": 2560, "height": 1440}
+
+    def make(vals):
+        def _probe(px, py, pw, ph, ox, oy, idx, timeout=15):
+            return vals[idx] if idx < len(vals) else None
+        return _probe
+
+    # 明確な差がある -> 確定する
+    streamer_core._ddagrab_output_map_cache.clear()
+    monkeypatch.setattr(streamer_core, "_probe_monitor_vs_ddagrab", make([90.0, 20.0]))
+    assert streamer_core.resolve_ddagrab_output_for_monitor(mon) == 1
+
+    # 差が2倍未満（紛らわしい）-> 決めずに退避させる
+    streamer_core._ddagrab_output_map_cache.clear()
+    monkeypatch.setattr(streamer_core, "_probe_monitor_vs_ddagrab", make([55.0, 40.0]))
+    assert streamer_core.resolve_ddagrab_output_for_monitor(mon) is None
+
+    # 出力が1つしかなければ、比べる相手がいないので確定してよい
+    streamer_core._ddagrab_output_map_cache.clear()
+    monkeypatch.setattr(streamer_core, "_probe_monitor_vs_ddagrab", make([40.0]))
+    assert streamer_core.resolve_ddagrab_output_for_monitor(mon) == 0
+
+    # 一度決まったらモニタ単位で覚える（毎回プローブしない）
+    streamer_core._ddagrab_output_map_cache.clear()
+    monkeypatch.setattr(streamer_core, "_probe_monitor_vs_ddagrab", make([90.0, 20.0]))
+    assert streamer_core.resolve_ddagrab_output_for_monitor(mon) == 1
+    monkeypatch.setattr(streamer_core, "_probe_monitor_vs_ddagrab", make([20.0, 90.0]))
+    assert streamer_core.resolve_ddagrab_output_for_monitor(mon) == 1

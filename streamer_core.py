@@ -847,49 +847,96 @@ def _capture_thumb(args, tag):
             pass
 
 
+def _probe_monitor_vs_ddagrab(px, py, pw, ph, ox, oy, output_idx, timeout=15):
+    """モニタの同じ場所を gdigrab と ddagrab で**同時に**1枚ずつ撮り、差を返す。
+
+    ★別プロセスで順番に撮ってはいけない。撮る瞬間がずれるぶん、画面が動いていると
+      正解でも大きく食い違う。実際それで**別のモニタを選ぶ誤判定**を踏んだ
+      （同じモニタが diff=3.7 で正解した後、別の時点で diff=31.4 の誤りを掴んだ）。
+      1つの ffmpeg に両方を入力として並べれば、ほぼ同時刻の絵どうしを比べられる。
+    """
+    import tempfile
+    a = os.path.join(tempfile.gettempdir(), f"_vrcms_pair_ref_{output_idx}.png")
+    b = os.path.join(tempfile.gettempdir(), f"_vrcms_pair_dda_{output_idx}.png")
+    cmd = [
+        get_ffmpeg_cmd(), "-hide_banner", "-v", "error",
+        "-f", "gdigrab", "-framerate", "10",
+        "-offset_x", str(px), "-offset_y", str(py),
+        "-video_size", f"{pw}x{ph}", "-i", "desktop",
+        "-f", "lavfi", "-i",
+        f"ddagrab=output_idx={output_idx}:framerate=10:video_size={pw}x{ph}"
+        f":offset_x={ox}:offset_y={oy}",
+        "-map", "0:v", "-frames:v", "1", "-y", a,
+        "-map", "1:v", "-vf", "hwdownload,format=bgra", "-frames:v", "1", "-y", b,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                              creationflags=CREATE_NO_WINDOW)
+        if proc.returncode != 0 or not (os.path.exists(a) and os.path.exists(b)):
+            return None
+        from PIL import Image
+        with Image.open(a) as ia, Image.open(b) as ib:
+            ta = list(ia.convert("L").resize((32, 18)).getdata())
+            tb = list(ib.convert("L").resize((32, 18)).getdata())
+        return sum(abs(x - y) for x, y in zip(ta, tb)) / len(ta)
+    except Exception:
+        return None
+    finally:
+        for f in (a, b):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
 def resolve_ddagrab_output_for_monitor(monitor, max_outputs=8):
     """モニタに対応する ddagrab の output_idx を、実際の絵を照合して決める。
 
     ★順番の一致を仮定してはいけない。取り違えると**別のモニタをそのまま配信する**。
-      ddagrab は出力の位置を返さないので、モニタ矩形と突き合わせる術が無い。
-      そこで gdigrab でそのモニタを1枚撮り、各 ddagrab 出力の同じ位置と
-      見比べて、いちばん近いものを採用する（実測の差: 正解 17.6 / 不正解 107.7 と
-      6倍の開きがあり、判定は安定する）。結果はモニタ原点をキーに覚える。
+      ddagrab は出力の位置を返さないため、モニタ矩形と突き合わせる術が無い。
+
+    判定は**絶対値ではなく比**で行う。同時に撮っても完全な同時刻にはならないので、
+    正解でも差はそれなりに出る（実測: 正解32.7 / 不正解90.6）。絶対値で線を引くと
+    動きの多い画面で常に失格になり、遅い経路へ落ち続けてしまう。
+    「次点が最良の2倍以上離れている」ことを条件にすれば、動いていても判別できる。
+
+    決められないときは None を返し、呼び出し側は gdigrab へ退避する
+    （遅いが、位置指定が絶対座標なので取り違えは起こらない）。
     """
     key = (monitor["left"], monitor["top"], monitor["width"], monitor["height"])
     if key in _ddagrab_output_map_cache:
         return _ddagrab_output_map_cache[key]
 
     mx, my = monitor["left"], monitor["top"]
-    # モニタ中央の 640x360 を照合窓にする（端は壁紙で似がちなので中央を使う）
     pw, ph = 640, 360
     px = mx + max(0, (monitor["width"] - pw) // 2)
     py = my + max(0, (monitor["height"] - ph) // 2)
-    ref = _capture_thumb(["-f", "gdigrab", "-framerate", "5",
-                          "-offset_x", str(px), "-offset_y", str(py),
-                          "-video_size", f"{pw}x{ph}", "-i", "desktop"], "ref")
-    if ref is None:
-        return None
 
-    best_idx, best_diff = None, None
-    for idx in range(max_outputs):
-        got = _capture_thumb(["-f", "lavfi", "-i",
-                              f"ddagrab=output_idx={idx}:framerate=5:video_size={pw}x{ph}"
-                              f":offset_x={px - mx}:offset_y={py - my}",
-                              "-vf", "hwdownload,format=bgra"], f"dda{idx}")
-        if got is None:
-            break
-        d = sum(abs(a - b) for a, b in zip(ref, got)) / len(ref)
-        if best_diff is None or d < best_diff:
-            best_idx, best_diff = idx, d
+    # 動きの大きい瞬間に当たると差が開かず決められない。数回試す。
+    # 一度決まればモニタ単位で覚えるので、費用は実質1回きり。
+    for attempt in range(3):
+        scored = []
+        for idx in range(max_outputs):
+            d = _probe_monitor_vs_ddagrab(px, py, pw, ph, px - mx, py - my, idx)
+            if d is None:
+                break
+            scored.append((d, idx))
 
-    # 明らかに似ていなければ諦める（gdigrab 経路へ退避させる）
-    if best_idx is None or best_diff is None or best_diff > 60:
-        log_print(f"[Capture] ddagrab output mapping failed (best diff={best_diff}).")
-        return None
-    log_print(f"[Capture] Monitor origin=({mx},{my}) -> ddagrab output_idx={best_idx} (diff={best_diff:.1f})")
-    _ddagrab_output_map_cache[key] = best_idx
-    return best_idx
+        if not scored:
+            return None
+        scored.sort()
+        best_diff, best_idx = scored[0]
+        second = scored[1][0] if len(scored) > 1 else None
+
+        if second is None or second >= best_diff * 2.0:
+            log_print(f"[Capture] Monitor origin=({mx},{my}) -> ddagrab output_idx={best_idx} "
+                      f"(diff={best_diff:.1f}, second={second}, attempt={attempt + 1})")
+            _ddagrab_output_map_cache[key] = best_idx
+            return best_idx
+
+    log_print(f"[Capture] ddagrab mapping ambiguous after 3 attempts "
+              f"(best={best_diff:.1f} second={second}) -> gdigrab へ退避")
+    return None
 
 
 def resolve_window_capture_plan(win):
