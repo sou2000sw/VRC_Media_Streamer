@@ -4651,7 +4651,7 @@ class StreamerCore:
 
         log_print(f"[Player] Encoder path=live_audio mic='{mic_dev}' loopback='{loop_dev}' "
                   f"mic_vol={mic_vol} loopback_vol={loop_vol} b:a={bitrate_kbps}k "
-                  f"bg={'slideshow' if slideshow_manifest_path else bg_source}")
+                  f"bg={'slideshow(concat)' if slideshow_manifest_path else bg_source + '(still)'}")
 
         try:
             proc = subprocess.Popen(
