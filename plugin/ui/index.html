@@ -849,7 +849,7 @@
                         <select id="screenCaptureWindowTitle" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
                             <option value="">（選択してください）</option>
                         </select>
-                        <p class="text-[11px] text-zinc-500">※ウィンドウのタイトルが変わると見つからなくなります（ブラウザのタブ切替など）。その場合は一覧を再取得して選び直してください。<br>※<span class="text-amber-400/90">共有元のウィンドウを隠さないでください。</span>覆われたり背面になるとアプリ側が描画を止め、実測で29.6fps→1.4fpsまで落ちます（VRChatを同じモニタにフルスクリーンで置かないこと）。<br>※<span class="text-amber-400/90">手前に別のウィンドウが重なると、その部分がそのまま映ります。</span>配信開始後にウィンドウを動かしても切り出し位置は追従しないので、動かしたら「適用」を押し直してください。</p>
+                        <p class="text-[11px] text-zinc-500">※ウィンドウのタイトルが変わると見つからなくなります（ブラウザのタブ切替など）。その場合は一覧を再取得して選び直してください。<br>※<span class="text-amber-400/90">共有元のウィンドウを隠さないでください。</span>覆われたり背面になるとアプリ側が描画を止めることがあり、絵の更新が止まって見えます（VRChatを同じモニタにフルスクリーンで置かないこと）。<br><span id="screenCaptureOverlapNote"></span>配信開始後にウィンドウを動かしても位置は追従しないので、動かしたら「適用」を押し直してください。</p>
                     </div>
 
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -3456,6 +3456,16 @@
                     r.checked = (r.value === data.screen_capture_source_type);
                 }
                 toggleScreenCaptureSourceFields(data.screen_capture_source_type);
+            }
+            // ★重なりの扱いは取り込み方式で正反対になる。プライバシーに直結するので
+            //   「今どちらで動くのか」を実態に合わせて出す（決め打ちで書かない）。
+            const overlapNote = document.getElementById('screenCaptureOverlapNote');
+            if (overlapNote) {
+                const method = data.screen_capture_window_method || 'auto';
+                const wgcOn = data.window_capture_available && method !== 'desktop_crop';
+                overlapNote.innerHTML = wgcOn
+                    ? '※<span class="text-emerald-400/90">手前に別のウィンドウが重なっても映りません。</span>選んだウィンドウの中身だけを取り込みます。<br>'
+                    : '※<span class="text-amber-400/90">手前に別のウィンドウが重なると、その部分がそのまま映ります。</span><br>';
             }
             const displaySel = document.getElementById('screenCaptureDisplayIndex');
             if (displaySel && typeof data.screen_capture_display_index === 'number' && screenCaptureSourcesLoaded) {
