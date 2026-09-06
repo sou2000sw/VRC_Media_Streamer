@@ -274,3 +274,57 @@ def test_screen_capture_always_has_audio_track(monkeypatch):
         assert "-c:a" in cmd and "aac" in cmd, "音声コーデックが指定されていない"
     finally:
         core.shutdown()
+
+
+def test_clamp_capture_size_to_destination():
+    """送出解像度は配信先の解像度を超えない。
+
+    ★RTMPシンクは必ず配信先の寸法へ作り直すので、それより大きく送っても
+      縮小されて捨てられるだけ。同じ帯域なら1画素あたりのビットが減って損をする
+      （実測: 1080p/2000kbps で送ると、取り込み8.8fps相当の動きが1.3fpsまで潰れた）。
+    """
+    from streamer_core import clamp_capture_size_to_destination as cap
+    # 配信先より大きい -> 配信先に合わせる
+    assert cap(1920, 1080, 1280, 720) == (1280, 720)
+    # 配信先より小さい -> そのまま（引き伸ばさない）
+    assert cap(854, 480, 1280, 720) == (854, 480)
+    # 同じなら素通し
+    assert cap(1280, 720, 1280, 720) == (1280, 720)
+    # 片方だけ超える場合もそれぞれ抑える
+    assert cap(1920, 480, 1280, 720) == (1280, 480)
+    # 奇数は偶数へ（yuv420p 用）
+    assert cap(1921, 1081, 1920, 1080) == (1920, 1080)
+    assert cap(853, 481, 1280, 720) == (852, 480)
+
+
+def test_screen_capture_caps_size_for_rtmp(monkeypatch):
+    """RTMP配信先のとき、送出コマンドの寸法が配信先を超えないこと。"""
+    core = StreamerCore(override_port=8992, override_enable_tunnel=False)
+    captured = {}
+
+    class _FakeProc:
+        returncode = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    try:
+        core.set_screen_capture_source(source_type="display", display_index=0,
+                                       width=1920, height=1080, framerate=30)
+        core.config["rtmp_video_width"] = 1280
+        core.config["rtmp_video_height"] = 720
+        monkeypatch.setattr(core, "get_active_output_mode", lambda: "topaz")
+        monkeypatch.setattr(core, "ensure_stream_sink", lambda: True)
+        monkeypatch.setattr(core, "get_video_encoder", lambda: "libx264")
+        monkeypatch.setattr(streamer_core.subprocess, "Popen",
+                            lambda cmd, *a, **kw: (captured.__setitem__("cmd", cmd), _FakeProc())[1])
+        monkeypatch.setattr(core, "relay_stream_data", lambda *a, **k: None)
+        monkeypatch.setattr(core, "watch_send_proc", lambda *a, **k: None)
+
+        core.play_screen_capture()
+        joined = " ".join(str(c) for c in captured["cmd"])
+        assert "scale=1280:720" in joined, f"配信先寸法へ抑えられていない: {joined[:200]}"
+        assert "1920:1080" not in joined
+    finally:
+        core.shutdown()

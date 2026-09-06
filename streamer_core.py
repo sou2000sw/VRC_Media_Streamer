@@ -1073,6 +1073,37 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
     return (input_args, True)
 
 
+def clamp_capture_size_to_destination(width, height, dest_width, dest_height):
+    """送出解像度を配信先の解像度以下に抑える。(w, h) を返す。
+
+    ★配信先がRTMP系のとき、シンクは映像を必ず配信先の解像度へ作り直す。
+      そこへ 1080p を送っても、縮小されて捨てられるだけで得は無い。
+      むしろ送出側の帯域が同じなら、1080p は 720p より1画素あたりのビットが
+      減るぶん**途中で痩せる**。実測で、動きのある画面を 1080p / 2000kbps で
+      送ると、取り込みが8.8fps相当の動きを持っていても1.3fpsまで潰れた。
+      同じ帯域なら配信先と同じ寸法で送った方が良い。
+
+    ビットレートは絞らない。送出が高品質なほど二段目の再エンコードの入力が
+    良くなるので、上限を掛けると逆効果になる。
+    """
+    def _even(v, minimum=2):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return minimum
+        if v < minimum:
+            return minimum
+        return v - (v % 2)
+
+    w, h = _even(width), _even(height)
+    dw, dh = _even(dest_width), _even(dest_height)
+    if dw >= 2 and w > dw:
+        w = dw
+    if dh >= 2 and h > dh:
+        h = dh
+    return (w, h)
+
+
 def build_screen_video_filter(needs_hwdownload, out_width=1920, out_height=1080,
                               clock_filter=None, in_label="0:v", out_label="vout"):
     """[0:v] から [vout] までの映像フィルタチェーン1本を組み立てる。"""
@@ -4366,6 +4397,16 @@ class StreamerCore:
         # ★ウィンドウ矩形は「配信を始める瞬間」の値を使う。以降ウィンドウを
         #   動かしても切り出し位置は追従しない（追従させるには送出の張り直しが
         #   要り、そのたびに画が飛ぶ）。動かしたら「適用」で取り直す運用にする。
+        # ★配信先がRTMP系ならシンクが必ず作り直すので、それを超える寸法で送らない。
+        if self.get_active_output_mode() in RTMP_OUTPUT_MODES:
+            dest_w = self.config.get("rtmp_video_width", 1280)
+            dest_h = self.config.get("rtmp_video_height", 720)
+            capped_w, capped_h = clamp_capture_size_to_destination(width, height, dest_w, dest_h)
+            if (capped_w, capped_h) != (width, height):
+                log_print(f"[Player] Screen capture size capped to destination: "
+                          f"{width}x{height} -> {capped_w}x{capped_h}")
+                width, height = capped_w, capped_h
+
         window_plan = resolve_window_capture_plan(win) if win else None
         if source_type == "window" and window_plan is None:
             log_print("[Player] Screen capture: could not resolve window capture plan.")
