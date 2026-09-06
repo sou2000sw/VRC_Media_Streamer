@@ -1280,6 +1280,18 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     "live_audio": res,
                     "message": "Live audio device settings updated."
                 })
+            elif action == "set_live_audio_app":
+                res = self.streamer_core.set_live_audio_app(
+                    enabled=body_json.get("enabled"),
+                    window_title=body_json.get("window_title"),
+                    volume=body_json.get("volume"),
+                    mode=body_json.get("mode")
+                )
+                self.send_json_response(200, {
+                    "success": True,
+                    "live_audio_app": res,
+                    "message": "App audio capture settings updated."
+                })
             elif action == "set_screen_capture":
                 res = self.streamer_core.set_screen_capture_source(
                     source_type=body_json.get("source_type"),

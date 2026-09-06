@@ -43,6 +43,11 @@ QR_OVERLAY_PATH = os.path.join(HLS_DIR, "qr_overlay.png")
 CLOUDFLARED_EXE = os.path.join(BASE_PATH, "cloudflared.exe")
 LOCAL_FFMPEG = os.path.join(APP_DIR, "ffmpeg.exe")
 LOCAL_FFPROBE = os.path.join(APP_DIR, "ffprobe.exe")
+# タスク25: アプリ単位の音声取り込み補助exe。配布時は ffmpeg.exe と同じ場所に置く。
+# 開発中はビルド出力（native/app_audio_capture/build/）を直接使う。
+LOCAL_APP_AUDIO_EXE = os.path.join(APP_DIR, "app_audio_capture.exe")
+DEV_APP_AUDIO_EXE = os.path.join(BASE_PATH, "native", "app_audio_capture",
+                                 "build", "app_audio_capture.exe")
 VIDEO_STORAGE_DIR = os.path.join(HLS_DIR, "videos")
 
 def cleanup_hls_dir_completely():
@@ -120,6 +125,12 @@ DEFAULT_CONFIG = {
     "live_audio_mic_volume": 1.0,
     "live_audio_loopback_volume": 0.7,
     "live_audio_bitrate_kbps": 192,
+    # タスク25: アプリ単位の音声取り込み（WASAPIプロセスループバック）
+    # ★正本はウィンドウタイトル。PIDは再起動で変わるので保存値を当てにしない。
+    "live_audio_app_enabled": False,
+    "live_audio_app_window_title": "",
+    "live_audio_app_volume": 1.0,
+    "live_audio_app_mode": "include",   # "include" | "exclude"
     "screen_capture_source_type": "display",   # "display" | "window"
     "screen_capture_display_index": 0,
     "screen_capture_window_title": "",
@@ -253,6 +264,13 @@ def get_ffprobe_cmd():
     if os.path.exists(LOCAL_FFPROBE):
         return LOCAL_FFPROBE
     return "ffprobe"
+
+def get_app_audio_capture_cmd():
+    """アプリ音声取り込み補助exeのパス。無ければ None（呼び出し側はフォールバックする）。"""
+    for path in (LOCAL_APP_AUDIO_EXE, DEV_APP_AUDIO_EXE):
+        if os.path.exists(path):
+            return path
+    return None
 
 def kill_proc(proc):
     if not proc:
@@ -430,6 +448,17 @@ def enumerate_dshow_audio_devices(timeout=8, use_cache=True):
         return []
 
 
+def _fmt_audio_volume(v):
+    """フィルタに埋める音量値を 0.0〜2.0 に丸めて文字列化する。"""
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        fv = 1.0
+    fv = max(0.0, min(2.0, fv))
+    fv = round(fv, 2)
+    return str(fv)
+
+
 def build_dshow_audio_inputs(mic_device=None, loopback_device=None,
                              mic_volume=1.0, loopback_volume=0.7,
                              start_index=1):
@@ -437,14 +466,7 @@ def build_dshow_audio_inputs(mic_device=None, loopback_device=None,
     mic_dev = str(mic_device).strip() if mic_device else ""
     loop_dev = str(loopback_device).strip() if loopback_device else ""
 
-    def _fmt_vol(v):
-        try:
-            fv = float(v)
-        except (TypeError, ValueError):
-            fv = 1.0
-        fv = max(0.0, min(2.0, fv))
-        fv = round(fv, 2)
-        return str(fv)
+    _fmt_vol = _fmt_audio_volume
 
     active = []
     if mic_dev:
@@ -489,6 +511,117 @@ def build_dshow_audio_inputs(mic_device=None, loopback_device=None,
     audio_map = "[aout]"
     return (input_args, audio_filter, audio_map)
 
+
+
+# --------------------------------------------------------------------------
+# タスク25: アプリ単位の音声（プロセスループバック）を音声グラフに合流させる
+# --------------------------------------------------------------------------
+
+APP_AUDIO_RATE = 48000
+APP_AUDIO_CHANNELS = 2
+
+
+def build_app_audio_input(rate=APP_AUDIO_RATE, channels=APP_AUDIO_CHANNELS):
+    """補助exeが stdout に流す生PCMを受ける ffmpeg 入力引数。
+
+    ★取り込み側FFmpegの stdout は MPEG-TS の出口として既に使っているが、
+      stdin は空いている。ここへ補助exeの stdout をOSパイプで直結するので、
+      名前付きパイプもTCPも要らず、Python はバイトを一切コピーしない。
+    """
+    return [
+        "-f", "s16le",
+        "-ar", str(int(rate)),
+        "-ac", str(int(channels)),
+        "-thread_queue_size", "1024",
+        "-i", "pipe:0"
+    ]
+
+
+def build_audio_inputs(app_enabled=False, app_volume=1.0,
+                       mic_device=None, loopback_device=None,
+                       mic_volume=1.0, loopback_volume=0.7,
+                       start_index=1,
+                       app_rate=APP_AUDIO_RATE, app_channels=APP_AUDIO_CHANNELS):
+    """アプリ音声＋dshow(マイク/ループバック)をまとめた入力・フィルタ・マップを組む。
+
+    アプリ音声が無効なら build_dshow_audio_inputs() をそのまま返す（既存挙動を維持）。
+    有効なときは **アプリ音声を必ず先頭（start_index）** に置く。順番を固定しないと
+    入力インデックスの採番が呼び出し側ごとにずれて、無音や取り違えの原因になる。
+    """
+    mic_dev = str(mic_device).strip() if mic_device else ""
+    loop_dev = str(loopback_device).strip() if loopback_device else ""
+
+    if not app_enabled:
+        return build_dshow_audio_inputs(
+            mic_device=mic_dev, loopback_device=loop_dev,
+            mic_volume=mic_volume, loopback_volume=loopback_volume,
+            start_index=start_index)
+
+    input_args = build_app_audio_input(app_rate, app_channels)
+    idx = start_index
+    filters = [f"[{idx}:a]volume={_fmt_audio_volume(app_volume)}[aapp]"]
+    labels = ["[aapp]"]
+    idx += 1
+
+    if mic_dev:
+        input_args += ["-f", "dshow", "-thread_queue_size", "1024",
+                       "-audio_buffer_size", "50", "-i", f"audio={mic_dev}"]
+        filters.append(f"[{idx}:a]volume={_fmt_audio_volume(mic_volume)}[amic]")
+        labels.append("[amic]")
+        idx += 1
+
+    if loop_dev:
+        input_args += ["-f", "dshow", "-thread_queue_size", "1024",
+                       "-audio_buffer_size", "50", "-i", f"audio={loop_dev}"]
+        filters.append(f"[{idx}:a]volume={_fmt_audio_volume(loopback_volume)}[apc]")
+        labels.append("[apc]")
+        idx += 1
+
+    if len(labels) == 1:
+        # アプリ音声だけ。amix を挟むと無駄に遅延が乗るので直接 [aout] にする。
+        return (input_args, filters[0].replace("[aapp]", "[aout]"), "[aout]")
+
+    mix = ("".join(labels) +
+           f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0[aout]")
+    return (input_args, ";".join(filters) + ";" + mix, "[aout]")
+
+
+def start_app_audio_helper(pid, mode="include", rate=APP_AUDIO_RATE,
+                           channels=APP_AUDIO_CHANNELS, stats_sec=0):
+    """補助exeを起動し Popen を返す。起動できなければ None。
+
+    ★戻り値が None でも配信は止めない（fail-soft）。音が取れないことより、
+      配信そのものが落ちる方が事故として重い。
+    """
+    exe = get_app_audio_capture_cmd()
+    if not exe:
+        log_print("[AppAudio] helper exe not found -> アプリ音声を無効化して続行")
+        return None
+    try:
+        target_pid = int(pid)
+    except (TypeError, ValueError):
+        log_print(f"[AppAudio] invalid pid: {pid!r}")
+        return None
+    if target_pid <= 0:
+        log_print(f"[AppAudio] invalid pid: {target_pid}")
+        return None
+
+    cmd = [exe, "--pid", str(target_pid),
+           "--mode", "exclude" if str(mode) == "exclude" else "include",
+           "--rate", str(int(rate)), "--channels", str(int(channels))]
+    if stats_sec:
+        cmd += ["--stats", str(int(stats_sec))]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, bufsize=0,
+            creationflags=CREATE_NO_WINDOW
+        )
+    except Exception as e:
+        log_print(f"[AppAudio] helper start failed: {e}")
+        return None
+    log_print(f"[AppAudio] helper started pid={target_pid} mode={mode}")
+    return proc
 
 _capture_displays_cache = (0.0, [])
 
@@ -2202,6 +2335,11 @@ class StreamerCore:
             "live_audio_loopback_device": str(self.config.get("live_audio_loopback_device", "")),
             "live_audio_mic_volume": float(self.config.get("live_audio_mic_volume", 1.0)),
             "live_audio_loopback_volume": float(self.config.get("live_audio_loopback_volume", 0.7)),
+            "live_audio_app_enabled": bool(self.config.get("live_audio_app_enabled", False)),
+            "live_audio_app_window_title": str(self.config.get("live_audio_app_window_title", "")),
+            "live_audio_app_volume": float(self.config.get("live_audio_app_volume", 1.0)),
+            "live_audio_app_mode": str(self.config.get("live_audio_app_mode", "include")),
+            "app_audio_available": bool(get_app_audio_capture_cmd()),
             "screen_capture_source_type": str(self.config.get("screen_capture_source_type", "display")),
             "screen_capture_display_index": int(self.config.get("screen_capture_display_index", 0)),
             "screen_capture_window_title": str(self.config.get("screen_capture_window_title", "")),
@@ -4156,6 +4294,75 @@ class StreamerCore:
                          args=(proc, stop_event), daemon=True).start()
         return stop_event
 
+    def _resolve_app_audio_pid(self):
+        """設定からアプリ音声の対象PIDを解決する。無効・未選択・不在なら None。
+
+        ★正本はウィンドウタイトル。PIDは対象アプリの再起動で変わるので、
+          配信を始める瞬間にタイトルから引き直す（タスク23と同じ考え方）。
+        """
+        if not self.config.get("live_audio_app_enabled", False):
+            return None
+        title = str(self.config.get("live_audio_app_window_title", "")).strip()
+        if not title:
+            log_print("[AppAudio] 対象ウィンドウ未選択 -> アプリ音声なしで続行")
+            return None
+        win = find_capture_window(title)
+        if not win:
+            log_print(f"[AppAudio] 対象ウィンドウが見つからない: '{title}' -> アプリ音声なしで続行")
+            return None
+        pid = win.get("pid")
+        log_print(f"[AppAudio] 対象ウィンドウ '{title}' -> pid={pid}")
+        return pid
+
+    def start_app_audio_capture(self):
+        """アプリ音声の補助exeを起動する。使えないときは None（fail-soft）。"""
+        pid = self._resolve_app_audio_pid()
+        if not pid:
+            return None
+        return start_app_audio_helper(
+            pid,
+            mode=self.config.get("live_audio_app_mode", "include"),
+            stats_sec=int(self.config.get("live_audio_app_stats_sec", 0) or 0)
+        )
+
+    def reap_app_audio_helper(self, sender_proc, helper_proc):
+        """送出FFmpegが終わったら補助exeを確実に落とす。
+
+        送出側の kill 箇所は多数あるので、個別に手を入れるのではなく
+        送出プロセスの寿命に紐づけて回収する。
+        """
+        if not helper_proc:
+            return
+        try:
+            sender_proc.wait()
+        except Exception:
+            pass
+        kill_proc(helper_proc)
+        log_print("[AppAudio] helper stopped")
+
+    def set_live_audio_app(self, enabled=None, window_title=None, volume=None, mode=None):
+        """アプリ単位の音声取り込み設定を更新する。"""
+        if enabled is not None:
+            self.config["live_audio_app_enabled"] = bool(enabled)
+        if window_title is not None:
+            self.config["live_audio_app_window_title"] = str(window_title)
+        if volume is not None:
+            try:
+                self.config["live_audio_app_volume"] = max(0.0, min(2.0, float(volume)))
+            except (TypeError, ValueError):
+                pass
+        if mode in ("include", "exclude"):
+            self.config["live_audio_app_mode"] = mode
+        self.save_config()
+        self.request_stream_reload()
+        return {
+            "live_audio_app_enabled": bool(self.config.get("live_audio_app_enabled", False)),
+            "live_audio_app_window_title": str(self.config.get("live_audio_app_window_title", "")),
+            "live_audio_app_volume": float(self.config.get("live_audio_app_volume", 1.0)),
+            "live_audio_app_mode": str(self.config.get("live_audio_app_mode", "include")),
+            "app_audio_available": bool(get_app_audio_capture_cmd()),
+        }
+
     def set_live_audio_devices(self, mic_device=None, loopback_device=None,
                                mic_volume=None, loopback_volume=None):
         """PC音声/マイク取り込みデバイス・音量を設定"""
@@ -4250,7 +4457,9 @@ class StreamerCore:
         """PC音声・マイク（dshow経路）を静止画背景でHLS/RTMPライブ配信"""
         mic_dev = str(self.config.get("live_audio_mic_device", "")).strip()
         loop_dev = str(self.config.get("live_audio_loopback_device", "")).strip()
-        if not mic_dev and not loop_dev:
+        # タスク25: アプリ音声だけでも成立するので、3つとも無いときだけ弾く。
+        app_on = bool(self.config.get("live_audio_app_enabled", False))
+        if not mic_dev and not loop_dev and not app_on:
             log_print("[Player] Live audio capture warning: No devices selected")
             self.status = "error"
             self.status_detail = "ライブ音声デバイスが未選択です"
@@ -4277,7 +4486,12 @@ class StreamerCore:
         mic_vol = self.config.get("live_audio_mic_volume", 1.0)
         loop_vol = self.config.get("live_audio_loopback_volume", 0.7)
 
-        input_args, audio_filter, audio_map = build_dshow_audio_inputs(
+        app_helper = self.start_app_audio_capture()
+        app_vol = self.config.get("live_audio_app_volume", 1.0)
+
+        input_args, audio_filter, audio_map = build_audio_inputs(
+            app_enabled=bool(app_helper),
+            app_volume=app_vol,
             mic_device=mic_dev,
             loopback_device=loop_dev,
             mic_volume=mic_vol,
@@ -4321,18 +4535,31 @@ class StreamerCore:
 
         try:
             proc = subprocess.Popen(
-                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                cmd,
+                stdin=(app_helper.stdout if app_helper else subprocess.DEVNULL),
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0,
                 creationflags=CREATE_NO_WINDOW
             )
         except Exception as e:
             log_print(f"[Player] Error starting live audio sender: {e}")
+            kill_proc(app_helper)
             self.status = "error"
             self.status_detail = f"Live audio sender error: {e}"
             return None
 
         with self.process_lock:
             self.send_proc = proc
+
+        # ★親側の読み口は閉じる。閉じないと補助exeが終わってもEOFが伝わらない。
+        if app_helper and app_helper.stdout:
+            try:
+                app_helper.stdout.close()
+            except Exception:
+                pass
+        if app_helper:
+            threading.Thread(target=self.reap_app_audio_helper,
+                             args=(proc, app_helper), daemon=True).start()
 
         stop_event = threading.Event()
         threading.Thread(target=self.relay_stream_data,
@@ -4389,7 +4616,13 @@ class StreamerCore:
         mic_vol = self.config.get("live_audio_mic_volume", 1.0)
         loop_vol = self.config.get("live_audio_loopback_volume", 0.7)
 
-        input_args_a, audio_filter, audio_map = build_dshow_audio_inputs(
+        # タスク25: アプリ単位の音声。使えないときは None が返り、従来の dshow 経路だけになる。
+        app_helper = self.start_app_audio_capture()
+        app_vol = self.config.get("live_audio_app_volume", 1.0)
+
+        input_args_a, audio_filter, audio_map = build_audio_inputs(
+            app_enabled=bool(app_helper),
+            app_volume=app_vol,
             mic_device=mic_dev,
             loopback_device=loop_dev,
             mic_volume=mic_vol,
@@ -4413,6 +4646,7 @@ class StreamerCore:
         window_plan = resolve_window_capture_plan(win) if win else None
         if source_type == "window" and window_plan is None:
             log_print("[Player] Screen capture: could not resolve window capture plan.")
+            kill_proc(app_helper)   # ここで抜けるなら補助exeも道連れにする
             self.status = "error"
             self.status_detail = "ウィンドウの取り込み方を決められませんでした"
             return None
@@ -4491,18 +4725,31 @@ class StreamerCore:
 
         try:
             proc = subprocess.Popen(
-                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                cmd,
+                stdin=(app_helper.stdout if app_helper else subprocess.DEVNULL),
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0,
                 creationflags=CREATE_NO_WINDOW
             )
         except Exception as e:
             log_print(f"[Player] Error starting screen capture sender: {e}")
+            kill_proc(app_helper)
             self.status = "error"
             self.status_detail = f"Screen capture sender error: {e}"
             return None
 
         with self.process_lock:
             self.send_proc = proc
+
+        # ★親側の読み口は閉じる。閉じないと補助exeが終わってもEOFが伝わらない。
+        if app_helper and app_helper.stdout:
+            try:
+                app_helper.stdout.close()
+            except Exception:
+                pass
+        if app_helper:
+            threading.Thread(target=self.reap_app_audio_helper,
+                             args=(proc, app_helper), daemon=True).start()
 
         stop_event = threading.Event()
         threading.Thread(target=self.relay_stream_data,
