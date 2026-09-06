@@ -4619,6 +4619,20 @@ class StreamerCore:
             start_index=1
         )
 
+        # ★入口のガードは「設定上どれか有効か」しか見ていない。アプリ音声だけを
+        #   有効にしていて、いざ始める段になって対象ウィンドウが見つからない
+        #   （補助exeが起動できない）と、ここで音声入力がゼロになる。
+        #   そのまま進むと "-map None" という壊れたコマンドをFFmpegに渡し、
+        #   何が悪いのか分からないまま配信が失敗していた。
+        #   ★画面共有と違い、ここは音声だけのモード。無音を流しても意味が無く、
+        #     機能が壊れているように見えるだけなので、理由を出して止める。
+        if not audio_map:
+            log_print("[Player] Live audio: 利用できる音声ソースがありません")
+            kill_proc(app_helper)
+            self.status = "error"
+            self.status_detail = "音声ソースが利用できません（対象ウィンドウやデバイスを確認してください）"
+            return None
+
         cmd = [get_ffmpeg_cmd()] + video_input_opts
         cmd.extend(input_args)
 

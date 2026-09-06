@@ -369,3 +369,48 @@ def test_build_slideshow_manifest_without_photos(monkeypatch):
         assert core.build_slideshow_manifest(track_seconds=0) is None
     finally:
         core.shutdown()
+
+
+def test_live_audio_stops_cleanly_when_no_audio_source(monkeypatch):
+    """アプリ音声だけ有効で対象が見つからないとき、壊れたコマンドを渡さない。
+
+    ★入口のガードは「設定上どれか有効か」しか見ない。いざ始める段で対象ウィンドウが
+      消えていると音声入力がゼロになり、以前は "-map None" をFFmpegへ渡していた。
+      何が悪いか分からないまま配信が失敗するので、理由を出して止める。
+    """
+    import streamer_core as sc
+    core = _live_core()
+    captured = {}
+
+    class _FakeProc:
+        returncode = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def _fake_popen(cmd, *a, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    try:
+        core.config["live_audio_mic_device"] = ""
+        core.config["live_audio_loopback_device"] = ""
+        core.config["live_audio_app_enabled"] = True
+        core.config["live_audio_app_window_title"] = "居ないウィンドウ"
+
+        monkeypatch.setattr(core, "ensure_stream_sink", lambda: True)
+        monkeypatch.setattr(core, "get_video_encoder", lambda: "libx264")
+        monkeypatch.setattr(sc.subprocess, "Popen", _fake_popen)
+        monkeypatch.setattr(core, "relay_stream_data", lambda *a, **k: None)
+        monkeypatch.setattr(core, "watch_send_proc", lambda *a, **k: None)
+        monkeypatch.setattr(sc, "find_capture_window", lambda title: None)
+
+        res = core.play_live_audio()
+
+        assert res is None, "音声ソースが無いのに配信を始めてしまっている"
+        assert "cmd" not in captured, "壊れたコマンドをFFmpegへ渡している"
+        assert core.status == "error"
+        assert core.status_detail, "理由が利用者に伝わらない"
+    finally:
+        core.shutdown()
