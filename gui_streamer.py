@@ -46,6 +46,15 @@ OUT_MODE_CHOICES = {
     "generic_rtmp": "Generic RTMP (上級者向け)",
 }
 
+# 映像エンコーダー（タスク18）。選んだものがそのPCで動かなければ libx264 へ退避する。
+ENCODER_CHOICES = {
+    "auto": "Auto (自動検出: NVENC → QSV → AMF → CPU)",
+    "libx264": "CPU / libx264 (最も互換性が高い)",
+    "h264_nvenc": "NVIDIA NVENC (GeForce / RTX)",
+    "h264_qsv": "Intel QSV (内蔵グラフィックス)",
+    "h264_amf": "AMD AMF (Radeon)",
+}
+
 # 設定ウィンドウ
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, parent, streamer_core):
@@ -108,6 +117,24 @@ class SettingsWindow(ctk.CTkToplevel):
         )
         self.opt_output_mode.set(out_mode_val)
         self.opt_output_mode.pack(fill="x", padx=15, pady=(2, 6))
+
+        self.lbl_video_encoder = ctk.CTkLabel(sec2_body, text="⚡ 映像エンコーダー (video_encoder):", anchor="w")
+        self.lbl_video_encoder.pack(fill="x", padx=15, pady=(10, 0))
+
+        curr_encoder = str(cfg.get("video_encoder", "auto"))
+        self.opt_video_encoder = ctk.CTkOptionMenu(
+            sec2_body,
+            values=list(ENCODER_CHOICES.values())
+        )
+        self.opt_video_encoder.set(ENCODER_CHOICES.get(curr_encoder, ENCODER_CHOICES["auto"]))
+        self.opt_video_encoder.pack(fill="x", padx=15, pady=(2, 2))
+
+        self.lbl_video_encoder_desc = ctk.CTkLabel(
+            sec2_body,
+            text="※選んだGPUエンコーダーがこのPCで動かない場合は、自動的にCPU(libx264)へ退避します。\n　ラジオモード(静止画+音声)は元から極小負荷のため常にCPUのままです。",
+            font=ctk.CTkFont(size=11), text_color="#95A5A6", anchor="w", justify="left"
+        )
+        self.lbl_video_encoder_desc.pack(fill="x", padx=15, pady=(0, 6))
 
         # TopazChat エンドポイント（個人運営でホストが変わり得るため利用者が変更可能）
         self.lbl_topaz_endpoint = ctk.CTkLabel(
@@ -307,6 +334,13 @@ class SettingsWindow(ctk.CTkToplevel):
         self.seg_radio_bg.set(radio_bg_val)
         self.seg_radio_bg.pack(fill="x", padx=15, pady=(2, 4))
 
+        self.lbl_radio_fade = ctk.CTkLabel(
+            sec5_body, text="🎚 Crossfade [sec] (曲間フェード秒数 / 0で無効・最大5):", anchor="w")
+        self.lbl_radio_fade.pack(fill="x", padx=15, pady=(6, 2))
+        self.entry_radio_fade = ctk.CTkEntry(sec5_body)
+        self.entry_radio_fade.insert(0, str(cfg.get("radio_crossfade_duration", 3)))
+        self.entry_radio_fade.pack(fill="x", padx=15, pady=(2, 4))
+
         self.lbl_radio_info = ctk.CTkLabel(
             sec5_body,
             text="💡 ラジオモード時は動画を落とさず帯域を約300kbps（通常比90%減）に極小化し、VRChatでのバッファ詰まりを防止します。",
@@ -381,6 +415,23 @@ class SettingsWindow(ctk.CTkToplevel):
 
         # 8. 📱 Webリモコン (権限 / パスワード)
         sec8_body = self._add_section("📱 Webリモコン (権限 / パスワード)", opened=False)
+
+        # 以下の個別権限より上位のスイッチ。オフにすると、ホストPC本人以外からは
+        # リモコン画面もAPIも見えなくなる（＝下の権限設定はどれも意味を持たなくなる）。
+        self.switch_web_remote = ctk.CTkSwitch(sec8_body, text="🛡️ Enable Web Remote (オフでホスト専用モード / 外部からの操作を全遮断)")
+        if cfg.get("enable_web_remote", True):
+            self.switch_web_remote.select()
+        self.switch_web_remote.pack(anchor="w", padx=15, pady=(10, 2))
+
+        self.lbl_web_remote_desc = ctk.CTkLabel(
+            sec8_body,
+            text="※オフにすると、QRオーバーレイと待機画面のQR案内も自動的に消えます。\n　VRChatへの映像配信（stream.m3u8）は止まりません。",
+            font=ctk.CTkFont(size=11),
+            text_color="#95A5A6",
+            anchor="w",
+            justify="left"
+        )
+        self.lbl_web_remote_desc.pack(fill="x", padx=15, pady=(0, 8))
 
         self.lbl_web_perms = ctk.CTkLabel(sec8_body, text="📱 Web Remote Permissions (ブラウザ操作権限):", font=ctk.CTkFont(weight="bold"), anchor="w")
         self.lbl_web_perms.pack(fill="x", padx=15, pady=(10, 4))
@@ -507,7 +558,7 @@ class SettingsWindow(ctk.CTkToplevel):
   現在の設定JSONを取得。
 
 ■ POST /api/config
-  設定JSONを更新・保存 (例: {"loop_queue": true, "shuffle": true, "radio_mode": true, "radio_bg_source": "card", "image_display_duration": 15})
+  設定JSONを更新・保存 (例: {"loop_queue": true, "shuffle": true, "radio_mode": true, "radio_bg_source": "card", "radio_crossfade_duration": 3, "image_display_duration": 15})
 """
         self.api_textbox = ctk.CTkTextbox(self.api_ref_frame, height=260, font=ctk.CTkFont(family="Consolas", size=11))
         self.api_textbox.insert("1.0", api_doc_text)
@@ -624,6 +675,14 @@ class SettingsWindow(ctk.CTkToplevel):
             radio_mode = bool(self.switch_radio.get())
             web_password = self.entry_web_password.get().strip()
             
+            # 曲間フェードは空欄・非数値でも保存を止めない（0＝無効へ倒す）。
+            # ここで例外を投げると、無関係な項目を直しただけの保存まで失敗する。
+            try:
+                radio_fade = float(self.entry_radio_fade.get().strip())
+            except Exception:
+                radio_fade = 0.0
+            radio_fade = max(0.0, min(5.0, radio_fade))
+
             selected_bg = self.seg_radio_bg.get()
             if "Slideshow" in selected_bg:
                 radio_bg = "slideshow"
@@ -631,6 +690,13 @@ class SettingsWindow(ctk.CTkToplevel):
                 radio_bg = "standby"
             else:
                 radio_bg = "card"
+
+            selected_encoder = self.opt_video_encoder.get()
+            video_encoder = "auto"
+            for key, text in ENCODER_CHOICES.items():
+                if selected_encoder == text:
+                    video_encoder = key
+                    break
 
             selected_out_mode = self.opt_output_mode.get()
             output_mode = "hls"
@@ -677,6 +743,7 @@ class SettingsWindow(ctk.CTkToplevel):
                 "playback_mode": "radio" if radio_mode else "video",
                 "radio_mode": radio_mode,
                 "radio_bg_source": radio_bg,
+                "radio_crossfade_duration": radio_fade,
                 "standby_mode": standby_mode,
                 "standby_image_path": self.current_standby_img_path,
                 "overlay_qr_enabled": qr_enabled,
@@ -690,6 +757,8 @@ class SettingsWindow(ctk.CTkToplevel):
                 "live_sync_duration_count": sync_count,
                 "loop_queue": loop_queue,
                 "shuffle": shuffle,
+                "video_encoder": video_encoder,
+                "enable_web_remote": bool(self.switch_web_remote.get()),
                 "allow_web_queue_add": bool(self.switch_web_add.get()),
                 "allow_web_queue_edit": bool(self.switch_web_edit.get()),
                 "allow_web_playback_control": bool(self.switch_web_control.get()),

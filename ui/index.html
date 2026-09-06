@@ -323,6 +323,16 @@
                                     <i class="ri-slideshow-line text-xs"></i>
                                     <span>スライドショー</span>
                                 </button>
+                                <!-- ライブ音声取り込み（タスク22）。取り込みデバイスはホストPCにしか無く、
+                                     設定もlocalhost限定なので、ゲストにはボタンごと出さない。 -->
+                                <button id="modeLiveBtn" onclick="selectAddMode('live')" class="hidden px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition items-center gap-1">
+                                    <i class="ri-mic-line text-xs"></i>
+                                    <span>ライブ音声</span>
+                                </button>
+                                <button id="modeScreenBtn" onclick="selectAddMode('screen')" class="hidden px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition items-center gap-1">
+                                    <i class="ri-tv-line text-xs"></i>
+                                    <span>画面共有</span>
+                                </button>
                             </div>
                         </div>
 
@@ -703,6 +713,182 @@
                     </div>
                 </div>
 
+                <div class="bg-card border border-border rounded-lg p-4 flex flex-col gap-4">
+                    <div class="flex items-center gap-2 pb-2 border-b border-border">
+                        <i class="ri-radio-2-line text-amber-400 text-base"></i>
+                        <h3 class="font-semibold text-xs text-zinc-200">ラジオ / BGM 設定</h3>
+                    </div>
+
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">曲間フェード秒数</label>
+                        <div class="flex items-center gap-2">
+                            <input type="number" id="settingRadioCrossfade" min="0" max="5" step="1" value="3" onchange="updateSettings()" class="w-24 bg-zinc-900 border border-zinc-700 rounded px-3 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary font-mono">
+                            <span class="text-xs text-zinc-400">秒（0で無効）</span>
+                        </div>
+                        <p class="text-[11px] text-zinc-500">※ラジオモードで曲の頭をフェードイン、終わりをフェードアウトさせ、変わり目のブツ切りをなくします。前後の曲を重ねる方式ではありません。</p>
+                    </div>
+                </div>
+
+                <!-- ライブ音声取り込み（タスク22）。デバイス列挙も設定変更も localhost 限定なので、
+                     ゲストには 403 になる。押せるのに保存できないUIを出さないため、カードごと隠す。 -->
+                <div id="liveAudioCard" class="hidden bg-card border border-border rounded-lg p-4 flex-col gap-4">
+                    <div class="flex items-center gap-2 pb-2 border-b border-border">
+                        <i class="ri-mic-line text-emerald-400 text-base"></i>
+                        <h3 class="font-semibold text-xs text-zinc-200">ライブ音声取り込み（このPCからのみ）</h3>
+                        <button onclick="loadAudioDevices(true)" class="ml-auto flex items-center gap-1 px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 rounded text-[11px] transition" title="接続機器を再スキャンします">
+                            <i class="ri-refresh-line"></i>
+                            <span>デバイス再スキャン</span>
+                        </button>
+                    </div>
+
+                    <!-- 配信画面（背景）。ラジオ背景と同じ仕組み（ffconcat + -stream_loop -1）を使うので、
+                         写真送りのために配信を張り直す必要がない。
+                         ★ラジオにある「サムネイルカード」は入れない。YouTubeのメタデータから作るもので、
+                         ライブ音声には元データが無い。 -->
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">配信画面（音声だけなので、映像はこの静止画になります）</label>
+                        <select id="liveAudioBgSource" onchange="changeLiveAudioBg(this.value)" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="standby">⏹ 待機画面 (Standby)</option>
+                            <option value="slideshow">🖼️ スライドショー (Slideshow)</option>
+                        </select>
+                        <p class="text-[11px] text-zinc-500">※スライドショーは「写真プール」の画像を巡回します。1枚あたりの表示秒数と自動送りは、上の写真スライドショー設定（ラジオと共通）に従います。自動送りがOFF、または写真が無いときは待機画面になります。</p>
+                    </div>
+
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">マイク入力（実況・MC）</label>
+                        <select id="liveAudioMicDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="">（使用しない）</option>
+                        </select>
+                        <div class="flex items-center gap-2">
+                            <input type="range" id="liveAudioMicVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                            <span id="liveAudioMicVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">PC出力音声（ループバック / BGM・ゲーム音）</label>
+                        <select id="liveAudioLoopbackDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="">（使用しない）</option>
+                        </select>
+                        <div class="flex items-center gap-2">
+                            <input type="range" id="liveAudioLoopbackVolume" min="0" max="2" step="0.05" value="0.7" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                            <span id="liveAudioLoopbackVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">0.70</span>
+                        </div>
+                    </div>
+
+                    <!-- アプリ単位の音声（タスク25）。Discordと同じく、選んだウィンドウの
+                         プロセスが鳴らしている音だけをWASAPIプロセスループバックで取り込む。 -->
+                    <div class="flex flex-col gap-2 pt-3 border-t border-border">
+                        <label class="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                            <input type="checkbox" id="liveAudioAppEnabled" onchange="applyLiveAudioAppSettings()" class="accent-emerald-400">
+                            <span>アプリ単位の音声（選んだウィンドウの音だけ）</span>
+                        </label>
+                        <select id="liveAudioAppWindow" onchange="applyLiveAudioAppSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="">（選択してください）</option>
+                        </select>
+                        <div class="flex items-center gap-2">
+                            <input type="range" id="liveAudioAppVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioAppSettings()" class="flex-1 accent-emerald-400">
+                            <span id="liveAudioAppVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
+                        </div>
+                        <!-- 入力レベルのゲージ。「取り込めているのか」を配信中に目で確かめるためのもの。
+                             補助exeが 200ms ごとに報告する peak/rms を /api/status 経由で受け取る。 -->
+                        <div class="flex items-center gap-2">
+                            <span class="text-[11px] text-zinc-400 w-16 shrink-0">入力レベル</span>
+                            <div class="flex-1 h-2 bg-zinc-800 rounded overflow-hidden">
+                                <div id="liveAudioAppMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
+                            </div>
+                            <span id="liveAudioAppMeterText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">停止中</span>
+                        </div>
+
+                        <p id="liveAudioAppUnavailable" class="hidden text-[11px] text-amber-400/90">
+                            &#9888; アプリ単位の音声取り込みに必要な補助プログラム（app_audio_capture.exe）が見つかりません。この項目を有効にしても、従来のPC出力音声／マイクだけで配信されます。
+                        </p>
+                        <p class="text-[11px] text-zinc-500">
+                            ※選んだウィンドウのプロセス（とその子プロセス）が鳴らしている音だけを取り込みます。ブラウザやDiscordのように音を別プロセスが出すアプリでも取り込めますが、ストアアプリなど一部は取り込めないことがあります。対象が見つからないときは自動で従来の経路に切り替わり、配信は止まりません。
+                        </p>
+                    </div>
+
+                    <p id="liveAudioLoopbackHint" class="hidden text-[11px] text-amber-400/90">
+                        ⚠️ このPCにはループバック録音に使えるデバイスが見つかりませんでした。PC出力音声を配信するには、サウンドカードの「ステレオ ミキサー / What U Hear」を有効にするか、VB-CABLE / VB-Audio Voicemeeter などの仮想オーディオデバイスの導入が必要です。マイク入力だけなら追加導入なしで使えます。
+                    </p>
+                    <p class="text-[11px] text-zinc-500">※両方選ぶとリアルタイム合成（amix）されます。設定を変えると配信は自動で再起動します。音声のみの生配信はHLSだと9〜12秒遅れるため、会話用途では配信先をTopazChatにしてください。</p>
+                </div>
+
+                <!-- 画面共有（タスク23）。キャプチャ対象列挙・設定変更は localhost 限定。 -->
+                <div id="screenCaptureCard" class="hidden bg-card border border-border rounded-lg p-4 flex-col gap-4">
+                    <div class="flex items-center gap-2 pb-2 border-b border-border">
+                        <i class="ri-tv-line text-emerald-400 text-base"></i>
+                        <h3 class="font-semibold text-xs text-zinc-200">画面共有（このPCからのみ）</h3>
+                        <button onclick="loadScreenCaptureSources(true)" class="ml-auto flex items-center gap-1 px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 rounded text-[11px] transition" title="キャプチャ対象一覧を再取得します">
+                            <i class="ri-refresh-line"></i>
+                            <span>一覧を再取得</span>
+                        </button>
+                    </div>
+
+                    <div class="flex items-center gap-4 text-xs text-zinc-300">
+                        <span class="text-zinc-400">共有対象:</span>
+                        <label class="flex items-center gap-1.5 cursor-pointer">
+                            <input type="radio" name="screenCaptureSourceType" value="display" checked onchange="toggleScreenCaptureSourceFields('display')" class="accent-emerald-400">
+                            <span>モニター</span>
+                        </label>
+                        <label class="flex items-center gap-1.5 cursor-pointer">
+                            <input type="radio" name="screenCaptureSourceType" value="window" onchange="toggleScreenCaptureSourceFields('window')" class="accent-emerald-400">
+                            <span>ウィンドウ</span>
+                        </label>
+                    </div>
+
+                    <div id="screenCaptureDisplayGroup" class="flex flex-col gap-2">
+                        <label class="text-xs text-zinc-400">対象モニター</label>
+                        <select id="screenCaptureDisplayIndex" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="0">ディスプレイ1 (既定)</option>
+                        </select>
+                    </div>
+
+                    <div id="screenCaptureWindowGroup" class="hidden flex-col gap-2">
+                        <label class="text-xs text-zinc-400">対象ウィンドウ</label>
+                        <select id="screenCaptureWindowTitle" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                            <option value="">（選択してください）</option>
+                        </select>
+                        <p class="text-[11px] text-zinc-500">※ウィンドウのタイトルが変わると見つからなくなります（ブラウザのタブ切替など）。その場合は一覧を再取得して選び直してください。<br>※<span class="text-amber-400/90">共有元のウィンドウを隠さないでください。</span>覆われたり背面になるとアプリ側が描画を止め、実測で29.6fps→1.4fpsまで落ちます（VRChatを同じモニタにフルスクリーンで置かないこと）。<br>※<span class="text-amber-400/90">手前に別のウィンドウが重なると、その部分がそのまま映ります。</span>配信開始後にウィンドウを動かしても切り出し位置は追従しないので、動かしたら「適用」を押し直してください。</p>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div class="flex flex-col gap-1.5">
+                            <label class="text-xs text-zinc-400">出力解像度</label>
+                            <select id="screenCaptureResolution" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                                <option value="1920x1080">1920x1080 (1080p)</option>
+                                <option value="1280x720">1280x720 (720p)</option>
+                                <option value="854x480">854x480 (480p)</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1.5">
+                            <label class="text-xs text-zinc-400">フレームレート</label>
+                            <select id="screenCaptureFramerate" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary font-mono">
+                                <option value="30">30 fps</option>
+                                <option value="20">20 fps</option>
+                                <option value="15">15 fps</option>
+                                <option value="10">10 fps</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1.5">
+                            <label class="text-xs text-zinc-400">ビットレート (kbps)</label>
+                            <input type="number" id="screenCaptureBitrateKbps" min="500" max="20000" step="100" value="4000" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary font-mono">
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between pt-1">
+                        <label class="flex items-center gap-2 cursor-pointer">
+                            <input type="checkbox" id="screenCaptureDrawMouse" checked class="rounded bg-zinc-900 border-zinc-700 text-emerald-400 focus:ring-0">
+                            <span class="text-xs text-zinc-300">マウスカーソルを含める</span>
+                        </label>
+                        <button id="screenCaptureApplyBtn" onclick="applyScreenCaptureSettings()" class="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-zinc-950 font-bold rounded text-xs transition">
+                            適用
+                        </button>
+                    </div>
+
+                    <p class="text-[11px] text-amber-400/90">※配信中は通知やパスワード入力も映ります。共有前に画面を確認してください。</p>
+                </div>
+
                 <!-- ホスト専用設定: ホストPC(localhost)からのみ表示・変更できる。
                      ゲストのブラウザに出すと「押せるのに403で保存できない」ので、UIごと隠す。 -->
                 <div id="hostSettingsCard" class="hidden bg-card border border-border rounded-lg p-4 flex-col gap-4">
@@ -748,6 +934,19 @@
                         </div>
 
                         <div class="flex flex-col gap-2">
+                            <label class="text-xs text-zinc-400">⚡ 映像エンコーダー</label>
+                            <select id="hostVideoEncoder" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
+                                <option value="auto">Auto（自動検出: NVENC → QSV → AMF → CPU）</option>
+                                <option value="libx264">CPU / libx264（最も互換性が高い）</option>
+                                <option value="h264_nvenc">NVIDIA NVENC（GeForce / RTX）</option>
+                                <option value="h264_qsv">Intel QSV（内蔵グラフィックス）</option>
+                                <option value="h264_amf">AMD AMF（Radeon）</option>
+                            </select>
+                            <p id="hostActiveEncoder" class="text-[11px] text-zinc-500"></p>
+                            <p class="text-[11px] text-zinc-500 -mt-1">※このPCで動かないGPUエンコーダーを選んだ場合は、自動的にCPU（libx264）へ退避します。ラジオモード（静止画＋音声）は元から極小負荷のため常にCPUのままです。</p>
+                        </div>
+
+                        <div class="flex flex-col gap-2">
                             <label class="text-xs text-zinc-400">待機画面</label>
                             <select id="hostStandbyMode" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
                                 <option value="image">🖼 待機画像を表示</option>
@@ -779,6 +978,12 @@
                             <i class="ri-shield-user-line text-amber-400 text-base"></i>
                             <span class="text-xs font-semibold text-zinc-200">Webリモコン（フレンド）に許可する操作</span>
                         </div>
+                        <label class="flex items-center gap-2 cursor-pointer">
+                            <input type="checkbox" id="hostEnableWebRemote" class="rounded bg-zinc-900 border-zinc-700 text-primary focus:ring-0">
+                            <span class="text-xs text-zinc-200">🛡️ Webリモコンを有効にする（オフ＝ホスト専用モード）</span>
+                        </label>
+                        <p class="text-[11px] text-zinc-500 -mt-1">※オフにすると、ホストPC以外からのリモコン画面・APIをすべて遮断します。QRオーバーレイと待機画面のQR案内も自動で消えます。VRChatへの映像配信は止まりません。</p>
+                        <p id="hostTunnelIdleWarn" class="hidden text-[11px] text-amber-400 -mt-1">⚠️ 現在の構成では、Cloudflareトンネルは何も配っていません（配信はRTMPで直接送出中）。トンネルを無効にすると公開URL自体が無くなります。</p>
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
                             <label class="flex items-center gap-2 cursor-pointer">
                                 <input type="checkbox" id="hostAllowAdd" class="rounded bg-zinc-900 border-zinc-700 text-primary focus:ring-0">
@@ -1385,6 +1590,15 @@
             const apiBaseInput = document.getElementById('settingApiBase');
             if (apiBaseInput) apiBaseInput.value = apiBase;
 
+            // 画面共有カード（タスク23）: 触ったら「編集中」に入れる。
+            // 個々の要素に onchange を書くのではなく委譲で拾う。項目を足したときに
+            // 付け忘れると、その項目だけ巻き戻る——という気付きにくい壊れ方をするため。
+            const scCard = document.getElementById('screenCaptureCard');
+            if (scCard) {
+                scCard.addEventListener('change', markScreenCaptureEditing);
+                scCard.addEventListener('input', markScreenCaptureEditing);
+            }
+
             // Check URL parameters for ?pin= or ?password=
             try {
                 const params = new URLSearchParams(window.location.search);
@@ -1479,6 +1693,39 @@
             if (navInfo) navInfo.classList.toggle('hidden', !showInfo);
             const btnShareQr = document.getElementById('btnGoShareQr');
             if (btnShareQr) btnShareQr.classList.toggle('hidden', !showInfo);
+
+            // ライブ音声（タスク22）: 取り込みデバイスはホストPCにしか存在せず、
+            // 列挙も設定変更も localhost 限定。ゲストにはモードボタンごと見せない。
+            const btnModeLive = document.getElementById('modeLiveBtn');
+            if (btnModeLive) {
+                btnModeLive.classList.toggle('hidden', !isHost);
+                btnModeLive.classList.toggle('flex', isHost);
+            }
+            if (isHost && !liveAudioDevicesLoaded) {
+                loadAudioDevices(false);
+            } else if (!isHost) {
+                const liveCard = document.getElementById('liveAudioCard');
+                if (liveCard) {
+                    liveCard.classList.add('hidden');
+                    liveCard.classList.remove('flex');
+                }
+            }
+
+            // 画面共有（タスク23）: キャプチャ対象列挙・設定変更は localhost 限定。
+            const btnModeScreen = document.getElementById('modeScreenBtn');
+            if (btnModeScreen) {
+                btnModeScreen.classList.toggle('hidden', !isHost);
+                btnModeScreen.classList.toggle('flex', isHost);
+            }
+            if (isHost && !screenCaptureSourcesLoaded) {
+                loadScreenCaptureSources(false);
+            } else if (!isHost) {
+                const screenCard = document.getElementById('screenCaptureCard');
+                if (screenCard) {
+                    screenCard.classList.add('hidden');
+                    screenCard.classList.remove('flex');
+                }
+            }
 
             // 表示中のタブが隠れた場合はプレイヤーへ戻す（空白の画面が残らないように）
             if ((!showSettings && activeTabId === 'settings') || (!showInfo && activeTabId === 'info')) {
@@ -1823,9 +2070,24 @@
             const inactiveCls = "px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition flex items-center gap-1";
             const activeCls = "px-2 py-0.5 rounded bg-zinc-800 text-primary font-medium transition flex items-center gap-1";
 
+            const lBtn = document.getElementById('modeLiveBtn');
+            const scBtn = document.getElementById('modeScreenBtn');
+
             if (vBtn) vBtn.className = (mode === 'video') ? activeCls : inactiveCls;
             if (rBtn) rBtn.className = (mode === 'radio') ? activeCls : inactiveCls;
             if (sBtn) sBtn.className = (mode === 'slideshow') ? activeCls : inactiveCls;
+            // ライブボタン・画面共有ボタンは表示制御が別（ホスト限定）なので、hidden を落とさないように
+            // className を丸ごと差し替えず、状態クラスだけを付け替える。
+            if (lBtn) {
+                const wasHidden = lBtn.classList.contains('hidden');
+                lBtn.className = (mode === 'live') ? activeCls : inactiveCls;
+                if (wasHidden) lBtn.classList.add('hidden');
+            }
+            if (scBtn) {
+                const wasHidden = scBtn.classList.contains('hidden');
+                scBtn.className = (mode === 'screen') ? activeCls : inactiveCls;
+                if (wasHidden) scBtn.classList.add('hidden');
+            }
 
             if (desc) {
                 if (mode === 'video') {
@@ -1834,6 +2096,10 @@
                     desc.innerText = "📻 BGMラジオ: 音声のみ抽出しアルバムアート/スライドショーと合成（帯域約300kbps・超軽量）";
                 } else if (mode === 'slideshow') {
                     desc.innerText = "🖼️ スライドショーモード: 写真プール内の写真を自動巡回配信（動画キューとは完全分離）";
+                } else if (mode === 'live') {
+                    desc.innerText = "🎙️ ライブ音声取り込み: このPCのマイク/出力音声を待機画面に載せて配信（キューは消費しません）";
+                } else if (mode === 'screen') {
+                    desc.innerText = "🖥️ 画面共有: ホストPCの画面（モニター/ウィンドウ）をリアルタイム配信（キューは消費しません）";
                 }
             }
         }
@@ -1917,6 +2183,9 @@
             // 未指定なら安全側＝非許可。サーバーが古い場合にゲストへ共有情報を出さない。
             guestCanSeeShareInfo = !!(data.permissions && data.permissions.allow_web_share_info === true);
             applyRemoteTabVisibility(isLocal);
+            updateActiveEncoderLabel(data);
+            syncLiveAudioFromStatus(data);
+            syncScreenCaptureFromStatus(data);
             maybeShowSetupModal(data, isLocal);
 
             // Header Action buttons visibility
@@ -2126,6 +2395,11 @@
             if (data.image_auto_advance !== undefined) {
                 const advEl = document.getElementById('settingImageAutoAdvance');
                 if (advEl) advEl.checked = data.image_auto_advance;
+            }
+            if (data.radio_crossfade_duration !== undefined) {
+                const fadeEl = document.getElementById('settingRadioCrossfade');
+                // 入力中の値を毎ポーリングで奪わない（他の設定項目と同じ扱い）
+                if (fadeEl && document.activeElement !== fadeEl) fadeEl.value = data.radio_crossfade_duration;
             }
 
             // Destination tab sync
@@ -2714,6 +2988,501 @@
             }
         }
 
+        // ===== ライブ音声取り込み（タスク22） =====
+        // デバイス列挙は ffmpeg のプロセス起動を伴い約1秒かかる（サーバー側で30秒キャッシュ）。
+        // ステータスポーリングから毎回叩かないよう、呼ぶのは初回とユーザー操作時だけにする。
+        let liveAudioDevicesLoaded = false;
+        let liveAudioUserChangedAt = 0;
+
+        function updateLiveAudioVolumeLabels() {
+            const mic = document.getElementById('liveAudioMicVolume');
+            const loop = document.getElementById('liveAudioLoopbackVolume');
+            const micLabel = document.getElementById('liveAudioMicVolumeLabel');
+            const loopLabel = document.getElementById('liveAudioLoopbackVolumeLabel');
+            if (mic && micLabel) micLabel.innerText = Number(mic.value).toFixed(2);
+            if (loop && loopLabel) loopLabel.innerText = Number(loop.value).toFixed(2);
+            const app = document.getElementById('liveAudioAppVolume');
+            const appLabel = document.getElementById('liveAudioAppVolumeLabel');
+            if (app && appLabel) appLabel.innerText = Number(app.value).toFixed(2);
+        }
+
+        async function loadAudioDevices(force = false) {
+            // アプリ音声のウィンドウ一覧も同じ操作で更新する（別ボタンを増やさない）。
+            loadAppAudioWindows(force);
+            const card = document.getElementById('liveAudioCard');
+            if (!card) return;
+            if (!isLocalEnvironment()) {
+                card.classList.add('hidden');
+                card.classList.remove('flex');
+                return;
+            }
+            const micSel = document.getElementById('liveAudioMicDevice');
+            const loopSel = document.getElementById('liveAudioLoopbackDevice');
+            if (!micSel || !loopSel) return;
+
+            try {
+                const url = `${apiBase}/api/audio_devices${force ? '?refresh=1' : ''}`;
+                const res = await fetch(url, { cache: 'no-store' });
+                if (!res.ok) {
+                    // 403 はゲスト。カードごと隠す（押せるのに保存できない状態を作らない）。
+                    card.classList.add('hidden');
+                    card.classList.remove('flex');
+                    return;
+                }
+                const data = await res.json();
+                const devices = Array.isArray(data.devices) ? data.devices : [];
+
+                // 選択中の値は列挙し直しても保持する（配信中に勝手に外れないように）。
+                const keepMic = micSel.value;
+                const keepLoop = loopSel.value;
+
+                const fill = (sel, keep, loopbackOnlyHint) => {
+                    sel.innerHTML = '';
+                    const none = document.createElement('option');
+                    none.value = '';
+                    none.textContent = '（使用しない）';
+                    sel.appendChild(none);
+                    devices.forEach(d => {
+                        const opt = document.createElement('option');
+                        opt.value = d.name;
+                        opt.textContent = (loopbackOnlyHint && d.loopback_hint) ? `${d.name}  ★ループバック候補` : d.name;
+                        sel.appendChild(opt);
+                    });
+                    // 既に選ばれているデバイスが今回の列挙に無い場合（抜かれた等）でも、
+                    // 選択が黙って消えると原因が分からなくなるので、項目を復活させて残す。
+                    if (keep && !devices.some(d => d.name === keep)) {
+                        const missing = document.createElement('option');
+                        missing.value = keep;
+                        missing.textContent = `${keep}  （未検出）`;
+                        sel.appendChild(missing);
+                    }
+                    sel.value = keep || '';
+                };
+
+                fill(micSel, keepMic, false);
+                fill(loopSel, keepLoop, true);
+
+                const hint = document.getElementById('liveAudioLoopbackHint');
+                if (hint) {
+                    const hasLoopback = devices.some(d => d.loopback_hint);
+                    hint.classList.toggle('hidden', hasLoopback || devices.length === 0);
+                }
+
+                liveAudioDevicesLoaded = true;
+                card.classList.remove('hidden');
+                card.classList.add('flex');
+                if (force) showToast(`音声デバイスを${devices.length}件検出しました`, 'info');
+            } catch (e) {
+                card.classList.add('hidden');
+                card.classList.remove('flex');
+            }
+        }
+
+        async function changeLiveAudioBg(val) {
+            liveAudioUserChangedAt = Date.now();
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'set_live_audio_bg_source', source: val })
+                });
+                if (res.ok) {
+                    showToast('ライブ音声の配信画面を変更しました', 'success');
+                    checkServerHealth(true);
+                } else {
+                    showToast('配信画面の変更に失敗しました', 'danger');
+                }
+            } catch (e) {
+                showToast('配信画面の変更に失敗しました', 'danger');
+            }
+        }
+
+        async function applyLiveAudioSettings() {
+            liveAudioUserChangedAt = Date.now();
+            updateLiveAudioVolumeLabels();
+            const micSel = document.getElementById('liveAudioMicDevice');
+            const loopSel = document.getElementById('liveAudioLoopbackDevice');
+            const micVol = document.getElementById('liveAudioMicVolume');
+            const loopVol = document.getElementById('liveAudioLoopbackVolume');
+            if (!micSel || !loopSel || !micVol || !loopVol) return;
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'set_live_audio',
+                        mic_device: micSel.value,
+                        loopback_device: loopSel.value,
+                        mic_volume: Number(micVol.value),
+                        loopback_volume: Number(loopVol.value)
+                    })
+                });
+                if (res.ok) {
+                    showToast('ライブ音声設定を保存しました', 'success');
+                    checkServerHealth(true);
+                } else {
+                    showToast('ライブ音声設定の保存に失敗しました', 'danger');
+                }
+            } catch (e) {
+                showToast('ライブ音声設定の保存に失敗しました', 'danger');
+            }
+        }
+
+        // サーバー側の値をUIへ反映。ユーザーが今まさに触っている最中は上書きしない
+        // （スライダーを動かしている途中でポーリングに値を戻される事故を防ぐ）。
+        function syncLiveAudioFromStatus(data) {
+            if (!data) return;
+            // ★ゲージは操作中でも止めない。ここより下の「4秒間は上書きしない」ガードは
+            //   スライダーを触っている最中に値を巻き戻さないためのもので、
+            //   読み取り専用のゲージには当てはまらない（止まると壊れて見える）。
+            updateAppAudioMeter(data);
+            if (Date.now() - liveAudioUserChangedAt < 4000) return;
+            const micSel = document.getElementById('liveAudioMicDevice');
+            const loopSel = document.getElementById('liveAudioLoopbackDevice');
+            const micVol = document.getElementById('liveAudioMicVolume');
+            const loopVol = document.getElementById('liveAudioLoopbackVolume');
+            if (micSel && typeof data.live_audio_mic_device === 'string' && liveAudioDevicesLoaded) {
+                if (micSel.value !== data.live_audio_mic_device) micSel.value = data.live_audio_mic_device;
+            }
+            if (loopSel && typeof data.live_audio_loopback_device === 'string' && liveAudioDevicesLoaded) {
+                if (loopSel.value !== data.live_audio_loopback_device) loopSel.value = data.live_audio_loopback_device;
+            }
+            if (micVol && typeof data.live_audio_mic_volume === 'number') micVol.value = data.live_audio_mic_volume;
+            if (loopVol && typeof data.live_audio_loopback_volume === 'number') loopVol.value = data.live_audio_loopback_volume;
+            const bgSel = document.getElementById('liveAudioBgSource');
+            if (bgSel && typeof data.live_audio_bg_source === 'string') {
+                if (bgSel.value !== data.live_audio_bg_source) bgSel.value = data.live_audio_bg_source;
+            }
+            updateLiveAudioVolumeLabels();
+            syncLiveAudioAppFromStatus(data);
+        }
+
+        // ===== アプリ単位の音声（タスク25） =====
+        // ウィンドウ一覧は画面共有と同じ /api/capture_sources を使い回す。
+        // 列挙のコストを二重に払う理由がない。
+        let appAudioWindowsLoaded = false;
+
+        async function loadAppAudioWindows(force = false) {
+            const sel = document.getElementById('liveAudioAppWindow');
+            if (!sel || !isLocalEnvironment()) return;
+            try {
+                const url = `${apiBase}/api/capture_sources${force ? '?refresh=1' : ''}`;
+                const res = await fetch(url, { cache: 'no-store' });
+                if (!res.ok) return;
+                const data = await res.json();
+                const windows = Array.isArray(data.windows) ? data.windows : [];
+                const keep = sel.value;
+                sel.innerHTML = '';
+                const none = document.createElement('option');
+                none.value = '';
+                none.textContent = '（選択してください）';
+                sel.appendChild(none);
+                windows.forEach(w => {
+                    const opt = document.createElement('option');
+                    opt.value = w.title;
+                    opt.textContent = w.duplicate ? `${w.title}（同名が複数）` : w.title;
+                    sel.appendChild(opt);
+                });
+                if (keep) sel.value = keep;
+                appAudioWindowsLoaded = true;
+            } catch (e) { /* 列挙に失敗しても配信操作は続けられるので黙って諦める */ }
+        }
+
+        async function applyLiveAudioAppSettings() {
+            liveAudioUserChangedAt = Date.now();
+            updateLiveAudioVolumeLabels();
+            const en = document.getElementById('liveAudioAppEnabled');
+            const win = document.getElementById('liveAudioAppWindow');
+            const vol = document.getElementById('liveAudioAppVolume');
+            if (!en || !win || !vol) return;
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'set_live_audio_app',
+                        enabled: en.checked,
+                        window_title: win.value,
+                        volume: Number(vol.value)
+                    })
+                });
+                if (res.ok) {
+                    showToast('アプリ音声設定を保存しました', 'success');
+                    checkServerHealth(true);
+                } else {
+                    showToast('アプリ音声設定の保存に失敗しました', 'danger');
+                }
+            } catch (e) {
+                showToast('アプリ音声設定の保存に失敗しました', 'danger');
+            }
+        }
+
+        // 入力レベルのゲージ。
+        // ★リニアで描くとバーがほとんど動かない。実測では rms 0.009（= -40dBFS）でも
+        //   はっきり聞こえるため、-60〜0dBFS を 0〜100% に写す。
+        function updateAppAudioMeter(data) {
+            const bar = document.getElementById('liveAudioAppMeterBar');
+            const txt = document.getElementById('liveAudioAppMeterText');
+            if (!bar || !txt) return;
+            const lv = (data && data.app_audio_level) ? data.app_audio_level : null;
+            if (!lv || !lv.fresh) {
+                // 配信していない、または補助exeが動いていない。
+                bar.style.width = '0%';
+                bar.style.backgroundColor = '#52525b';
+                txt.textContent = '停止中';
+                txt.className = 'w-16 text-right text-[11px] text-zinc-500 font-mono';
+                return;
+            }
+            const rms = Number(lv.rms) || 0;
+            const db = rms > 0 ? 20 * Math.log10(rms) : -100;
+            const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+            const silent = db < -55;
+            bar.style.width = pct.toFixed(1) + '%';
+            bar.style.backgroundColor = silent ? '#52525b' : (db > -6 ? '#f59e0b' : '#34d399');
+            txt.textContent = silent ? '無音' : Math.round(db) + ' dB';
+            txt.className = 'w-16 text-right text-[11px] font-mono ' +
+                (silent ? 'text-zinc-500' : (db > -6 ? 'text-amber-400' : 'text-emerald-400'));
+        }
+
+        function syncLiveAudioAppFromStatus(data) {
+            if (!data) return;
+            if (Date.now() - liveAudioUserChangedAt < 4000) return;
+            const en = document.getElementById('liveAudioAppEnabled');
+            const win = document.getElementById('liveAudioAppWindow');
+            const vol = document.getElementById('liveAudioAppVolume');
+            const warn = document.getElementById('liveAudioAppUnavailable');
+            if (en && typeof data.live_audio_app_enabled === 'boolean') en.checked = data.live_audio_app_enabled;
+            if (win && typeof data.live_audio_app_window_title === 'string' && appAudioWindowsLoaded) {
+                if (win.value !== data.live_audio_app_window_title) win.value = data.live_audio_app_window_title;
+            }
+            if (vol && typeof data.live_audio_app_volume === 'number') vol.value = data.live_audio_app_volume;
+            // 補助exeが無い環境では、有効にしても効かないことを明示する。
+            if (warn && typeof data.app_audio_available === 'boolean') {
+                warn.classList.toggle('hidden', data.app_audio_available);
+            }
+            updateLiveAudioVolumeLabels();
+        }
+
+        // ===== 画面共有（タスク23） =====
+        let screenCaptureSourcesLoaded = false;
+        let screenCaptureUserChangedAt = 0;
+        // ★このカードだけ「適用」ボタン方式なので、押すまでの間フォームを守る必要がある。
+        //   ライブ音声カードは onchange で即時送信するため liveAudioUserChangedAt が
+        //   毎回更新され、この問題が起きない。こちらは「適用」を押すまで何も記録されず、
+        //   /api/status のポーリング（約0.5秒）が選択をサーバー値へ巻き戻していた
+        //   （実測: ラジオを「ウィンドウ」にしても 517ms で「モニター」へ戻る）。
+        //   ★守り方は「時間」ではなく「触ったかどうか」にする。
+        //     猶予時間方式（20秒）にすると、利用者が迷っている間に黙って巻き戻り、
+        //     そのまま適用を押すと古い値が飛ぶ——最初の不具合と同じ壊れ方が、
+        //     再現しにくいぶん**もっと気付きにくい形**で残る（実測: 猶予方式でも21.7秒で巻き戻った）。
+        //     一度触ったら、適用するか再取得するまで上書きしない。時計に頼らない。
+        let screenCaptureDirty = false;
+
+        function markScreenCaptureEditing() {
+            if (screenCaptureDirty) return;
+            screenCaptureDirty = true;
+            updateScreenCaptureDirtyUI();
+        }
+
+        function clearScreenCaptureDirty() {
+            screenCaptureDirty = false;
+            updateScreenCaptureDirtyUI();
+        }
+
+        // 「押したかどうか」が見て分からないと、巻き戻りに気付けないまま
+        // 古い設定で配信し続けることになる。未反映を明示する。
+        function updateScreenCaptureDirtyUI() {
+            const btn = document.getElementById('screenCaptureApplyBtn');
+            if (!btn) return;
+            btn.textContent = screenCaptureDirty ? '適用（未反映）' : '適用';
+            btn.classList.toggle('ring-2', screenCaptureDirty);
+            btn.classList.toggle('ring-amber-300', screenCaptureDirty);
+        }
+
+        function toggleScreenCaptureSourceFields(sourceType) {
+            const displayGroup = document.getElementById('screenCaptureDisplayGroup');
+            const windowGroup = document.getElementById('screenCaptureWindowGroup');
+            if (displayGroup) displayGroup.classList.toggle('hidden', sourceType !== 'display');
+            if (windowGroup) {
+                windowGroup.classList.toggle('hidden', sourceType !== 'window');
+                windowGroup.classList.toggle('flex', sourceType === 'window');
+            }
+        }
+
+        async function loadScreenCaptureSources(force = false) {
+            const card = document.getElementById('screenCaptureCard');
+            if (!card) return;
+            if (!isLocalEnvironment()) {
+                card.classList.add('hidden');
+                card.classList.remove('flex');
+                return;
+            }
+            const displaySel = document.getElementById('screenCaptureDisplayIndex');
+            const windowSel = document.getElementById('screenCaptureWindowTitle');
+            if (!displaySel || !windowSel) return;
+
+            try {
+                const url = `${apiBase}/api/capture_sources${force ? '?refresh=1' : ''}`;
+                const res = await fetch(url, { cache: 'no-store' });
+                if (!res.ok) {
+                    card.classList.add('hidden');
+                    card.classList.remove('flex');
+                    return;
+                }
+                const data = await res.json();
+                const displays = Array.isArray(data.displays) ? data.displays : [];
+                const windows = Array.isArray(data.windows) ? data.windows : [];
+
+                const keepDisplay = displaySel.value;
+                const keepWindow = windowSel.value;
+
+                displaySel.innerHTML = '';
+                displays.forEach(d => {
+                    const opt = document.createElement('option');
+                    opt.value = d.index;
+                    opt.textContent = d.label || `ディスプレイ${d.index + 1} (${d.width}x${d.height})`;
+                    displaySel.appendChild(opt);
+                });
+                if (displays.length === 0) {
+                    const opt = document.createElement('option');
+                    opt.value = 0;
+                    opt.textContent = 'ディスプレイ1 (既定)';
+                    displaySel.appendChild(opt);
+                }
+                if (keepDisplay !== "") displaySel.value = keepDisplay;
+
+                windowSel.innerHTML = '';
+                const noneWin = document.createElement('option');
+                noneWin.value = '';
+                noneWin.textContent = '（選択してください）';
+                windowSel.appendChild(noneWin);
+
+                windows.forEach(w => {
+                    const opt = document.createElement('option');
+                    opt.value = w.title;
+                    const dupLabel = w.duplicate ? ' ⚠ 同名あり' : '';
+                    opt.textContent = `${w.title} (${w.width}x${w.height})${dupLabel}`;
+                    windowSel.appendChild(opt);
+                });
+
+                if (keepWindow && !windows.some(w => w.title === keepWindow)) {
+                    const missing = document.createElement('option');
+                    missing.value = keepWindow;
+                    missing.textContent = `${keepWindow} （未検出）`;
+                    windowSel.appendChild(missing);
+                }
+                windowSel.value = keepWindow || '';
+
+                screenCaptureSourcesLoaded = true;
+                card.classList.remove('hidden');
+                card.classList.add('flex');
+                if (force) showToast(`ディスプレイ${displays.length}件、ウィンドウ${windows.length}件を検出しました`, 'info');
+            } catch (e) {
+                card.classList.add('hidden');
+                card.classList.remove('flex');
+            }
+        }
+
+        async function applyScreenCaptureSettings() {
+            screenCaptureUserChangedAt = Date.now();
+            const sourceRadios = document.getElementsByName('screenCaptureSourceType');
+            let sourceType = 'display';
+            for (const r of sourceRadios) {
+                if (r.checked) sourceType = r.value;
+            }
+            const displaySel = document.getElementById('screenCaptureDisplayIndex');
+            const windowSel = document.getElementById('screenCaptureWindowTitle');
+            const resSel = document.getElementById('screenCaptureResolution');
+            const fpsSel = document.getElementById('screenCaptureFramerate');
+            const bInput = document.getElementById('screenCaptureBitrateKbps');
+            const mouseChk = document.getElementById('screenCaptureDrawMouse');
+
+            // ★ウィンドウ指定なのに未選択のまま送ると、配信中のストリームが
+            //   error（「キャプチャ対象のウィンドウが未選択です」）へ落ちる。
+            //   実測で踏んだので、送る前に止める。
+            if (sourceType === 'window' && !(windowSel && windowSel.value)) {
+                showToast('共有するウィンドウを選んでください', 'danger');
+                return;
+            }
+
+            let w = 1920, h = 1080;
+            if (resSel && resSel.value) {
+                const parts = resSel.value.split('x');
+                if (parts.length === 2) {
+                    w = parseInt(parts[0], 10) || 1920;
+                    h = parseInt(parts[1], 10) || 1080;
+                }
+            }
+
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'set_screen_capture',
+                        source_type: sourceType,
+                        display_index: parseInt(displaySel ? displaySel.value : 0, 10) || 0,
+                        window_title: windowSel ? windowSel.value : '',
+                        framerate: parseInt(fpsSel ? fpsSel.value : 30, 10) || 30,
+                        width: w,
+                        height: h,
+                        draw_mouse: mouseChk ? mouseChk.checked : true,
+                        bitrate_kbps: parseInt(bInput ? bInput.value : 4000, 10) || 4000
+                    })
+                });
+                if (res.ok) {
+                    // 保存できたので編集中の保護は解く。以降は screenCaptureUserChangedAt の
+                    // 4秒間だけ待って、サーバーの確定値に追随させる。
+                    clearScreenCaptureDirty();
+                    showToast('画面共有設定を保存しました', 'success');
+                    checkServerHealth(true);
+                } else {
+                    showToast('画面共有設定の保存に失敗しました', 'danger');
+                }
+            } catch (e) {
+                showToast('画面共有設定の保存に失敗しました', 'danger');
+            }
+        }
+
+        function syncScreenCaptureFromStatus(data) {
+            if (!data) return;
+            if (Date.now() - screenCaptureUserChangedAt < 4000) return;
+            // ユーザーが触った後はサーバー値で上書きしない（「適用」を押す前に巻き戻さない）
+            if (screenCaptureDirty) return;
+
+            const sourceRadios = document.getElementsByName('screenCaptureSourceType');
+            if (typeof data.screen_capture_source_type === 'string') {
+                for (const r of sourceRadios) {
+                    r.checked = (r.value === data.screen_capture_source_type);
+                }
+                toggleScreenCaptureSourceFields(data.screen_capture_source_type);
+            }
+            const displaySel = document.getElementById('screenCaptureDisplayIndex');
+            if (displaySel && typeof data.screen_capture_display_index === 'number' && screenCaptureSourcesLoaded) {
+                displaySel.value = data.screen_capture_display_index;
+            }
+            const windowSel = document.getElementById('screenCaptureWindowTitle');
+            if (windowSel && typeof data.screen_capture_window_title === 'string' && screenCaptureSourcesLoaded) {
+                windowSel.value = data.screen_capture_window_title;
+            }
+            const resSel = document.getElementById('screenCaptureResolution');
+            if (resSel && typeof data.screen_capture_width === 'number' && typeof data.screen_capture_height === 'number') {
+                resSel.value = `${data.screen_capture_width}x${data.screen_capture_height}`;
+            }
+            const fpsSel = document.getElementById('screenCaptureFramerate');
+            if (fpsSel && typeof data.screen_capture_framerate === 'number') {
+                fpsSel.value = data.screen_capture_framerate;
+            }
+            const bInput = document.getElementById('screenCaptureBitrateKbps');
+            if (bInput && typeof data.screen_capture_bitrate_kbps === 'number') {
+                bInput.value = data.screen_capture_bitrate_kbps;
+            }
+            const mouseChk = document.getElementById('screenCaptureDrawMouse');
+            if (mouseChk && typeof data.screen_capture_draw_mouse === 'boolean') {
+                mouseChk.checked = data.screen_capture_draw_mouse;
+            }
+        }
+
         async function changeDuration(sec) {
             try {
                 const res = await fetch(`${apiBase}/api/control`, {
@@ -2902,6 +3671,9 @@
             const qrMode = document.getElementById('settingQrMode').value;
             const clockOverlay = document.getElementById('settingClockOverlay') ? document.getElementById('settingClockOverlay').checked : false;
             const duration = parseInt(document.getElementById('settingImageDuration').value) || 15;
+            let radioCrossfade = parseFloat(document.getElementById('settingRadioCrossfade')?.value);
+            if (!isFinite(radioCrossfade) || radioCrossfade < 0) radioCrossfade = 0;
+            if (radioCrossfade > 5) radioCrossfade = 5;
             const autoAdvance = document.getElementById('settingImageAutoAdvance').checked;
 
             const outputModeEl = document.getElementById('settingOutputMode');
@@ -2937,6 +3709,7 @@
                 overlay_clock_video: clockOverlay,
                 image_display_duration: duration,
                 image_auto_advance: autoAdvance,
+                radio_crossfade_duration: radioCrossfade,
                 output_mode: outputMode,
                 rtmp_video_bitrate_kbps: vBitrate,
                 rtmp_audio_bitrate_kbps: aBitrate,
@@ -3365,6 +4138,41 @@
             if (label) label.innerText = reveal ? '隠す' : '表示';
         }
 
+        // 設定した値ではなく「実際に動いているエンコーダー」を出す。GPUが無い等で
+        // libx264 へ退避したとき、設定画面だけ見ても気づけないため。
+        function updateActiveEncoderLabel(data) {
+            const el = document.getElementById('hostActiveEncoder');
+            if (!el) return;
+            const active = data && data.active_video_encoder;
+            const requested = (data && data.video_encoder) || 'auto';
+            if (!active) { el.innerText = ''; return; }
+            if (requested !== 'auto' && requested !== active) {
+                el.innerText = '⚠ 現在の実動作: ' + active + '（' + requested + ' はこのPCで使えないため退避中）';
+                el.className = 'text-[11px] text-amber-400';
+            } else {
+                el.innerText = '現在の実動作: ' + active;
+                el.className = 'text-[11px] text-zinc-500';
+            }
+        }
+
+        // トンネルが「誰にも何も配っていない」構成の検知に使う。/api/config からしか取れない。
+        let lastHostOutputMode = 'hls';
+        let lastHostRtmpFallback = true;
+
+        // ホスト専用モード + RTMP押し出し + HLSフォールバック無効 のとき、
+        // Cloudflareトンネルは 403 を返すだけの存在になる（＝公開URLが無駄に立っている）。
+        // 自動で止めはしない。フォールバックが有効な場合はHLS退避にトンネルが要るうえ、
+        // クイックトンネルは張り直すとURLが変わり、ワールドに貼ったURLが死ぬため。
+        function updateTunnelIdleWarning() {
+            const warn = document.getElementById('hostTunnelIdleWarn');
+            if (!warn) return;
+            const remoteOff = !(document.getElementById('hostEnableWebRemote') || {}).checked;
+            const tunnelOn = !!(document.getElementById('hostEnableTunnel') || {}).checked;
+            const isPush = lastHostOutputMode === 'topaz' || lastHostOutputMode === 'generic_rtmp';
+            const idle = remoteOff && tunnelOn && isPush && !lastHostRtmpFallback;
+            warn.classList.toggle('hidden', !idle);
+        }
+
         // ホスト専用設定は /api/status には載っていないので、設定ファイルから直接読む。
         // このエンドポイントは localhost 限定（ゲストには 403）。
         async function loadHostSettings() {
@@ -3395,17 +4203,31 @@
                 set('hostHlsSegment', cfg.hls_segment_time);
                 set('hostTransitionWait', cfg.video_transition_wait_seconds);
                 set('hostLiveSync', cfg.live_sync_duration_count);
+                set('hostVideoEncoder', cfg.video_encoder || 'auto');
                 set('hostStandbyMode', cfg.standby_mode || 'image');
                 set('hostLoopQueue', cfg.loop_queue);
                 set('hostShuffle', cfg.shuffle);
                 set('hostAllowAdd', cfg.allow_web_queue_add);
                 set('hostAllowEdit', cfg.allow_web_queue_edit);
                 set('hostAllowControl', cfg.allow_web_playback_control);
+                // 未設定（キーが無い古い config.json）は有効。ここを false 側に倒すと
+                // 更新しただけでリモコンが消えたように見える。
+                set('hostEnableWebRemote', cfg.enable_web_remote !== false);
                 set('hostAllowShareInfo', cfg.allow_web_share_info);
                 set('hostWebPassword', cfg.web_password || '');
 
                 const pathEl = document.getElementById('hostStandbyImagePath');
                 if (pathEl) pathEl.innerText = cfg.standby_image_path || '（未設定：既定の待機画面）';
+                lastHostOutputMode = cfg.output_mode || 'hls';
+                lastHostRtmpFallback = cfg.rtmp_fallback_to_hls !== false;
+                updateTunnelIdleWarning();
+                ['hostEnableWebRemote', 'hostEnableTunnel'].forEach((id) => {
+                    const el = document.getElementById(id);
+                    if (el && !el.dataset.idleWarnBound) {
+                        el.dataset.idleWarnBound = '1';
+                        el.addEventListener('change', updateTunnelIdleWarning);
+                    }
+                });
                 applyHostWindowMode();
             } catch (e) {
                 card.classList.add('hidden');
@@ -3435,12 +4257,14 @@
                 hls_segment_time: num('hostHlsSegment', 3),
                 video_transition_wait_seconds: num('hostTransitionWait', 1),
                 live_sync_duration_count: num('hostLiveSync', 4),
+                video_encoder: (document.getElementById('hostVideoEncoder') || {}).value || 'auto',
                 standby_mode: (document.getElementById('hostStandbyMode') || {}).value || 'image',
                 loop_queue: bool('hostLoopQueue'),
                 shuffle: bool('hostShuffle'),
                 allow_web_queue_add: bool('hostAllowAdd'),
                 allow_web_queue_edit: bool('hostAllowEdit'),
                 allow_web_playback_control: bool('hostAllowControl'),
+                enable_web_remote: bool('hostEnableWebRemote'),
                 allow_web_share_info: bool('hostAllowShareInfo'),
                 web_password: (document.getElementById('hostWebPassword') || {}).value || ''
             };

@@ -24,14 +24,15 @@
 | **14** | 📡 配信経路 | **配信先（HLS/TopazChat/汎用RTMP）の選択制対応** (Selectable Streaming Destination) | **v2.9.0** | 🟢 **実装完了 ✅** |
 | **15** | 🔄 外部依存 | **外部ソース（yt-dlp等）の自動更新・メンテナンス機能** (External Tools Auto-Update) | 未定 | 🔵 **検討中 📋** |
 | **16** | 🎨 GUI刷新 | **ホストソフトGUIのモダン化・リデザイン** (Host GUI Modernization) | v2.9.4 | 🟢 **実装完了 ✅** |
-| **17** | 🎵 ラジオ | **ラジオモード時のクロスフェード・滑らか切り替え** (Smooth Crossfade) | 未定 | ⚪ **実装予定 📝** |
-| **18** | ⚡ 性能 | **FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応** (HW Encoding) | 未定 | ⚪ **実装予定 📝** |
+| **17** | 🎵 ラジオ | **ラジオモード時の曲間フェード** (Smooth Fade) | v2.9.9 | 🟡 **実装完了・実機未確認** |
+| **18** | ⚡ 性能 | **FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応** (HW Encoding) | develop | 🟢 **実装完了 ✅** |
 | **19** | 🛠️ CLI | **CLI 引数・環境設定オーバーライド機構の総点検・堅牢化** (CLI Overrides Overhaul) | **v2.9.0** | 🟢 **実装完了 ✅** |
 | **20** | 🌐 UI/権限 | **通常ブラウザ利用時のサーバー操作ボタン（再起動・起動）非表示化** (Button Visibility) | v2.6.0 | 🟢 **実装完了 ✅** |
-| **21** | 🛡️ Web制御 | **Webリモコン機能の無効化・ホスト専用スタンドアロンモード** (Disable Web Remote / Host-Only Mode) | 未定 | ⚪ **実装予定 📝** |
-| **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | 未定 | 🔵 **検討中 📋** |
-| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | 未定 | 🔵 **検討中 📋** |
+| **21** | 🛡️ Web制御 | **Webリモコン機能の無効化・ホスト専用スタンドアロンモード** (Disable Web Remote / Host-Only Mode) | develop | 🟢 **実装完了 ✅** |
+| **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | develop | 🟡 **実装完了・VRC実機未確認** |
+| **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | feature/task23-screen-share | 🟡 **実装完了・VRC実機未確認** |
 | **24** | 🎤 参加型 | **Webリモコンからの参加型カラオケ・楽器セッション機能** (Remote Karaoke & Session) | 未定 | 🔵 **検討中 📋** |
+| **25** | 🎚️ 音声配信 | **アプリ単位の音声取り込み（WASAPIプロセスループバック）** (Per-Application Audio Capture) | feature/task25-app-audio-capture | 🟡 **実装完了・ホスト側実機確認済み / VRChat内は未確認** |
 
 ---
 
@@ -512,7 +513,7 @@ YouTube側のプレイヤー仕様変更や暗号化シグネチャ変更（n-si
 
 ---
 
-## 17. 🎵 ラジオモード時のクロスフェード・滑らか切り替え (Smooth Crossfade in Radio Mode) 【実装予定 📝】
+## 17. 🎵 ラジオモード時の曲間フェード (Smooth Fade in Radio Mode) 【実装完了・実機未確認 🟡】
 
 ### 概要
 ラジオモード（音声＋アルバムアートカード/スライドショー）再生時、曲の終了と次の曲の開始がブツ切り・無音にならず、設定した秒数（例: 2〜4秒）で前の曲をフェードアウトしながら次の曲をフェードインして滑らかにシームレス遷移する機能。
@@ -530,14 +531,38 @@ YouTube側のプレイヤー仕様変更や暗号化シグネチャ変更（n-si
    - `config.json`: `"radio_crossfade_duration": 3`（0で無効、1〜5秒で調整可能）。
    - Webリモコン / ホスト設定画面に「クロスフェード秒数」スライダーを追加。
 
-### 変更対象予定ファイル
-- `streamer_core.py`（クロスフェード用オーディオ合成ロジック、セグメント遷移ハンドリング）
+### 実装結果（feature/task17-radio-crossfade）
+
+**方式Aの「重ねるクロスフェード」は採用していない。現構造では成立しないため。**
+送出は 1曲 = 1本の送信FFmpegで、永続シンクの `pipe:0` へ MPEG-TS を流し込んでいる。
+2本を同時に同じ pipe へ流せば多重化が壊れるので、前曲末尾と次曲頭を重ねるには
+1本のFFmpegの中で作るしかなく、送出構造そのものの再設計を伴う。
+上の方式Bも「前曲末尾セグメント」を独立に扱える前提で書かれており、同じ理由で不成立。
+
+採用したのは**重ねない afade 方式**（曲頭フェードイン＋曲尾フェードアウト）。
+重ねなくても目的はほぼ達する: 次曲のPTSは `accumulated_pts` から続くため、
+プロセス起動やキュー処理の実時間はストリームの時間軸に現れず、曲間の無音は 0.1 秒程度。
+耳に付いていたのは**波形の断ち切り**の方だった。
+
+- 設定は `radio_crossfade_duration`（既定3秒 / 0で無効 / 最大5秒）。
+- ホットリロード復帰（`seek > 0`）ではフェードインを掛けない。掛けると
+  **設定を保存するたびに再生中の曲の音量が落ちて上がる**。
+- 曲長の1/4を上限にフェード幅を縮め、0.5秒未満になるなら掛けない。
+- 長さ不明の曲はフェードインのみ（`-shortest` で切れる瞬間は事前に読めない）。
+- 残課題: **実機（VRChat）で曲の変わり目を実聴していない**。
+  真の重なりが欲しくなった場合は、入曲側FFmpegに前曲末尾（`-ss duration-N`）を
+  第2入力として与える案があるが、YouTube音声URLの末尾シーク・URL失効・
+  skip / ホットリロード / ループとの相互作用・累積PTSの補正がすべて絡む。
+
+### 変更対象ファイル
+- `streamer_core.py`（`build_radio_audio_filter` / `normalize_radio_crossfade`、`play_radio` の `-af`、ステータス公開）
 - `config.dist.json`（`radio_crossfade_duration: 3` 追加）
-- `gui_streamer.py` / `ui/index.html`（クロスフェード設定UI）
+- `gui_streamer.py` / `ui/index.html` / `plugin/ui/index.html`（設定UI）
+- `test_radio_crossfade.py`（新規・25件）
 
 ---
 
-## 18. ⚡ FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応 (Hardware-Accelerated Video Encoding) 【実装予定 📝】
+## 18. ⚡ FFmpeg ハードウェアエンコード（NVENC / QSV / AMF）対応 (Hardware-Accelerated Video Encoding) 【実装完了 ✅】
 
 ### 概要
 ホストPCで通常動画モード（1080p60 / 720p60）を高画質配信する際、CPU負荷を大幅に低減し、省電力かつ高フレームレート・低遅延を維持するため、GPUによるハードウェアエンコード（NVIDIA NVENC, Intel QSV, AMD AMF）を自動検出・選択可能にする機能。
@@ -559,10 +584,23 @@ YouTube側のプレイヤー仕様変更や暗号化シグネチャ変更（n-si
    - `config.json`: `"video_encoder": "auto"`
    - Webリモコン設定モーダル / ホスト設定画面に「動画エンコーダー（自動 / CPU / NVENC / QSV / AMF）」選択セレクトボックスを追加。
 
-### 変更対象予定ファイル
-- `streamer_core.py`（エンコーダー自動プローブ関数、FFmpeg 引数生成ロジックの動的切替）
-- `config.dist.json`（`video_encoder: "auto"` 追加）
-- `gui_streamer.py` / `ui/index.html`（エンコーダー選択UI）
+### 実装結果（develop）
+- **実測 1.4倍軽い**: 待機配信のFFmpeg CPUが 36.39 → 25.54 秒/60秒（1コアの61%→43%）。
+  単体では動画再エンコード経路 1.9倍・静止画ループ 1.5倍。詳細は CHANGELOG の同項目。
+- **可否判定は実エンコード**: `ffmpeg -encoders` は GPU が無くても3種すべてを列挙するため
+  一覧では判定できない（このPCでも一覧に4種出たが、実際に通ったのは NVENC と libx264 だけ）。
+- **エンコーダーごとに完全に別の引数一覧を返す**。x264 の `-preset ultrafast` を
+  NVENC に渡すと起動できない。`-level 3.1` も 1080p では NVENC に拒否される。
+- ラジオモードは仕様どおり libx264 のまま（2fps/200k で元から極小負荷）。
+- QSV / AMF はこのPCに該当GPUが無く**実機未検証**。誤っていてもプローブが落として
+  libx264 へ退避するため、配信が止まることはない。
+
+### 変更対象ファイル
+- `streamer_core.py`（エンコーダー自動プローブ、引数生成、4経路の差し替え、ステータス）
+- `config.dist.json` / `config_overrides.py`（既定値と `--video-encoder`）
+- `gui_streamer.py` / `ui/index.html` / `plugin/ui/index.html`（選択UIと実動作の表示）
+- `conftest.py`（テストが開発機のGPU有無で結果を変えないよう libx264 に固定）
+- `test_hw_encoding.py`（新規・24件）
 
 ---
 
@@ -689,36 +727,81 @@ WebリモコンUI（`ui/index.html`）を通常のブラウザ（Chrome / Edge �
 
 ---
 
-## 21. 🛡️ Webリモコン機能の無効化・ホスト専用スタンドアロンモード (Disable Web Remote / Host-Only Mode) 【実装予定 📝】
+## 21. 🛡️ Webリモコン機能の無効化・ホスト専用スタンドアロンモード (Disable Web Remote / Host-Only Mode) 【実装完了 ✅】
 
 ### 概要
 ホストPCのデスクトップGUIのみで配信操作を完結させたいユーザー（VJ、イベント配信、プライベート鑑賞等）向けに、Webリモコン画面（`/`）やゲスト向け操作APIへのアクセスを遮断し、完全スタンドアロン（ホスト専用）で運用可能にする機能。
 
 ### 背景と目的
-- **現状**: `enable_tunnel: false` で外部インターネット公開は遮断できるが、同一LAN内の他端末から `http://<ホストIP>:<port>/` にアクセスするとWebリモコン画面が表示される。
+- **前提の訂正（実装時の調査で判明）**: 「トンネルを切ってもLANからリモコンが見える」は既定構成では起きない。
+  `APIServer.start()` は config の `host` をそのまま bind し、既定は `127.0.0.1` のため LAN からは接続自体ができない。
+  この機能が実際に効くのは次の2ケース。
+  1. `host: "0.0.0.0"` にして LAN 公開しているとき。
+  2. **HLS配信 + トンネル** — VRChatが `stream.m3u8` を取りに来るためポートを公開せざるを得ず、
+     その副作用としてリモコン画面まで公開されるとき（**本命**）。
+- **さらに判明した点**: `start_tunnel()` は `output_mode` を見ずに無条件で起動する。
+  そのため既定構成（`output_mode: "topaz"` = RTMP押し出し + `enable_tunnel: true`）では、
+  **配信はRTMPで出ているのに、トンネルはリモコン画面を配るためだけに公開URLを立てている**。
+  ここで本機能をオフにすると、公開URLに残るのは403だけになる。
 - **目的**:
-  1. 他者からのアクセス・リクエスト受付を完全に拒絶し、誤操作や不正アクセスをゼロにする。
-  2. 画面上のQRコードオーバーレイやWebリモコンURL表示を自動で無効化し、クリーンな配信画面を維持する。
+  1. 他者からの操作・リクエスト受付を完全に拒絶する。
+  2. QRオーバーレイやリモコンURL表示を自動で無効化し、クリーンな配信画面を維持する。
 
-### 仕様・実装設計
-1. **設定項目の追加**:
-   - `config.json`: `"enable_web_remote": true` (デフォルト: `true`、`false` で無効化)。
-   - `gui_streamer.py` の設定画面に「Webリモコンを有効にする」チェックボックスを追加。
-2. **Webサーバー（`api_server.py`）のアクセス制御**:
-   - `enable_web_remote: false` 時：
-     - **外部/LANからのアクセス**: `/`（Webリモコン画面）および `/api/*` に対し `403 Forbidden`（または「Webリモコンは無効化されています」の案内画面）を返却。
-     - **ローカルホスト（127.0.0.1）**: ホスト自身のブラウザや内部通信用としてアクセス許可を維持。
-     - **HLSストリーム配信（`/stream.m3u8`, `*.ts`）**: VRChat内プレイヤーの再生を阻害しないよう、メディア配信エンドポイントは正常稼働を維持。
-3. **QRオーバーレイおよびステータス表示の自動連動**:
-   - `enable_web_remote: false` の場合、QRコード生成および画面オーバーレイ（`overlay_qr_enabled`）を自動的にスキップ/非表示化。
-   - ステータス情報（`remote_url` 等）にも無効状態を反映。
+### 実装（v2.9.7+ / develop）
+1. **設定項目**: `enable_web_remote`（既定 `true`）。
+   - 未設定は `true` として扱う。既存ユーザーの `config.json` にキーが無いため、
+     ここを fail-closed にすると更新しただけで全員のリモコンが黙って死ぬ。
+   - GUI（`gui_streamer.py` の「📱 Webリモコン」節）とホストWeb UI（`hostEnableWebRemote`）の両方にトグル。
+   - CLI: `--host-only` / `--web-remote`（両方指定時は安全側＝閉じる）。`VRCMS_ENABLE_WEB_REMOTE` も可。
+2. **アクセス制御（`api_server.py`）**: `reject_if_web_remote_disabled()` を
+   `do_GET` / `do_POST` の**認証判定より前**に置く。閉じているなら、パスワードが合っているかも
+   `allow_web_*` で何が許されているかも問う必要がないため。
+   - **ホスト判定は厳格なループバックのみ**（`_client_is_strict_loopback()`）。
+     `is_local_request()` を流用しないのは `trust_lan_clients` を見ないため。「ホスト専用」なら
+     同一LANの別端末も他人。
+     **`CF-Connecting-IP` / `X-Forwarded-For` の確認は必須**: cloudflared はこのPCの `127.0.0.1` へ
+     繋いでくるので、接続元IPだけを見るとトンネル経由の全員がホスト扱いになりゲートが素通りする。
+   - **通すのは許可リスト方式**で `*.m3u8` / `*.ts` / `*.m4s` / `*.mp4` / `*.aac` のみ。
+     `HLS_DIR` には写真プール `/images/*` が同居しており、「静的ファイルなら通す」にすると
+     共有済みの写真が外へ出る。
+   - ゲストへの応答: リモコン画面は **403 + 案内HTML**（バージョン・製品名を載せない／`/vendor/*` も
+     閉じるためCSSは直書き）、それ以外は **403 JSON**。
+3. **QR・ステータスの自動連動（`streamer_core.py`）**:
+   - `generate_qr_overlay_image()` の冒頭で `None` を返す。**唯一の生成口**なので、
+     動画・写真・ラジオ・待機画面の5箇所を個別に直す必要がない。
+   - `standby_mode: "qr"`（QR案内画面）は画像モードへフォールバック。
+   - `/api/status` の `overlay_qr_*` は消灯を返し、`remote_url` は空。**config の値そのものは
+     書き換えない**ため、再度有効化すれば元の設定に戻る。
+4. **トンネル遊休の警告（自動停止はしない）**: ホスト専用 + RTMP押し出し + HLSフォールバック無効の
+   構成では、トンネルは403を返すだけになる。設定画面に警告を出すに留めた。
+   `rtmp_fallback_to_hls` が有効な間はHLS退避にトンネルが要るうえ、クイックトンネルは張り直すと
+   URLが変わり、ワールドに貼ったURLが死ぬため。
 
-### 変更対象予定ファイル
-- `streamer_core.py`（`enable_web_remote` 設定の管理、QRコード生成のスキップ制御、ステータス反映）
-- `api_server.py`（ゲストからの `/` および `/api/*` リクエストの遮断・403返却）
-- `gui_streamer.py`（設定画面にWebリモコン有効/無効トグル追加）
-- `config.dist.json`（`enable_web_remote: true` 追加）
-- `tests/test_security.py`（Webリモコン無効化時のアクセス遮断テスト）
+### 変更対象ファイル
+- `streamer_core.py`（`enable_web_remote` の管理、QR生成のスキップ、待機画面フォールバック、ステータス反映）
+- `api_server.py`（ゲートと403応答）
+- `gui_streamer.py` / `ui/index.html` / `plugin/ui/index.html`（トグルとトンネル遊休警告）
+- `config.dist.json` / `config_overrides.py`（既定値とCLI）
+- `test_host_only_mode.py`（新規・34件）
+
+### 負荷の実測（2026-09-04 / Intel 12コア, FFmpeg 8.1.2）
+詳細は CHANGELOG の同項目。**効いたのはQRオーバーレイの停止だけで、それが桁違いだった。**
+
+| 項目 | 実測 |
+|---|---|
+| **QR停止で FFmpeg がコピー経路へ戻る** | 49.14 → **0.55 CPU秒**（映像60秒あたり / **89.9倍**の差） |
+| HLS視聴者のさばき（経路を絞ると消える分） | 1人あたり CPU 0.16秒/60秒（1コアの0.27%）・**上り1.56 Mbps** |
+| ゲスト10人のポーリング | +0.48秒/60秒（**1コアの0.8%** = 想定よりずっと小さい） |
+| 403に落としても1リクエスト 2.87ms（200は3.08ms） | ハンドラでなくHTTPの受け口が支配的 |
+
+**注意**: QRの効果は「元からQRを点けていた場合」に限る（既定は `overlay_qr_enabled: false`）。
+また**時計オーバーレイが点いていると、QRを消しても再エンコードは続く**（同じ分岐の別条件）。
+
+### 残った制約（設計上の限界）
+- **視聴は防げない**。HLS配信中は `stream.m3u8` / `*.ts` を開けておく必要があるため、
+  URLを知る第三者の再生までは止められない。完全に inbound をゼロにしたい場合は
+  RTMP押し出し（topaz / generic_rtmp）+ `enable_tunnel: false` + `host: 127.0.0.1` を選ぶ。
+- ポート自体は開いており、403を返す。スキャンの対象にはなる（レートリミットは既存のものが効く）。
 
 ---
 
@@ -752,9 +835,116 @@ WebリモコンUI（`ui/index.html`）を通常のブラウザ（Chrome / Edge �
 - **デバイス名の動的取得**: ホストPCに接続されているマイク・スピーカーのデバイス一覧を列挙（`ffmpeg -list_devices true -f dshow -i dummy` 等）し、GUIで選択できる仕組みが必要。
 - **TopazChat（低遅延）との併用**: 音声のみの生配信ではバッファ遅延（HLSの9〜12秒）が会話のボトルネックになるため、TopazChat（RTSP 1〜2秒）との併用が実用的。
 
+### 実装記録（2026-09-06 / ブランチ `feature/task22-audio-capture`）
+
+#### ★実測でひっくり返った設計前提（2026-09-06）
+
+上の「技術方式と実装設計」に事実誤認が2件あった。同梱 ffmpeg 8.1.2-full (gyan.dev) で実測して判明。
+
+1. **`-f wasapi` というデマクサは存在しない。** `ffmpeg -devices` で使える音声入力は
+   `dshow` と `openal` のみ。WASAPI ループバックを使いたければ ffmpeg 単体では不可能で、
+   Python 側（`pyaudiowpatch` 等）で掴んで PCM を stdin へ流す構成になる。**採用せず。**
+2. **「仮想オーディオミキサー不要でデスクトップ音声が録れる」も成立しない。**
+   開発機の `-list_devices` 実測では汎用の `Stereo Mix` も `virtual-audio-capturer` も存在せず、
+   ループバック相当は `What U Hear (Sound Blaster X5)`（ハード固有）、
+   `マイク (Virtual Desktop Audio)`、`Voicemeeter Out A1〜B3`（VB-Audio）のみだった。
+   dshow でPC出力音を録るには、ハード固有機能か第三者製仮想デバイスへの依存が必須。
+
+→ **方式は dshow 一本に確定。** 新規の pip 依存は追加していない。
+
+#### タスク23（画面共有）と地続きにするための構造
+
+タスク23は `ddagrab`/`gdigrab`（どちらも ffmpeg ネイティブ入力。同梱 ffmpeg に存在を確認済み）で
+「1本の ffmpeg にライブ映像入力とライブ音声入力を並べる」形になる。音声も dshow なら `-i` が1本増える
+だけで、A/V同期は ffmpeg 側のタイムスタンプが面倒を見る。Python PCM 経路を選ぶと同期・ドリフト・
+アンダーランを自前で持つことになり、タスク23で作り直しになるため避けた。
+
+そのため音声入力の組み立ては `build_dshow_audio_inputs()`（`self` に触らない純粋関数）へ切り出し、
+`play_live_audio()` は「映像＝静止画」という一事例として実装している。タスク23は映像ソースを
+差し替えるだけで済む。
+
+#### 実装したもの
+
+- `enumerate_dshow_audio_devices()` / `parse_dshow_audio_devices_output()` / `is_loopback_candidate()`
+- `build_dshow_audio_inputs()` — 0/1/2デバイス、`volume` と `amix=inputs=2` の組み立て
+- `StreamerCore.play_live_audio()` / `set_live_audio_devices()`、再生モード `"live"` の追加
+- `queue_monitor_loop` の「モード0: ライブ音声取り込み」分岐（キューを消費しない）
+- `GET /api/audio_devices`（localhost限定）、`POST /api/control` の `set_live_audio`（localhost限定）
+- **UI（`ui/index.html`）**: 再生モードピルに「ライブ音声」を追加、設定タブに
+  「ライブ音声取り込み」カード（マイク／ループバックのデバイス選択・音量スライダー2本・
+  デバイス再スキャン）。どちらもホストPC（localhost）からのみ表示する。
+  ★`plugin/ui/index.html` は `ui/index.html` と**バイト一致**していなければ
+  `test_host_only_mode.py::test_plugin_ui_is_in_sync` が落ちる。UIを触ったら必ずコピーすること。
+- `test_live_audio.py`（8ケース）
+
+#### ★踏み抜くと分かりにくい罠（実装時に潰したもの）
+
+- **`-vf` と `-filter_complex` は併用できない。** 時計オーバーレイ有効＋`amix` 有効のとき、
+  時計フィルタを `[0:v]<clock>[vout]` として同じ `-filter_complex` に統合しないと起動しない。
+  4通りの分岐すべてに回帰テストを置いた。
+- **`-shortest` を付けてはいけない。** ライブ入力に終端が無いため。
+- **`-max_interleave_delta 0` は必須。** ライブ入力2本は必ずドリフトし、既定の10秒を超えると
+  受信側HLS multiplexer がセグメント出力を止める（タスク17で実際に起きた事故と同じ経路）。
+- **`relay_stream_data` は `is_paced=False`。** 実時間駆動なのでペーシングを掛けない。
+- **`-thread_queue_size 1024` と `-audio_buffer_size 50` を各 dshow 入力に付ける。**
+  前者はライブ入力のフレーム落ち対策、後者は会話用途の遅延削減（ミリ秒）。
+- **デバイス名は日本語で返ってくる。** `-list_devices` の stderr は bytes で受け、
+  utf-8 → cp932 → replace の順でフォールバックする。`text=True` で Popen すると壊れる。
+- **ffmpeg 8.x は列挙結果の各行に `[in#0 @ 000001c2760f36c0] ` を前置する。** 行頭一致の
+  正規表現を書くと1件も取れない。
+- **`-list_devices` は必ず非ゼロ終了する**（最後に `Error opening input file dummy.`）。
+  returncode で成否を判定してはいけない。
+- **ライブモードには「曲の終わり」が無い。** デバイスを掴めないと ffmpeg が即死して同じ分岐へ
+  すぐ戻るため、短命終了（3秒未満）を数えて待ち時間を伸ばす後退（最大15秒）を入れている。
+  これが無いとプロセス生成の暴走になる。
+
+#### 実機スモークテスト（2026-09-06）
+
+実デバイス2本（`Microphone (3- Razer Seiren V3 Mini)` + `What U Hear (Sound Blaster X5)`）に対し、
+時計オーバーレイ＋`amix` を有効にした本番同等のコマンドを `-t 3 -f null -` で実行し、
+returncode 0・映像160KiB・音声72KiB の生成を確認。両デバイスが開き、`drawtext` と `amix` が
+同一 `-filter_complex` 内で正しく合成されることを実測で確認済み。
+
+なお dshow の音声入力はデバイス稼働時間由来の巨大な開始タイムスタンプ（実測 `start 150410.02`）を
+返すが、`_ts_offset_opts()` は `-output_ts_offset` のみで `-copyts` を使わないため影響しない。
+
+#### ホストPCでの通し確認（2026-09-06）
+
+アプリを `--no-tunnel --port 8123` で起動し、UIから実際に操作して確認した。
+
+- `GET /api/audio_devices` が実機で17件を返し、日本語デバイス名が壊れず、
+  ループバック候補の判定も正しいことを確認。
+- 設定カードにデバイス18項目（「使用しない」含む）が並び、ループバック候補に
+  ★マークが付くことをDOM上で確認。
+- `set_live_audio` → `set_playback_mode: live` の順に叩き、
+  `status=streaming` / `status_detail=Live audio capture` になり、
+  HLSセグメントが生成され続けることを確認。
+- 生成された `seg_00015.ts` を `ffprobe` にかけ、
+  h264 + **aac 44100Hz stereo** の2ストリームが実際に入っていることを確認。
+
+→ ホスト側の経路は通し確認済み。**VRChatワールド内での視聴確認だけが未実施。**
+
+#### ★実機で判明した最大の落とし穴（2026-09-06）
+
+**共有元ウィンドウを隠すと、そのアプリが描画を止める。** 配信がカクついて見えるが
+アプリの不具合ではない。VRChatを共有元と同じモニタにフルスクリーンで置くと必ず起きる。
+
+実測（同一ビルド・同一設定・TopazChatのRTSPを直接解析）: 背面 1.4fps / 見えている 29.6fps。
+
+原因究明を何周も遠回りした理由は**測り方の誤り**だった。ffmpeg の `dup=` は
+`ddagrab` が内部で複製するぶんを数えないため「29.8fps 出ている」と誤認した。
+**実効fpsは「絵が実際に変わっているか」で数えること。** 詳細は
+`docs/TASK23_実機テスト手順.md` の冒頭に記載した。
+
+#### 未実装・引き続き必要なもの
+
+- **VRChat実機での視聴確認**（ホスト側の送出までは確認済み。ワールド内での再生は未確認）
+- **TopazChat併用時の実遅延の実測**（HLSの9〜12秒では会話が成立しないため、数値を取って記録する）
+- 背景は現状 待機画面の静止画のみ。ラジオカード背景・スライドショー背景は未対応。
+
 ---
 
-## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【検討中 📋】
+## 23. 🖥️ PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信 (Desktop Screen Share) 【実装完了・VRC実機未確認 🟡】
 
 ### 概要
 ホストPCのデスクトップ画面全体、セカンダリディスプレイ、または特定のアプリケーションウィンドウ（ブラウザ、ゲーム、DAW、プレゼン資料等）をリアルタイムでキャプチャし、VRChatワールド内のプレイヤーへ低遅延で映像配信する画面共有機能。
@@ -781,6 +971,141 @@ WebリモコンUI（`ui/index.html`）を通常のブラウザ（Chrome / Edge �
 ### 検討課題・留意点
 - **解像度スケーリング**: 4K/WQHDディスプレイをそのまま配信すると帯域オーバーになるため、TopazChat推奨の 1080p/720p へのスケーリング（`scale=1920:1080:flags=bicubic`）を必須とする。
 - **セキュリティ・プライバシー保護**: 個人情報やパスワードの誤配信を防ぐため、特定ウィンドウ限定キャプチャ機能や、キャプチャ開始前のプレビュー・確認ダイアログの提供。
+
+### 実装準備の実測（2026-09-06 / ブランチ `feature/task23-screen-share`）
+
+同梱想定の ffmpeg 8.1.2-full (gyan.dev) を開発機（NVIDIA GPU / 2560x1440 ×2枚）で実測した結果。
+**上の「技術方式と実装設計」の記述には、実測で覆った点が2件ある。**
+
+#### 使えることを確認した入力
+
+| 方式 | 実測結果 |
+|---|---|
+| `-f lavfi -i ddagrab=output_idx=N:framerate=30` | ○ 画面0/1 とも 2560x1440 の **d3d11 ハードウェアフレーム**で取得 |
+| `-f gdigrab -i desktop` | ○ ただし**全画面の外接矩形** 5120x1441 が返る（マルチモニタ結合） |
+| `-f gdigrab -i "title=VRChat"` | ○ 2021x1121（ウィンドウの実サイズそのまま） |
+
+#### ★実測で覆った前提
+
+1. **「ddagrab は `-f lavfi -i` でも `-filter_complex` でも同じ」ではない。**
+   `-init_hw_device d3d11va -filter_complex "ddagrab=...,hwmap=derive_device=cuda,..."` は
+   `Failed to created derived device context: -40 (Function not implemented)` で**起動しない**。
+   このビルドは d3d11 → cuda の device derive を持たない。
+   → **`-f lavfi -i "ddagrab=..."` の入力形にすること。** この形なら
+   `-c:v h264_nvenc` が d3d11 フレームを直接受け取り、無変換で通る（実測 RC=0）。
+   `scale_cuda` も同じ理由で使えない。
+
+2. **「GPUキャプチャなのでCPU負荷極小」は、そのままでは成立しない。**
+   ゼロコピーが成立するのは **無加工でそのまま送るときだけ**。本機能では
+   ・TopazChat 向けの 1080p スケーリング（必須。素材は 2560x1440）
+   ・LIVE時計オーバーレイ（`drawtext`）
+   のどちらも `hwdownload` を挟まないと掛けられない。
+   → 実装は `[0:v]hwdownload,format=bgra,scale=...,format=yuv420p,<clock>[vout]` を前提に設計する。
+   ゼロコピーは「スケール無し・オーバーレイ無し」の特殊構成としてのみ成立する。
+
+#### 本番同等の通し確認（実測）
+
+タスク22の `build_dshow_audio_inputs()` / `get_clock_filter_for_config()` /
+`build_video_encoder_opts("h264_nvenc")` をそのまま呼び、映像を静止画から ddagrab へ
+差し替えた形（＝タスク22で意図した「映像ソースの差し替えだけ」）で 3 秒送出した。
+
+```
+ffmpeg -f lavfi -i ddagrab=output_idx=0:framerate=30
+       -f dshow -thread_queue_size 1024 -audio_buffer_size 50 -i audio=<マイク>
+       -f dshow -thread_queue_size 1024 -audio_buffer_size 50 -i audio=<ループバック>
+       -filter_complex "[0:v]hwdownload,format=bgra,scale=1920:1080:flags=bicubic,format=yuv420p,<drawtext>[vout];
+                        [1:a]volume=1.0[amic];[2:a]volume=0.7[apc];[amic][apc]amix=inputs=2:...[aout]"
+       -map [vout] -map [aout] <nvenc opts> -c:a aac -b:a 192k -ar 44100
+       -max_interleave_delta 0 -muxdelay 0 -muxpreload 0 -f mpegts ...
+```
+
+→ **RC=0 / 1.75MiB / ffprobe で h264 1920x1080 30fps ＋ aac 44100Hz stereo の2本を確認。**
+タスク22の設計（映像ソースだけ差し替える）が実際に成立することを実測で確認した。
+
+#### ★踏み抜きそうな罠（実装前に潰しておく点）
+
+- **キャプチャ解像度は奇数になりうる。** 実測で `gdigrab desktop` = 5120x**1441**、
+  `gdigrab title=VRChat` = 2021x1121。yuv420p は偶数寸法を要求するので、
+  スケール指定が無い経路には `scale=trunc(iw/2)*2:trunc(ih/2)*2` を必ず噛ませる。
+  「1080p固定にするから関係ない」ではなく、アスペクト維持のパディング経路でも同じ。
+- **`ddagrab` のディスプレイ列挙にきれいなエラーが無い。** `output_idx=2` は
+  `Error configuring filter graph: Generic error in an external library` としか言わない。
+  枚数はプローブ（`-t 0.5 -f null -` を idx 0 から順に試す）で決めるしかない。
+  `-list_devices` 相当は存在しない。
+- **`ddagrab` は画面が変化しないとフレームを出さない。** 実測で `dup=59 drop=6`。
+  出力fpsは `-r` で固定し、`dup_frames` の既定に頼る。可変fpsのまま HLS へ流さない。
+- **`-vf` と `-filter_complex` は併用できない**（タスク22と同じ罠）。音声 `amix` 有効時は
+  映像側チェーンも同じ `-filter_complex` に統合すること。
+- **`-shortest` を付けない / `-max_interleave_delta 0` は必須**（タスク22と同じ理由）。
+- **`relay_stream_data` は `is_paced=False`**（実時間駆動のため）。
+- **ウィンドウキャプチャは開始時の寸法で固定される。** 配信中に利用者がウィンドウを
+  リサイズしたときの挙動は未確認。UI 側で「開始後はサイズを変えない」旨の注意が要る。
+- **プライバシー**: `gdigrab desktop` は通知・パスワードマネージャ等も丸ごと映る。
+  既定はデスクトップ全体ではなく**ディスプレイ指定 or ウィンドウ指定**にし、
+  開始前にプレビューを見せる（上の「検討課題」の再確認）。
+
+#### 実装方針（この時点の決定）
+
+- 再生モード `"screen"` を追加し、`queue_monitor_loop` の「モード0」分岐を
+  ライブ音声と共通化する（どちらもキューを消費しない実時間ソース）。
+- 入力の組み立ては `build_screen_capture_input()`（`self` に触らない純粋関数）へ切り出し、
+  `build_dshow_audio_inputs()` と同じ粒度で単体テストする。
+- 音声はタスク22の設定をそのまま流用する（画面共有時にデスクトップ音も一緒に出るのが既定）。
+
+### 実装したもの（2026-09-06）
+
+- `probe_ddagrab_display()` / `enumerate_capture_displays()` — ddagrab に列挙APIが無いため
+  `output_idx` を 0 から実際に起動して数える（最初の失敗で打ち切り・60秒キャッシュ）
+- `enumerate_capture_windows()` / `find_capture_window()` — ctypes で `EnumWindows`。
+  可視・非最小化・非cloaked・非ツールウィンドウ・160x120以上のみ。新規 pip 依存なし
+- `even_dimension()` / `build_screen_capture_input()` / `build_screen_video_filter()`（純粋関数）
+- `StreamerCore.play_screen_capture()` / `set_screen_capture_source()`、再生モード `"screen"` の追加
+- `queue_monitor_loop` の「モード0b: 画面共有」分岐（短命終了の後退つき）
+- `GET /api/capture_sources`（localhost限定）、`POST /api/control` の `set_screen_capture`（localhost限定）
+- **UI**: 再生モードピルに「画面共有」、設定タブに「画面共有」カード
+  （モニター／ウィンドウの切替・一覧再取得・解像度／fps／ビットレート・カーソル有無・注意書き2行）。
+  ★`plugin/ui/index.html` とのバイト一致を維持すること
+- `test_screen_capture.py`（14ケース）
+
+### 実機検証（2026-09-06）
+
+`python -m pytest` = **279 passed**。失敗2件（`test_transition` / `test_yt_dlp`）は
+**変更前のベースラインでも同じく落ちる**ネットワーク依存テストで、本変更とは無関係。
+
+自作テストは実物を触らないので、別途アプリのコードを直接呼んで実測した:
+
+- `enumerate_capture_displays()` → ディスプレイ2枚（各 2560x1440）を正しく検出（所要 3.4秒）
+- `enumerate_capture_windows()` → 可視ウィンドウ3件。日本語タイトル
+  （`#ゲームクリップ | bakabakka - Discord`）も壊れない
+- `find_capture_window()` → 完全一致は HIT、前方一致は **MISS**（意図どおり）
+- **モニター配信**: `ddagrab` + `hwdownload` + 時計オーバーレイ + NVENC →
+  rc=0 / 1.27MB / ffprobe で **h264 1280x720 20fps** を確認
+- **ウィンドウ配信**: 1294x1399（縦長）のウィンドウを `gdigrab` で取り込み、
+  `force_original_aspect_ratio=decrease` + `pad` で 720p へレターボックス →
+  rc=0 / 1.17MB / **h264 1280x720 20fps** を確認
+
+→ **ホスト側の送出は、モニター・ウィンドウの両方で通し確認済み。**
+
+### ★設計判断として残しておくこと
+
+- **ウィンドウは完全一致でしか掴めないので、部分一致のフォールバックを入れていない。**
+  実測で `GitHub - Google Chrome` がタブ切替により
+  `sou2000sw/VRC_Media_Streamer - Google Chrome` へ変わり、開けなくなることを確認した。
+  ここで前方一致に逃がすと、似た名前の別ウィンドウ（パスワードマネージャ等）を
+  映す事故になりうる。**見つからなければ諦めてエラーを出す**方を選んでいる。
+  UI には一覧の再取得ボタンとその旨の注意書きを置いた。
+- **ctypes は `argtypes`/`restype` を全関数に必ず指定する。** 省略すると 64bit で HWND が
+  `c_int` に切り詰められ、一部のウィンドウが理由も分からず一覧から消える（実装中に踏んだ）。
+- ディスプレイ列挙は ffmpeg を実起動するため 3.4秒かかる。60秒キャッシュしているが、
+  UI は「再取得」に待ち表示が要る。
+
+### 未実装・引き続き必要なもの
+
+- **VRChat実機での視聴確認**（ホスト側の送出までは確認済み。ワールド内での再生は未確認）
+- **TopazChat併用時の実遅延の実測**（プレゼン・実況用途で会話が成立するかは数値を取ってから）
+- キャプチャ開始前のプレビュー（「検討課題」に挙げた確認ダイアログ）は未実装。
+  現状は注意書きのみで、誤配信の最終防波堤になっていない
+- 画面共有中の負荷（CPU/GPU）の実測。1080p60 が現実的かは未測定
 
 ---
 

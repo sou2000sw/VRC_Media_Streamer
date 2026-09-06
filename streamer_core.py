@@ -43,6 +43,11 @@ QR_OVERLAY_PATH = os.path.join(HLS_DIR, "qr_overlay.png")
 CLOUDFLARED_EXE = os.path.join(BASE_PATH, "cloudflared.exe")
 LOCAL_FFMPEG = os.path.join(APP_DIR, "ffmpeg.exe")
 LOCAL_FFPROBE = os.path.join(APP_DIR, "ffprobe.exe")
+# タスク25: アプリ単位の音声取り込み補助exe。配布時は ffmpeg.exe と同じ場所に置く。
+# 開発中はビルド出力（native/app_audio_capture/build/）を直接使う。
+LOCAL_APP_AUDIO_EXE = os.path.join(APP_DIR, "app_audio_capture.exe")
+DEV_APP_AUDIO_EXE = os.path.join(BASE_PATH, "native", "app_audio_capture",
+                                 "build", "app_audio_capture.exe")
 VIDEO_STORAGE_DIR = os.path.join(HLS_DIR, "videos")
 
 def cleanup_hls_dir_completely():
@@ -90,6 +95,13 @@ DEFAULT_CONFIG = {
     "live_sync_duration_count": 4,
     "loop_queue": False,
     "shuffle": False,
+    # Webリモコン（ゲスト向けの `/` と `/api/*`）そのものを開くかどうか。タスク21。
+    # False で「ホスト専用スタンドアロンモード」: ホストPC本人（厳格なループバック）
+    # 以外からの操作を全部 403 で塞ぐ。allow_web_* は「開いた上で何を許すか」の設定なので、
+    # ここが False のときは一切参照されない（＝より強い上位のスイッチ）。
+    # HLS配信（stream.m3u8 / *.ts）だけは開けたままにする。VRChatのプレイヤーは
+    # 認証ヘッダを付けられず、ここを塞ぐと配信そのものが止まるため。
+    "enable_web_remote": True,
     "allow_web_queue_add": True,
     "allow_web_queue_edit": True,
     "allow_web_playback_control": True,
@@ -108,8 +120,33 @@ DEFAULT_CONFIG = {
     "overlay_clock_video": False,
     "overlay_clock_position": "top-right",
     "playback_mode": "video",
+    "live_audio_mic_device": "",
+    "live_audio_loopback_device": "",
+    "live_audio_mic_volume": 1.0,
+    "live_audio_loopback_volume": 0.7,
+    "live_audio_bitrate_kbps": 192,
+    # タスク25: アプリ単位の音声取り込み（WASAPIプロセスループバック）
+    # ★正本はウィンドウタイトル。PIDは再起動で変わるので保存値を当てにしない。
+    "live_audio_app_enabled": False,
+    "live_audio_app_window_title": "",
+    "live_audio_app_volume": 1.0,
+    "live_audio_app_mode": "include",   # "include" | "exclude"
+    # ライブ音声の背景。ラジオと同じ選び方にする。
+    # ★"card"（サムネイルカード）は入れない。あれはYouTubeのメタデータから作るもので、
+    #   ライブ音声には元データが無い。
+    "live_audio_bg_source": "standby",  # "standby" | "slideshow"
+    "screen_capture_source_type": "display",   # "display" | "window"
+    "screen_capture_display_index": 0,
+    "screen_capture_window_title": "",
+    "screen_capture_framerate": 30,
+    "screen_capture_width": 1920,
+    "screen_capture_height": 1080,
+    "screen_capture_draw_mouse": True,
+    "screen_capture_bitrate_kbps": 4000,
     "radio_mode": False,
     "radio_bg_source": "card",
+    # ラジオの曲頭・曲尾フェード秒数（0で無効・最大5秒）: タスク17
+    "radio_crossfade_duration": 3,
     "standby_mode": "image",
     "standby_image_path": "",
     "web_password": "",
@@ -132,7 +169,10 @@ DEFAULT_CONFIG = {
     "topaz_stream_key": "",
     "generic_rtmp_url": "",
     "generic_rtmp_key": "",
-    "rtmp_video_bitrate_kbps": 1500,
+    # ★TopazChat の上限（TOPAZ_MAX_VIDEO_KBPS=2000）に合わせる。
+    #   720p30 の画面共有を 1500kbps に通すと1画素あたり0.054ビットしか無く、
+    #   動きのある画面で明確に潰れる（実測）。上限まで使うのを既定にする。
+    "rtmp_video_bitrate_kbps": 2000,
     "rtmp_audio_bitrate_kbps": 192,
     "rtmp_video_width": 1280,
     "rtmp_video_height": 720,
@@ -141,6 +181,11 @@ DEFAULT_CONFIG = {
     "rtmp_fallback_to_hls": True,
     "rtmp_fallback_after_failures": 3,
     "rtmp_retry_backoff_max_seconds": 300,
+
+    # --- 映像エンコーダー（タスク18）---
+    # "auto" = NVENC → QSV → AMF の順に実際に動くものを探し、全滅なら libx264。
+    # 明示指定しても、そのPCで動かなければ libx264 へ退避する（配信を止めない）。
+    "video_encoder": "auto",
 
     # 初回セットアップ（配信先とストリームキーの確認）を通過したか。
     # 既定の TopazChat はストリームキーが要る。キーは再生開始時に自動生成されるが、
@@ -224,6 +269,13 @@ def get_ffprobe_cmd():
         return LOCAL_FFPROBE
     return "ffprobe"
 
+def get_app_audio_capture_cmd():
+    """アプリ音声取り込み補助exeのパス。無ければ None（呼び出し側はフォールバックする）。"""
+    for path in (LOCAL_APP_AUDIO_EXE, DEV_APP_AUDIO_EXE):
+        if os.path.exists(path):
+            return path
+    return None
+
 def kill_proc(proc):
     if not proc:
         return
@@ -273,6 +325,1181 @@ def get_keyframe_opts(segment_seconds):
     """
     seg = max(1, int(segment_seconds or 3))
     return ["-force_key_frames", f"expr:gte(t,n_forced*{seg})"]
+
+
+# =============================================================================
+# ラジオモードの曲間フェード（タスク17）
+# =============================================================================
+# 曲の変わり目のブツ切りを消すための曲頭フェードイン／曲尾フェードアウト。
+#
+# ★「重ねる」クロスフェードは現構造では作れない。送出は 1曲 = 1本の送信FFmpegで、
+#   永続シンクの pipe:0 へ MPEG-TS を流し込んでいる（play_radio / relay_stream_data）。
+#   2本を同時に同じ pipe へ流せば多重化が壊れるため、前曲末尾と次曲頭を
+#   オーバーラップさせるには1本のFFmpegの中で作るしかなく、送出構造の再設計を伴う。
+#
+# 重ねなくても目的はほぼ達する。曲間に空く無音は 0.1 秒程度しかない:
+# 次曲のPTSは accumulated_pts から続くので、プロセス起動やキュー処理にかかった
+# 実時間はストリームの時間軸には現れない（耳に付いていたのは波形の断ち切りの方）。
+RADIO_CROSSFADE_MAX_SECONDS = 5
+
+# これ未満のフェードは掛けない。短い曲に長いフェードを掛けると
+# 「終始音量が動いていて落ち着かない」音になるため、曲長の1/4を上限に縮めたうえで、
+# 縮んだ結果が短すぎるならフェード自体をやめる。
+_RADIO_FADE_MIN_SECONDS = 0.5
+
+
+def normalize_radio_crossfade(value):
+    """設定値を 0〜5 秒へ丸める。数値でない値・負値は 0（無効）とみなす。"""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if seconds != seconds or seconds <= 0:  # NaN も無効扱い
+        return 0.0
+    return float(min(RADIO_CROSSFADE_MAX_SECONDS, seconds))
+
+
+# --------------------------------------------------------------------------
+# タスク22: PC音声（ループバック）＆マイク取り込み（dshow経路）
+# --------------------------------------------------------------------------
+
+_dshow_audio_devices_cache = (0.0, [])
+
+
+def is_loopback_candidate(name: str) -> bool:
+    """デバイス名がPC出力音（ループバック）取り込みに使えそうかを判定 (UIヒント用)"""
+    if not name:
+        return False
+    name_lower = str(name).lower()
+    keywords = [
+        "stereo mix",
+        "ステレオ ミキサー",
+        "ステレオミキサー",
+        "what u hear",
+        "voicemeeter out",
+        "virtual desktop audio",
+        "cable output",
+        "virtual-audio-capturer",
+        "loopback",
+        "wave out mix",
+    ]
+    return any(kw in name_lower for kw in keywords)
+
+
+def decode_dshow_bytes(raw_bytes: bytes) -> str:
+    """dshow出力バイト列を utf-8 -> cp932 -> utf-8 (replace) の順でデコード"""
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return raw_bytes.decode("cp932")
+        except Exception:
+            return raw_bytes.decode("utf-8", errors="replace")
+
+
+def parse_dshow_audio_devices_output(output_text: str) -> list[dict]:
+    """ffmpeg -list_devices true -f dshow の stderr テキストをパース"""
+    devices = []
+    current_dev = None
+    for line in output_text.splitlines():
+        m_audio = re.search(r'"([^"]+)"\s+\(audio\)', line)
+        m_video = re.search(r'"([^"]+)"\s+\(video\)', line)
+        m_alt = re.search(r'Alternative name\s+"([^"]+)"', line)
+
+        if m_audio:
+            name = m_audio.group(1)
+            current_dev = {
+                "name": name,
+                "alt": "",
+                "loopback_hint": is_loopback_candidate(name)
+            }
+            devices.append(current_dev)
+        elif m_video:
+            current_dev = None
+        elif m_alt and current_dev is not None:
+            current_dev["alt"] = m_alt.group(1)
+            current_dev = None
+    return devices
+
+
+def enumerate_dshow_audio_devices(timeout=8, use_cache=True):
+    """dshow 経由で音声入力デバイス一覧を列挙"""
+    global _dshow_audio_devices_cache
+    now = time.time()
+    if use_cache and (now - _dshow_audio_devices_cache[0] < 30):
+        return _dshow_audio_devices_cache[1]
+
+    cmd = [get_ffmpeg_cmd(), "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW
+        )
+        _, stderr_bytes = proc.communicate(timeout=timeout)
+        text = decode_dshow_bytes(stderr_bytes or b"")
+        devices = parse_dshow_audio_devices_output(text)
+        _dshow_audio_devices_cache = (now, devices)
+        return devices
+    except subprocess.TimeoutExpired:
+        log_print("[dshow] Device enumeration timed out")
+        if 'proc' in locals():
+            kill_proc(proc)
+        return []
+    except Exception as e:
+        log_print(f"[dshow] Device enumeration failed: {e}")
+        return []
+
+
+def _fmt_audio_volume(v):
+    """フィルタに埋める音量値を 0.0〜2.0 に丸めて文字列化する。"""
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        fv = 1.0
+    fv = max(0.0, min(2.0, fv))
+    fv = round(fv, 2)
+    return str(fv)
+
+
+def build_dshow_audio_inputs(mic_device=None, loopback_device=None,
+                             mic_volume=1.0, loopback_volume=0.7,
+                             start_index=1):
+    """dshow音声入力のコマンド引数・フィルタ・マップラベルを構築する純粋関数"""
+    mic_dev = str(mic_device).strip() if mic_device else ""
+    loop_dev = str(loopback_device).strip() if loopback_device else ""
+
+    _fmt_vol = _fmt_audio_volume
+
+    active = []
+    if mic_dev:
+        active.append(("mic", mic_dev, _fmt_vol(mic_volume)))
+    if loop_dev:
+        active.append(("loopback", loop_dev, _fmt_vol(loopback_volume)))
+
+    if not active:
+        return ([], None, None)
+
+    if len(active) == 1:
+        dev_type, dev_name, vol_str = active[0]
+        idx = start_index
+        input_args = [
+            "-f", "dshow",
+            "-thread_queue_size", "1024",
+            "-audio_buffer_size", "50",
+            "-i", f"audio={dev_name}"
+        ]
+        if vol_str == "1.0":
+            return (input_args, None, f"{idx}:a:0")
+        else:
+            return (input_args, f"[{idx}:a]volume={vol_str}[aout]", "[aout]")
+
+    # 2件（マイクを先、ループバックを後の順で固定）
+    mic_name, mic_vol_str = active[0][1], active[0][2]
+    loop_name, loop_vol_str = active[1][1], active[1][2]
+    i = start_index
+    j = start_index + 1
+
+    input_args = [
+        "-f", "dshow",
+        "-thread_queue_size", "1024",
+        "-audio_buffer_size", "50",
+        "-i", f"audio={mic_name}",
+        "-f", "dshow",
+        "-thread_queue_size", "1024",
+        "-audio_buffer_size", "50",
+        "-i", f"audio={loop_name}"
+    ]
+    audio_filter = f"[{i}:a]volume={mic_vol_str}[amic];[{j}:a]volume={loop_vol_str}[apc];[amic][apc]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
+    audio_map = "[aout]"
+    return (input_args, audio_filter, audio_map)
+
+
+
+# --------------------------------------------------------------------------
+# タスク25: アプリ単位の音声（プロセスループバック）を音声グラフに合流させる
+# --------------------------------------------------------------------------
+
+APP_AUDIO_RATE = 48000
+# 入力レベルの通知間隔[ms]。UIのゲージ用。細かすぎても人には読めないので5回/秒。
+APP_AUDIO_LEVEL_INTERVAL_MS = 200
+# レベルがこの秒数より古ければ「来ていない」と扱う。
+APP_AUDIO_LEVEL_STALE_SEC = 2.0
+APP_AUDIO_CHANNELS = 2
+
+
+def build_app_audio_input(rate=APP_AUDIO_RATE, channels=APP_AUDIO_CHANNELS):
+    """補助exeが stdout に流す生PCMを受ける ffmpeg 入力引数。
+
+    ★取り込み側FFmpegの stdout は MPEG-TS の出口として既に使っているが、
+      stdin は空いている。ここへ補助exeの stdout をOSパイプで直結するので、
+      名前付きパイプもTCPも要らず、Python はバイトを一切コピーしない。
+    """
+    return [
+        "-f", "s16le",
+        "-ar", str(int(rate)),
+        "-ac", str(int(channels)),
+        "-thread_queue_size", "1024",
+        "-i", "pipe:0"
+    ]
+
+
+def build_audio_inputs(app_enabled=False, app_volume=1.0,
+                       mic_device=None, loopback_device=None,
+                       mic_volume=1.0, loopback_volume=0.7,
+                       start_index=1,
+                       app_rate=APP_AUDIO_RATE, app_channels=APP_AUDIO_CHANNELS):
+    """アプリ音声＋dshow(マイク/ループバック)をまとめた入力・フィルタ・マップを組む。
+
+    アプリ音声が無効なら build_dshow_audio_inputs() をそのまま返す（既存挙動を維持）。
+    有効なときは **アプリ音声を必ず先頭（start_index）** に置く。順番を固定しないと
+    入力インデックスの採番が呼び出し側ごとにずれて、無音や取り違えの原因になる。
+    """
+    mic_dev = str(mic_device).strip() if mic_device else ""
+    loop_dev = str(loopback_device).strip() if loopback_device else ""
+
+    if not app_enabled:
+        return build_dshow_audio_inputs(
+            mic_device=mic_dev, loopback_device=loop_dev,
+            mic_volume=mic_volume, loopback_volume=loopback_volume,
+            start_index=start_index)
+
+    input_args = build_app_audio_input(app_rate, app_channels)
+    idx = start_index
+    filters = [f"[{idx}:a]volume={_fmt_audio_volume(app_volume)}[aapp]"]
+    labels = ["[aapp]"]
+    idx += 1
+
+    if mic_dev:
+        input_args += ["-f", "dshow", "-thread_queue_size", "1024",
+                       "-audio_buffer_size", "50", "-i", f"audio={mic_dev}"]
+        filters.append(f"[{idx}:a]volume={_fmt_audio_volume(mic_volume)}[amic]")
+        labels.append("[amic]")
+        idx += 1
+
+    if loop_dev:
+        input_args += ["-f", "dshow", "-thread_queue_size", "1024",
+                       "-audio_buffer_size", "50", "-i", f"audio={loop_dev}"]
+        filters.append(f"[{idx}:a]volume={_fmt_audio_volume(loopback_volume)}[apc]")
+        labels.append("[apc]")
+        idx += 1
+
+    if len(labels) == 1:
+        # アプリ音声だけ。amix を挟むと無駄に遅延が乗るので直接 [aout] にする。
+        return (input_args, filters[0].replace("[aapp]", "[aout]"), "[aout]")
+
+    mix = ("".join(labels) +
+           f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0[aout]")
+    return (input_args, ";".join(filters) + ";" + mix, "[aout]")
+
+
+def start_app_audio_helper(pid, mode="include", rate=APP_AUDIO_RATE,
+                           channels=APP_AUDIO_CHANNELS, stats_sec=0,
+                           level_ms=APP_AUDIO_LEVEL_INTERVAL_MS):
+    """補助exeを起動し Popen を返す。起動できなければ None。
+
+    ★戻り値が None でも配信は止めない（fail-soft）。音が取れないことより、
+      配信そのものが落ちる方が事故として重い。
+    """
+    exe = get_app_audio_capture_cmd()
+    if not exe:
+        log_print("[AppAudio] helper exe not found -> アプリ音声を無効化して続行")
+        return None
+    try:
+        target_pid = int(pid)
+    except (TypeError, ValueError):
+        log_print(f"[AppAudio] invalid pid: {pid!r}")
+        return None
+    if target_pid <= 0:
+        log_print(f"[AppAudio] invalid pid: {target_pid}")
+        return None
+
+    cmd = [exe, "--pid", str(target_pid),
+           "--mode", "exclude" if str(mode) == "exclude" else "include",
+           "--rate", str(int(rate)), "--channels", str(int(channels))]
+    if stats_sec:
+        cmd += ["--stats", str(int(stats_sec))]
+    if level_ms:
+        cmd += ["--level", str(int(level_ms))]
+    # ★親（このプロセス）のPIDを渡す。本体がタスクマネージャ等で強制終了されると
+    #   Python側の回収スレッドは動かないため、補助exeだけが残って音声を取り込み
+    #   続けてしまう（実際に2回発生した）。補助exe自身に親を監視させて畳ませる。
+    cmd += ["--parent-pid", str(os.getpid())]
+    try:
+        # ★stderr を DEVNULL にしてはいけない。補助exeの診断ログと入力レベルが
+        #   そこにしか出ないため、捨てると「音が来ているのか」を誰も知り得なくなる。
+        #   PIPE にした以上は必ず読み続けること（読まないとバッファが詰まって止まる）。
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, bufsize=0,
+            creationflags=CREATE_NO_WINDOW
+        )
+    except Exception as e:
+        log_print(f"[AppAudio] helper start failed: {e}")
+        return None
+    log_print(f"[AppAudio] helper started pid={target_pid} mode={mode}")
+    return proc
+
+_capture_displays_cache = (0.0, [])
+
+
+def probe_ddagrab_display(output_idx, timeout=8):
+    """ddagrab の output_idx が実在するかを1回試し、(ok, width, height) を返す。"""
+    cmd = [
+        get_ffmpeg_cmd(), "-hide_banner", "-f", "lavfi",
+        "-i", f"ddagrab=output_idx={output_idx}:framerate=5",
+        "-t", "0.3", "-f", "null", "-"
+    ]
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW
+        )
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            return (False, 0, 0)
+        err_text = decode_dshow_bytes(stderr_bytes)
+        m = re.search(r"Stream #0:0.*?, (\d+)x(\d+)", err_text)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            return (True, w, h)
+        return (True, 0, 0)
+    except Exception:
+        if proc:
+            kill_proc(proc)
+        return (False, 0, 0)
+
+
+def enumerate_capture_displays(max_outputs=8, use_cache=True):
+    """接続ディスプレイを ddagrab の output_idx 順に列挙する。"""
+    global _capture_displays_cache
+    now = time.time()
+    if use_cache and (now - _capture_displays_cache[0] < 60.0):
+        return list(_capture_displays_cache[1])
+
+    displays = []
+    for idx in range(max_outputs):
+        ok, w, h = probe_ddagrab_display(idx)
+        if not ok:
+            break
+        displays.append({
+            "index": idx,
+            "width": w,
+            "height": h,
+            "label": f"ディスプレイ{idx + 1} ({w}x{h})"
+        })
+
+    _capture_displays_cache = (now, displays)
+    return list(displays)
+
+
+def enumerate_capture_windows():
+    """キャプチャ候補になる可視トップレベルウィンドウを列挙する。"""
+    if sys.platform != "win32":
+        return []
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # ★ctypes.windll.user32 はプロセス内で共有・キャッシュされる。ここで
+        #   argtypes を書き換えると、同じプロセスの別の利用者が壊れる（実際に
+        #   検証スクリプトが "expected LP_RECT instead of pointer to RECT" で落ちた）。
+        #   独立インスタンスを作って、この関数の中に閉じ込める。
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = wintypes.LONG
+
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+
+        EXCLUDE_TITLES = {
+            "Program Manager", "Windows 入力エクスペリエンス", "Windows Input Experience",
+            "Default IME", "MSCTFIME UI", "Discord Overlay", "NVIDIA GeForce Overlay"
+        }
+
+        results = []
+
+        def enum_windows_callback(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                if user32.IsIconic(hwnd):
+                    return True
+
+                ex_style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+                if ex_style & 0x00000080:  # WS_EX_TOOLWINDOW
+                    return True
+
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.strip()
+                if not title:
+                    return True
+
+                cloaked = ctypes.c_int(0)
+                dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                if cloaked.value != 0:
+                    return True
+
+                rect = RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return True
+
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w < 160 or h < 120:
+                    return True
+
+                if title in EXCLUDE_TITLES:
+                    return True
+
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+                results.append({
+                    "title": title,
+                    "hwnd": int(hwnd),
+                    "left": int(rect.left),
+                    "top": int(rect.top),
+                    "width": int(w),
+                    "height": int(h),
+                    "pid": int(pid.value)
+                })
+            except Exception:
+                pass
+            return True
+
+        cb = WNDENUMPROC(enum_windows_callback)
+        user32.EnumWindows(cb, 0)
+
+        title_counts = {}
+        for r in results:
+            t = r["title"]
+            title_counts[t] = title_counts.get(t, 0) + 1
+
+        final_windows = []
+        for r in results:
+            final_windows.append({
+                "title": r["title"],
+                "hwnd": r["hwnd"],
+                "left": r["left"],
+                "top": r["top"],
+                "width": r["width"],
+                "height": r["height"],
+                "pid": r["pid"],
+                "duplicate": (title_counts[r["title"]] > 1)
+            })
+
+        final_windows.sort(key=lambda x: x["title"])
+        return final_windows
+    except Exception:
+        return []
+
+
+def find_capture_window(title):
+    """保存されたタイトルのウィンドウが今も存在するかを完全一致で確かめる。"""
+    for w in enumerate_capture_windows():
+        if w.get("title") == title:
+            return w
+    return None
+
+
+def even_dimension(value, minimum=2):
+    """yuv420p 用に偶数へ切り下げる。"""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return minimum
+    if v < minimum:
+        return minimum
+    if v % 2 != 0:
+        v -= 1
+    return v
+
+
+def get_window_rect_by_hwnd(hwnd):
+    """ウィンドウハンドルから現在のタイトルと矩形を引く。無効なら None。
+
+    ★ウィンドウの同一性は**タイトルではなくハンドルで持つ**。
+      タイトルは動く。実測: YouTube が次の動画へ進んだだけで
+      `黄色Vtuber… - YouTube - Google Chrome` が
+      `親父の仕事初日 #shorts - YouTube - Google Chrome` に変わり、
+      完全一致で引き直していた実装は配信開始12秒で対象を見失って停止した。
+      ハンドルなら「利用者が選んだそのウィンドウ」を取り違えずに追い続けられる。
+    """
+    if sys.platform != "win32" or not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.IsWindow.argtypes = [wintypes.HWND]; u.IsWindow.restype = wintypes.BOOL
+        u.IsWindowVisible.argtypes = [wintypes.HWND]; u.IsWindowVisible.restype = wintypes.BOOL
+        u.IsIconic.argtypes = [wintypes.HWND]; u.IsIconic.restype = wintypes.BOOL
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]; u.GetWindowTextLengthW.restype = ctypes.c_int
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowTextW.restype = ctypes.c_int
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+        u.GetWindowRect.restype = wintypes.BOOL
+
+        h = wintypes.HWND(int(hwnd))
+        if not u.IsWindow(h) or not u.IsWindowVisible(h) or u.IsIconic(h):
+            return None
+        r = _RECT()
+        if not u.GetWindowRect(h, ctypes.byref(r)):
+            return None
+        w, ht = r.right - r.left, r.bottom - r.top
+        if w < 16 or ht < 16:
+            return None
+        n = u.GetWindowTextLengthW(h)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u.GetWindowTextW(h, buf, n + 1)
+        return {"hwnd": int(hwnd), "title": buf.value.strip(),
+                "left": int(r.left), "top": int(r.top), "width": int(w), "height": int(ht)}
+    except Exception:
+        return None
+
+
+_ddagrab_output_map_cache = {}
+
+
+def enumerate_display_monitors():
+    """接続モニタの矩形を列挙する。[{left, top, width, height, primary}] を返す。"""
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", _RECT),
+                        ("rcWork", _RECT), ("dwFlags", wintypes.DWORD)]
+
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                                  ctypes.POINTER(_RECT), wintypes.LPARAM)
+        u.EnumDisplayMonitors.argtypes = [wintypes.HDC, ctypes.POINTER(_RECT), PROC, wintypes.LPARAM]
+        u.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MONITORINFO)]
+
+        out = []
+
+        def _cb(hmon, hdc, lprc, lparam):
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcMonitor
+                out.append({"hmon": int(hmon), "left": int(r.left), "top": int(r.top),
+                            "width": int(r.right - r.left), "height": int(r.bottom - r.top),
+                            "primary": bool(mi.dwFlags & 1)})
+            return True
+
+        u.EnumDisplayMonitors(None, None, PROC(_cb), 0)
+        return out
+    except Exception:
+        return []
+
+
+def get_monitor_for_window(hwnd):
+    """ウィンドウが乗っているモニタの矩形。見つからなければ None。"""
+    if sys.platform != "win32" or not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        u.MonitorFromWindow.restype = wintypes.HMONITOR
+        hm = int(u.MonitorFromWindow(wintypes.HWND(int(hwnd)), 2))  # MONITOR_DEFAULTTONEAREST
+        for m in enumerate_display_monitors():
+            if m["hmon"] == hm:
+                return m
+    except Exception:
+        pass
+    return None
+
+
+def clamp_rect_to_monitor(left, top, width, height, monitor):
+    """ウィンドウ矩形をモニタ矩形の内側へ収め、偶数寸法にする。
+
+    ★ddagrab は「その出力の内側」しか切り出せない。モニタをはみ出す指定は
+      起動できない（実測: ウィンドウ幅2568 > モニタ幅2560、オフセット -1 で失敗）。
+    """
+    mx, my = monitor["left"], monitor["top"]
+    mw, mh = monitor["width"], monitor["height"]
+    x = max(mx, int(left))
+    y = max(my, int(top))
+    w = min(int(left) + int(width), mx + mw) - x
+    h = min(int(top) + int(height), my + mh) - y
+    w -= w % 2
+    h -= h % 2
+    return (x, y, max(0, w), max(0, h))
+
+
+def _capture_thumb(args, tag):
+    """1フレームだけ取り出して 32x18 のグレースケール列を返す（照合用）。"""
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), f"_vrcms_probe_{tag}.png")
+    try:
+        p = subprocess.run([get_ffmpeg_cmd(), "-hide_banner", *args, "-frames:v", "1", "-y", path],
+                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+        if p.returncode != 0 or not os.path.exists(path):
+            return None
+        from PIL import Image
+        with Image.open(path) as im:
+            return list(im.convert("L").resize((32, 18)).getdata())
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _probe_monitor_vs_ddagrab(px, py, pw, ph, ox, oy, output_idx, timeout=15):
+    """モニタの同じ場所を gdigrab と ddagrab で**同時に**1枚ずつ撮り、差を返す。
+
+    ★別プロセスで順番に撮ってはいけない。撮る瞬間がずれるぶん、画面が動いていると
+      正解でも大きく食い違う。実際それで**別のモニタを選ぶ誤判定**を踏んだ
+      （同じモニタが diff=3.7 で正解した後、別の時点で diff=31.4 の誤りを掴んだ）。
+      1つの ffmpeg に両方を入力として並べれば、ほぼ同時刻の絵どうしを比べられる。
+    """
+    import tempfile
+    a = os.path.join(tempfile.gettempdir(), f"_vrcms_pair_ref_{output_idx}.png")
+    b = os.path.join(tempfile.gettempdir(), f"_vrcms_pair_dda_{output_idx}.png")
+    cmd = [
+        get_ffmpeg_cmd(), "-hide_banner", "-v", "error",
+        "-f", "gdigrab", "-framerate", "10",
+        "-offset_x", str(px), "-offset_y", str(py),
+        "-video_size", f"{pw}x{ph}", "-i", "desktop",
+        "-f", "lavfi", "-i",
+        f"ddagrab=output_idx={output_idx}:framerate=10:video_size={pw}x{ph}"
+        f":offset_x={ox}:offset_y={oy}",
+        "-map", "0:v", "-vf", "scale=32:18", "-frames:v", "1", "-y", a,
+        "-map", "1:v", "-vf", "hwdownload,format=bgra,scale=32:18", "-frames:v", "1", "-y", b,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                              creationflags=CREATE_NO_WINDOW)
+        if proc.returncode != 0 or not (os.path.exists(a) and os.path.exists(b)):
+            return None
+        from PIL import Image
+        with Image.open(a) as ia, Image.open(b) as ib:
+            ta = list(ia.convert("L").getdata())
+            tb = list(ib.convert("L").getdata())
+        return sum(abs(x - y) for x, y in zip(ta, tb)) / len(ta)
+    except Exception:
+        return None
+    finally:
+        for f in (a, b):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def resolve_ddagrab_output_for_monitor(monitor, max_outputs=8):
+    """モニタに対応する ddagrab の output_idx を、実際の絵を照合して決める。
+
+    ★順番の一致を仮定してはいけない。取り違えると**別のモニタをそのまま配信する**。
+      ddagrab は出力の位置を返さないため、モニタ矩形と突き合わせる術が無い。
+
+    判定は**絶対値ではなく比**で行う。同時に撮っても完全な同時刻にはならないので、
+    正解でも差はそれなりに出る（実測: 正解32.7 / 不正解90.6）。絶対値で線を引くと
+    動きの多い画面で常に失格になり、遅い経路へ落ち続けてしまう。
+    「次点が最良の2倍以上離れている」ことを条件にすれば、動いていても判別できる。
+
+    決められないときは None を返し、呼び出し側は gdigrab へ退避する
+    （遅いが、位置指定が絶対座標なので取り違えは起こらない）。
+    """
+    key = (monitor["left"], monitor["top"], monitor["width"], monitor["height"])
+    if key in _ddagrab_output_map_cache:
+        return _ddagrab_output_map_cache[key]
+
+    mx, my = monitor["left"], monitor["top"]
+    # ★照合窓は**モニタ全体**にする。中央だけを見ると再生中の動画に支配されて
+    #   識別できない。実測（同一条件・4試行）で、中央640x360では比が
+    #   1.31/1.14/2.32/1.14 となり3回は**誤った出力が最良**になったが、
+    #   モニタ全体なら 4.25/49.16/6.32/4.80 と4回とも正解を明確に判別できた。
+    #   タスクバー・ウィンドウ配置・壁紙まで入るぶん、モニタごとの違いが際立つ。
+    px, py = mx, my
+    pw, ph = monitor["width"], monitor["height"]
+
+    # 動きの大きい瞬間に当たると差が開かず決められない。数回試す。
+    # 一度決まればモニタ単位で覚えるので、費用は実質1回きり。
+    for attempt in range(3):
+        scored = []
+        for idx in range(max_outputs):
+            d = _probe_monitor_vs_ddagrab(px, py, pw, ph, px - mx, py - my, idx)
+            if d is None:
+                break
+            scored.append((d, idx))
+
+        if not scored:
+            return None
+        scored.sort()
+        best_diff, best_idx = scored[0]
+        second = scored[1][0] if len(scored) > 1 else None
+
+        if second is None or second >= best_diff * 2.0:
+            log_print(f"[Capture] Monitor origin=({mx},{my}) -> ddagrab output_idx={best_idx} "
+                      f"(diff={best_diff:.1f}, second={second}, attempt={attempt + 1})")
+            _ddagrab_output_map_cache[key] = best_idx
+            return best_idx
+
+    log_print(f"[Capture] ddagrab mapping ambiguous after 3 attempts "
+              f"(best={best_diff:.1f} second={second}) -> gdigrab へ退避")
+    return None
+
+
+def resolve_window_capture_plan(win):
+    """ウィンドウ取り込みの取り方を決める。
+
+    戻り値は ("ddagrab", output_idx, ox, oy, w, h) か ("gdigrab", x, y, w, h)。
+
+    ★既定を ddagrab にするのは速度のため。gdigrab(BitBlt) は切り出しが大きいほど
+      遅くなり、実測で 2568x1401 では実効 23.7fps（30fps指定に対し複製38）まで落ちて
+      カクつきとして見えた。同じ範囲でも ddagrab は 29.5fps を維持する
+      （640x360 まで小さくすれば gdigrab でも 29.5fps 出るので、サイズ依存であることも確認済み）。
+    """
+    if not win:
+        return None
+    mon = get_monitor_for_window(win.get("hwnd"))
+    if mon:
+        x, y, w, h = clamp_rect_to_monitor(win["left"], win["top"], win["width"], win["height"], mon)
+        if w >= 16 and h >= 16:
+            idx = resolve_ddagrab_output_for_monitor(mon)
+            if idx is not None:
+                return ("ddagrab", idx, x - mon["left"], y - mon["top"], w, h)
+    # 退避: 合成済みデスクトップからの切り出し（遅いが絵は正しい）
+    x, y, w, h = clamp_window_capture_rect(win["left"], win["top"], win["width"], win["height"])
+    w -= w % 2
+    h -= h % 2
+    if w < 16 or h < 16:
+        return None
+    return ("gdigrab", x, y, w, h)
+
+
+def get_virtual_screen_rect():
+    """仮想デスクトップ全体の矩形 (left, top, width, height)。
+
+    マルチモニタでは原点が負になりうる（実測: 左側にもう1枚あると (-2560, 0)）。
+    0 起点だと思い込むと切り出し位置が丸ごとずれる。
+    """
+    if sys.platform != "win32":
+        return (0, 0, 0, 0)
+    try:
+        import ctypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u.GetSystemMetrics.restype = ctypes.c_int
+        # SM_XVIRTUALSCREEN=76 / SM_YVIRTUALSCREEN=77 / SM_CXVIRTUALSCREEN=78 / SM_CYVIRTUALSCREEN=79
+        return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),
+                u.GetSystemMetrics(78), u.GetSystemMetrics(79))
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+def clamp_window_capture_rect(left, top, width, height, virtual_rect=None):
+    """ウィンドウ矩形を仮想デスクトップの内側へ収めて (x, y, w, h) を返す。
+
+    ★はみ出しを落とさないと ffmpeg が起動しない。実測でウィンドウが
+    `(-2568, -7)` のように画面外へわずかに出ていることがあり、そのまま渡すと
+    `Capture area ... extends outside window area ...` で I/O error になる。
+    """
+    vx, vy, vw, vh = virtual_rect if virtual_rect else get_virtual_screen_rect()
+    try:
+        left, top, width, height = int(left), int(top), int(width), int(height)
+    except (TypeError, ValueError):
+        return (0, 0, 0, 0)
+    if vw <= 0 or vh <= 0:
+        return (left, top, max(0, width), max(0, height))
+
+    x = max(vx, left)
+    y = max(vy, top)
+    w = min(left + width, vx + vw) - x
+    h = min(top + height, vy + vh) - y
+    return (x, y, max(0, w), max(0, h))
+
+
+def build_screen_capture_input(source_type="display", display_index=0, window_title="",
+                               framerate=30, draw_mouse=True, window_plan=None):
+    """画面キャプチャ入力の ffmpeg 引数を組み立てる。(input_args, needs_hwdownload) を返す。
+
+    ★ウィンドウ取り込みに `gdigrab -i "title=..."` を使ってはいけない。
+      あれはウィンドウのDCから BitBlt するので、**GPU合成されたウィンドウが
+      真っ黒（または真っ白）になる**。実測: Chrome / Electron(Claude) は
+      mean=0.0 の完全な黒、Unity(VRChat) は mean=255.0 の完全な白だった。
+      共有したいアプリはほぼ全部これに当たるので、事実上使えない。
+      代わりに **合成済みのデスクトップをウィンドウ矩形で切り出す**。
+      同じ3ウィンドウが mean=30.6 / 37.2 / 133.7 と正しく映ることを実測で確認済み。
+      副作用として、手前に重なった別ウィンドウはそのまま映り込む。
+    """
+    try:
+        fps = int(framerate)
+    except (TypeError, ValueError):
+        fps = 30
+    if fps < 1 or fps > 60:
+        fps = 30
+
+    if source_type == "window" and window_title and window_plan:
+        kind = window_plan[0]
+        if kind == "ddagrab":
+            _, idx, ox, oy, w, h = window_plan
+            dm = "true" if draw_mouse else "false"
+            input_args = [
+                "-f", "lavfi", "-thread_queue_size", "1024",
+                "-i", (f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
+                       f":video_size={w}x{h}:offset_x={ox}:offset_y={oy}")
+            ]
+            return (input_args, True)
+        if kind == "gdigrab":
+            _, x, y, w, h = window_plan
+            dm = "1" if draw_mouse else "0"
+            # ★offset_x/offset_y は仮想画面の**絶対座標**。原点からの相対値を
+            #   渡すと `extends outside window area` で起動しない（実測で確認）。
+            input_args = [
+                "-f", "gdigrab", "-thread_queue_size", "1024",
+                "-framerate", str(fps), "-draw_mouse", dm,
+                "-offset_x", str(x), "-offset_y", str(y),
+                "-video_size", f"{w}x{h}",
+                "-i", "desktop"
+            ]
+            return (input_args, False)
+
+    # ディスプレイ取り込み（ウィンドウを解決できなかった場合もここへ落ちる）
+    try:
+        idx = int(display_index)
+        if idx < 0:
+            idx = 0
+    except (TypeError, ValueError):
+        idx = 0
+    dm = "true" if draw_mouse else "false"
+    input_args = [
+        "-f", "lavfi", "-thread_queue_size", "1024",
+        "-i", f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
+    ]
+    return (input_args, True)
+
+
+def clamp_capture_size_to_destination(width, height, dest_width, dest_height):
+    """送出解像度を配信先の解像度以下に抑える。(w, h) を返す。
+
+    ★配信先がRTMP系のとき、シンクは映像を必ず配信先の解像度へ作り直す。
+      そこへ 1080p を送っても、縮小されて捨てられるだけで得は無い。
+      むしろ送出側の帯域が同じなら、1080p は 720p より1画素あたりのビットが
+      減るぶん**途中で痩せる**。実測で、動きのある画面を 1080p / 2000kbps で
+      送ると、取り込みが8.8fps相当の動きを持っていても1.3fpsまで潰れた。
+      同じ帯域なら配信先と同じ寸法で送った方が良い。
+
+    ビットレートは絞らない。送出が高品質なほど二段目の再エンコードの入力が
+    良くなるので、上限を掛けると逆効果になる。
+    """
+    def _even(v, minimum=2):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return minimum
+        if v < minimum:
+            return minimum
+        return v - (v % 2)
+
+    w, h = _even(width), _even(height)
+    dw, dh = _even(dest_width), _even(dest_height)
+    if dw >= 2 and w > dw:
+        w = dw
+    if dh >= 2 and h > dh:
+        h = dh
+    return (w, h)
+
+
+def build_screen_video_filter(needs_hwdownload, out_width=1920, out_height=1080,
+                              clock_filter=None, in_label="0:v", out_label="vout"):
+    """[0:v] から [vout] までの映像フィルタチェーン1本を組み立てる。"""
+    w = even_dimension(out_width)
+    h = even_dimension(out_height)
+    parts = []
+    parts.append(f"[{in_label}]")
+    if needs_hwdownload:
+        parts.append("hwdownload,format=bgra,")
+    parts.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=bicubic,")
+    parts.append(f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,")
+    parts.append("format=yuv420p")
+    if clock_filter:
+        parts.append("," + clock_filter)
+    parts.append(f"[{out_label}]")
+    return "".join(parts)
+
+
+def build_radio_audio_filter(crossfade_seconds, duration=0, seek_seconds=0,
+                             base="aresample=async=1"):
+    """ラジオ送出の -af 文字列を組み立てる。
+
+    seek_seconds > 0 は「設定変更のホットリロードで曲の途中から張り直した」場合。
+    ここでフェードインを掛けると、設定を保存するたびに再生中の曲の音量が
+    一度落ちて上がる（利用者には原因の分からない音量ゆらぎに見える）ので掛けない。
+
+    duration が 0（長さ不明）の曲にはフェードアウトを掛けられない。開始位置が
+    決まらないうえ、-shortest で入力が尽きる瞬間も事前には読めないため。
+    """
+    filters = [base] if base else []
+
+    fade = normalize_radio_crossfade(crossfade_seconds)
+    try:
+        total = max(0.0, float(duration or 0))
+    except (TypeError, ValueError):
+        total = 0.0
+    try:
+        seek = max(0.0, float(seek_seconds or 0))
+    except (TypeError, ValueError):
+        seek = 0.0
+
+    if fade > 0 and total > 0:
+        fade = min(fade, total / 4.0)
+    if fade < _RADIO_FADE_MIN_SECONDS:
+        return ",".join(filters)
+
+    if seek <= 0:
+        filters.append(f"afade=t=in:st=0:d={fade:g}")
+
+    if total > 0:
+        start = total - seek - fade
+        if start > 0:
+            filters.append(f"afade=t=out:st={start:.3f}:d={fade:g}")
+
+    return ",".join(filters)
+
+
+# =============================================================================
+# 映像エンコーダーの選択（タスク18: NVENC / QSV / AMF 対応）
+# =============================================================================
+# 既定は "auto"。起動時に**実際に1回エンコードしてみて**通ったものだけを使う。
+# `ffmpeg -encoders` の一覧は当てにならない: 同梱ビルドは h264_nvenc / h264_qsv /
+# h264_amf を常に「載せて」おり、GPUもドライバも無い環境でそのまま列挙される。
+# ★実測(2026-09-06 / このPC): 一覧には4種すべて出るが、実際に通るのは
+#   h264_nvenc と libx264 だけ。h264_qsv は "Error creating a MFX session: -9"、
+#   h264_amf は "DLL amfrt64.dll failed to open" で初期化に失敗した。
+VIDEO_ENCODERS = ("auto", "libx264", "h264_nvenc", "h264_qsv", "h264_amf")
+
+# auto のときに試す順番。NVENC が最も枯れていて低遅延指定も素直なため先頭。
+HW_ENCODER_PRIORITY = ("h264_nvenc", "h264_qsv", "h264_amf")
+
+# プローブ結果のキャッシュ。エンコーダーの可否は実行中に変わらない
+# （GPUの抜き差しは再起動を伴う）ので、プロセス内で1度だけ確かめる。
+_ENCODER_PROBE_CACHE = {}
+_ENCODER_PROBE_LOCK = threading.Lock()
+
+
+def build_video_encoder_opts(encoder, *, v_kbps, max_kbps, buf_kbps,
+                             h264_profile="baseline", sw_preset="ultrafast",
+                             sw_tune="zerolatency", level="3.1",
+                             gop_frames=None, fps=None, bf_zero=True,
+                             sc_threshold_zero=False):
+    """`-c:v` から始まる映像エンコード引数一式を組み立てる。
+
+    **エンコーダーごとに完全に別の一覧を返す。共通部分に足し込む形にしてはいけない。**
+    ★実測: x264 の値をNVENCに渡すと即座に落ちる
+      （`-preset ultrafast` → "Unable to parse preset option value ultrafast"）。
+    「とりあえず全部付ける」実装は、HWエンコーダーでは起動不能を意味する。
+
+    引数は「意味」で受け取り、方言への翻訳をここに閉じ込める。
+    呼び出し側（動画・写真・待機画面・RTMP送出）は方言を知らなくてよい。
+    """
+    rate = ["-b:v", f"{v_kbps}k", "-maxrate", f"{max_kbps}k", "-bufsize", f"{buf_kbps}k"]
+
+    if encoder == "h264_nvenc":
+        opts = [
+            "-c:v", "h264_nvenc",
+            # p1=最速。配信は実時間で足りればよく、画質はビットレートで決まる。
+            "-preset", "p1" if sw_tune == "zerolatency" else "p4",
+            "-tune", "ull" if sw_tune == "zerolatency" else "hq",
+            "-rc", "cbr",
+            "-profile:v", h264_profile,
+        ]
+        if level:
+            # ★NVENCは 1080p で level 3.1 を拒否する
+            #   ("InitializeEncoder failed: invalid param (8): Invalid Level")。
+            #   libx264 は黙って辻褄を合わせるので、同じ値を流用すると
+            #   「x264では動くのにNVENCだけ起動しない」になる。1080p の実力値へ上げる。
+            opts += ["-level", "4.1" if str(level) == "3.1" else str(level)]
+        opts += ["-pix_fmt", "yuv420p"] + rate
+        if bf_zero:
+            opts += ["-bf", "0"]
+        # -sc_threshold は libx264 専用。NVENC に渡すと弾かれるので出さない。
+    elif encoder == "h264_qsv":
+        # このPCにIntel GPUが無く実機確認できていない。誤っていてもプローブが
+        # 落として libx264 へ退避するため、配信が止まることはない。
+        opts = [
+            "-c:v", "h264_qsv",
+            "-preset", "veryfast",
+            "-profile:v", h264_profile,
+        ]
+        if level:
+            opts += ["-level", "4.1" if str(level) == "3.1" else str(level)]
+        # QSVはNV12で受ける。yuv420pを明示するとフォーマット不一致で落ちる環境がある。
+        opts += ["-pix_fmt", "nv12"] + rate
+        if bf_zero:
+            opts += ["-bf", "0"]
+    elif encoder == "h264_amf":
+        # 同上（AMD GPU無しのため未検証。プローブが可否を決める）。
+        opts = [
+            "-c:v", "h264_amf",
+            "-usage", "lowlatency" if sw_tune == "zerolatency" else "transcoding",
+            "-quality", "speed",
+            "-rc", "cbr",
+            # ★AMFのプロファイル定数は x264 と綴りが違う。"baseline" を渡すと
+            #   "Undefined constant or missing '(' in 'baseline'" で起動できない
+            #   （このPCではDLLが無く到達しないが、エラー文からは判別できた）。
+            "-profile:v", "constrained_baseline" if h264_profile == "baseline" else h264_profile,
+        ]
+        if level:
+            opts += ["-level", "4.1" if str(level) == "3.1" else str(level)]
+        opts += ["-pix_fmt", "yuv420p"] + rate
+        if bf_zero:
+            opts += ["-bf", "0"]
+    else:
+        # libx264（既定・フォールバック）。
+        # ここは既存の実装と1バイトも変えない。preset/tune/level の値は
+        # 過去の画質実測（CHANGELOG 2026-08-30）で決まったものなので、
+        # 「統一のため」に触らないこと。
+        opts = ["-c:v", "libx264", "-preset", sw_preset]
+        if sw_tune:
+            opts += ["-tune", sw_tune]
+        opts += ["-profile:v", h264_profile]
+        if level:
+            opts += ["-level", str(level)]
+        if bf_zero:
+            opts += ["-bf", "0"]
+        if sc_threshold_zero:
+            opts += ["-sc_threshold", "0"]
+        opts += ["-pix_fmt", "yuv420p"] + rate
+
+    if gop_frames:
+        opts += ["-g", str(gop_frames), "-keyint_min", str(gop_frames)]
+    if fps:
+        opts += ["-r", str(fps)]
+    return opts
+
+
+def probe_video_encoder(encoder, timeout=20):
+    """そのエンコーダーが**このPCで実際に動くか**を1回だけ確かめる（結果はキャッシュ）。
+
+    `ffmpeg -encoders` を見るだけでは不十分。同梱ビルドはGPUの有無に関わらず
+    h264_nvenc / h264_qsv / h264_amf を列挙するので、一覧を信じると
+    「配信を始めた瞬間に落ちる」設定を選んでしまう。
+
+    そこで **本番と同じ形の引数**で 1080p を数フレームだけ実際に encode する。
+    引数の方言違い（level・preset・pix_fmt）もここで一緒に検出できる。
+    """
+    if encoder == "libx264":
+        return True   # 同梱ビルドの必須エンコーダー。これが無ければ何も配信できない。
+    with _ENCODER_PROBE_LOCK:
+        if encoder in _ENCODER_PROBE_CACHE:
+            return _ENCODER_PROBE_CACHE[encoder]
+
+    cmd = [get_ffmpeg_cmd(), "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=0.2"]
+    cmd += build_video_encoder_opts(encoder, v_kbps=2500, max_kbps=3000, buf_kbps=2000)
+    cmd += ["-f", "null", "-"]
+
+    ok = False
+    detail = ""
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0
+        )
+        try:
+            _out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_proc(proc)
+            _out, err = "", "probe timed out"
+        # 終了コードだけで判定する。stderr の文言はFFmpegの版で変わるうえ、
+        # 成功時にも警告が出る。
+        ok = (proc.returncode == 0)
+        detail = (err or "").strip().splitlines()[0] if err else ""
+    except Exception as e:
+        ok, detail = False, str(e)
+
+    with _ENCODER_PROBE_LOCK:
+        _ENCODER_PROBE_CACHE[encoder] = ok
+    log_print(f"[Encoder] Probe {encoder}: {'available' if ok else 'unavailable'}"
+              + (f" ({detail})" if not ok and detail else ""))
+    return ok
+
+
+def resolve_video_encoder(requested):
+    """設定値を「実際に使うエンコーダー名」へ解決する。
+
+    - "auto": NVENC → QSV → AMF の順に試し、通ったものを使う。全滅なら libx264。
+    - 明示指定: そのエンコーダーが**動くことを確かめてから**使う。動かなければ
+      libx264 へ退避する。利用者が選んだ設定を尊重して落ちるより、
+      配信が続く方が価値が高い（設定画面には実際に使われている方を表示する）。
+    """
+    requested = str(requested or "auto").strip() or "auto"
+    if requested not in VIDEO_ENCODERS:
+        log_print(f"[Encoder] Unknown video_encoder {requested!r}; falling back to auto.")
+        requested = "auto"
+
+    if requested == "libx264":
+        return "libx264"
+    if requested == "auto":
+        for candidate in HW_ENCODER_PRIORITY:
+            if probe_video_encoder(candidate):
+                return candidate
+        return "libx264"
+    if probe_video_encoder(requested):
+        return requested
+    log_print(f"[Encoder] {requested} is not usable on this PC; using libx264 instead.")
+    return "libx264"
+
 
 
 def get_live_clock_drawtext_filter(x="w-tw-45", y="26", font_size=28, bold=True):
@@ -1018,6 +2245,29 @@ class StreamerCore:
             log_print(f"[Core] Failed to save config: {e}")
             return False
 
+    def get_video_encoder(self):
+        """今この瞬間に使う映像エンコーダー名。
+
+        解決結果はインスタンスに保持する。プローブは実エンコードを1回走らせるので、
+        再生のたびに呼ぶと切り替えが目に見えて遅くなる。設定が変わったときだけ
+        引き直す（設定画面で選び直した直後から効かせるため）。
+        """
+        requested = str(self.config.get("video_encoder", "auto") or "auto")
+        if getattr(self, "_video_encoder_requested", None) != requested:
+            self._video_encoder_requested = requested
+            self._video_encoder_resolved = resolve_video_encoder(requested)
+            log_print(f"[Encoder] video_encoder={requested} -> using {self._video_encoder_resolved}")
+        return self._video_encoder_resolved
+
+    def is_web_remote_enabled(self):
+        """Webリモコン（ゲスト向けの画面とAPI）を開いているか。タスク21。
+
+        未設定は True（＝従来どおり開く）。既存ユーザーの設定ファイルには
+        このキーが無いため、ここを fail-closed にすると更新した全員のリモコンが
+        黙って死ぬ。「無効化」は利用者が明示的に選んだときだけ効かせる。
+        """
+        return bool(self.config.get("enable_web_remote", True))
+
     def get_status_data(self, include_secrets=False):
         """配信状態一式。include_secrets=True はローカルホスト（ホスト本人）専用。
 
@@ -1036,6 +2286,12 @@ class StreamerCore:
             public_url = f"http://localhost:{port}"
         else:
             stream_url = ""
+            public_url = ""
+
+        # ホスト専用モードでは誰も開けないURLなので、リモコンURLは配らない。
+        # ここを残すと、UIもQRも「アクセスできないURL」を表示し続ける。
+        web_remote_enabled = self.is_web_remote_enabled()
+        if not web_remote_enabled:
             public_url = ""
 
         is_image = bool(self.current_video and self.current_video.get("type") == "image")
@@ -1073,9 +2329,16 @@ class StreamerCore:
             "image_paused": self.image_paused,
             "image_display_duration": int(self.config.get("image_display_duration", 15)),
             "image_auto_advance": bool(self.config.get("image_auto_advance", False)),
-            "overlay_qr_enabled": bool(self.config.get("overlay_qr_enabled", False) or self.config.get("overlay_qr_video", False) or self.config.get("overlay_qr_image", False)),
-            "overlay_qr_video": bool(self.config.get("overlay_qr_video", False)),
-            "overlay_qr_image": bool(self.config.get("overlay_qr_image", False)),
+            "enable_web_remote": web_remote_enabled,
+            # 設定値と「実際に使われているもの」は食い違いうる（GPUが無い等）。
+            # 片方しか出さないと、退避したことが利用者から見えない。
+            "video_encoder": str(self.config.get("video_encoder", "auto")),
+            "active_video_encoder": self.get_video_encoder(),
+            # QRはリモコンURLを焼いたものなので、リモコンが無効なら「消えている」状態を返す。
+            # 設定値そのものは書き換えない（再度有効化したら元の設定に戻る）。
+            "overlay_qr_enabled": web_remote_enabled and bool(self.config.get("overlay_qr_enabled", False) or self.config.get("overlay_qr_video", False) or self.config.get("overlay_qr_image", False)),
+            "overlay_qr_video": web_remote_enabled and bool(self.config.get("overlay_qr_video", False)),
+            "overlay_qr_image": web_remote_enabled and bool(self.config.get("overlay_qr_image", False)),
             "overlay_qr_mode": str(self.config.get("overlay_qr_mode", "bottom-right")),
             "overlay_clock_enabled": bool(self.config.get("overlay_clock_enabled", False) or self.config.get("overlay_clock_video", False)),
             "overlay_clock_video": bool(self.config.get("overlay_clock_video", False)),
@@ -1085,6 +2348,26 @@ class StreamerCore:
             "photo_count": len(self.get_photos()),
             "radio_mode": (self.get_playback_mode() == "radio"),
             "radio_bg_source": str(self.config.get("radio_bg_source", "standby")),
+            "radio_crossfade_duration": self.get_radio_crossfade_duration(),
+            "live_audio_mic_device": str(self.config.get("live_audio_mic_device", "")),
+            "live_audio_loopback_device": str(self.config.get("live_audio_loopback_device", "")),
+            "live_audio_mic_volume": float(self.config.get("live_audio_mic_volume", 1.0)),
+            "live_audio_loopback_volume": float(self.config.get("live_audio_loopback_volume", 0.7)),
+            "live_audio_app_enabled": bool(self.config.get("live_audio_app_enabled", False)),
+            "live_audio_app_window_title": str(self.config.get("live_audio_app_window_title", "")),
+            "live_audio_app_volume": float(self.config.get("live_audio_app_volume", 1.0)),
+            "live_audio_app_mode": str(self.config.get("live_audio_app_mode", "include")),
+            "app_audio_available": bool(get_app_audio_capture_cmd()),
+            "app_audio_level": self.get_app_audio_level(),
+            "live_audio_bg_source": str(self.config.get("live_audio_bg_source", "standby")),
+            "screen_capture_source_type": str(self.config.get("screen_capture_source_type", "display")),
+            "screen_capture_display_index": int(self.config.get("screen_capture_display_index", 0)),
+            "screen_capture_window_title": str(self.config.get("screen_capture_window_title", "")),
+            "screen_capture_framerate": int(self.config.get("screen_capture_framerate", 30)),
+            "screen_capture_width": int(self.config.get("screen_capture_width", 1920)),
+            "screen_capture_height": int(self.config.get("screen_capture_height", 1080)),
+            "screen_capture_draw_mouse": bool(self.config.get("screen_capture_draw_mouse", True)),
+            "screen_capture_bitrate_kbps": int(self.config.get("screen_capture_bitrate_kbps", 4000)),
             "standby_mode": str(self.config.get("standby_mode", "image")),
             "standby_image_path": str(self.config.get("standby_image_path", "")),
             "has_prev": has_prev,
@@ -1094,22 +2377,25 @@ class StreamerCore:
                 "allow_web_queue_add": bool(self.config.get("allow_web_queue_add", True)),
                 "allow_web_queue_edit": bool(self.config.get("allow_web_queue_edit", True)),
                 "allow_web_playback_control": bool(self.config.get("allow_web_playback_control", True)),
-                "allow_web_share_info": bool(self.config.get("allow_web_share_info", False))
+                "allow_web_share_info": bool(self.config.get("allow_web_share_info", False)),
+                # リモコン自体が閉じているなら、個別の許可は意味を持たない。
+                # UI が「許可されているのに操作できない」と見せないよう、ここでも落とす。
+                "enable_web_remote": web_remote_enabled
             }
         }
 
     def get_playback_mode(self):
-        """現在の再生モード ('video' | 'radio' | 'slideshow') を取得"""
+        """現在の再生モード ('video' | 'radio' | 'slideshow' | 'live' | 'screen') を取得"""
         mode = self.config.get("playback_mode")
-        if mode in ("video", "radio", "slideshow"):
+        if mode in ("video", "radio", "slideshow", "live", "screen"):
             return mode
         if self.config.get("radio_mode", False):
             return "radio"
         return "video"
 
     def set_playback_mode(self, mode: str):
-        """再生モードを設定 ('video' | 'radio' | 'slideshow')"""
-        if mode not in ("video", "radio", "slideshow"):
+        """再生モードを設定 ('video' | 'radio' | 'slideshow' | 'live' | 'screen')"""
+        if mode not in ("video", "radio", "slideshow", "live", "screen"):
             log_print(f"[Core] Invalid playback mode: {mode}")
             return self.get_playback_mode()
 
@@ -1143,6 +2429,10 @@ class StreamerCore:
     def set_radio_mode(self, enabled: bool):
         mode = "radio" if enabled else "video"
         return (self.set_playback_mode(mode) == "radio")
+
+    def get_radio_crossfade_duration(self):
+        """ラジオの曲頭・曲尾フェード秒数。0 なら掛けない（タスク17）。"""
+        return normalize_radio_crossfade(self.config.get("radio_crossfade_duration", 0))
 
     def set_radio_bg_source(self, source: str):
         if source in ("card", "standby", "slideshow"):
@@ -1444,7 +2734,7 @@ class StreamerCore:
             "generic_rtmp_url": str(self.config.get("generic_rtmp_url", "") or ""),
             "generic_rtmp_key": generic_key if include_secrets else self.mask_stream_key(generic_key),
             "generic_rtmp_key_set": bool(generic_key),
-            "rtmp_video_bitrate_kbps": int(self.config.get("rtmp_video_bitrate_kbps", 1500)),
+            "rtmp_video_bitrate_kbps": int(self.config.get("rtmp_video_bitrate_kbps", 2000)),
             "rtmp_audio_bitrate_kbps": int(self.config.get("rtmp_audio_bitrate_kbps", 192)),
             "rtmp_fallback_to_hls": bool(self.config.get("rtmp_fallback_to_hls", True)),
             "max_video_bitrate_kbps": self.get_rtmp_limits()[0],
@@ -1523,7 +2813,7 @@ class StreamerCore:
             if not url:
                 return None, ""
             self.clamp_rtmp_bitrates()
-            v_kbps = int(self.config.get("rtmp_video_bitrate_kbps", 1500))
+            v_kbps = int(self.config.get("rtmp_video_bitrate_kbps", 2000))
             a_kbps = int(self.config.get("rtmp_audio_bitrate_kbps", 192))
             width = int(self.config.get("rtmp_video_width", 1280))
             height = int(self.config.get("rtmp_video_height", 720))
@@ -1541,10 +2831,12 @@ class StreamerCore:
                 # （ビットレートを2000kまで上げるのと同等の劣化を、帯域を増やさず被っていた）。
                 # 稼ぐはずのレイテンシは数フレーム分で、TopazChatの中継とAVProのバッファに
                 # 比べて無視できるため外す。エンコード速度も 8.6x→9.2x で悪化しない。
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-profile:v", "main", "-pix_fmt", "yuv420p",
-                "-b:v", f"{v_kbps}k", "-maxrate", f"{v_kbps}k", "-bufsize", f"{v_kbps * 2}k",
-                "-g", gop, "-keyint_min", gop, "-sc_threshold", "0",
+                *build_video_encoder_opts(
+                    self.get_video_encoder(),
+                    v_kbps=v_kbps, max_kbps=v_kbps, buf_kbps=v_kbps * 2,
+                    h264_profile="main", sw_preset="veryfast", sw_tune=None,
+                    level=None, bf_zero=False, sc_threshold_zero=True,
+                    gop_frames=gop),
                 "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ar", "44100", "-ac", "2",
                 "-max_muxing_queue_size", "1024",
                 "-f", "flv", url,
@@ -2256,6 +3548,56 @@ class StreamerCore:
             return STANDBY_IMAGE_PATH
         return None
 
+    def build_slideshow_manifest(self, track_seconds=0, label="Radio",
+                                 manifest_name="slideshow_manifest.txt"):
+        """スライドショー用の ffconcat マニフェストを作る。写真が無ければ None。
+
+        ★concat + -stream_loop -1 は常にマニフェストの先頭から再生される。
+          「写真枚数 x 表示秒数」が曲の長さを超えると後半の写真が一度も表示されないまま
+          次の曲でまた1枚目に戻り、特定の写真が永久にスキップされていた。
+          開始位置をずらし、消化した枚数だけカーソルを進めることで全写真を巡回させる。
+
+        track_seconds に 0 を渡すと「1枚消化」として扱う。ライブ音声のように
+        終わりのない配信では曲の長さという概念が無いため。
+        """
+        images = self.get_slideshow_images()
+        if not images:
+            return None
+
+        duration_val = float(self.config.get("image_display_duration", 15))
+
+        start = self.slideshow_cursor % len(images)
+        images = images[start:] + images[:start]
+        try:
+            secs = float(track_seconds or 0)
+        except (TypeError, ValueError):
+            secs = 0.0
+        if secs > 0 and duration_val > 0:
+            consumed = max(1, int(math.ceil(secs / duration_val)))
+        else:
+            consumed = 1
+        self.slideshow_cursor = (start + consumed) % len(images)
+
+        manifest_lines = ["ffconcat version 1.0\n"]
+        for idx, img in enumerate(images):
+            pb_path = self.get_image_for_playback(img, unique_id=idx)
+            pb_path_clean = os.path.abspath(pb_path).replace("\\", "/")
+            manifest_lines.append(f"file '{pb_path_clean}'\n")
+            manifest_lines.append(f"duration {duration_val}\n")
+        # concat demuxer の最終要素の持続時間を有効にするため末尾に複製
+        last_pb = self.get_image_for_playback(images[-1], unique_id=len(images))
+        last_pb_clean = os.path.abspath(last_pb).replace("\\", "/")
+        manifest_lines.append(f"file '{last_pb_clean}'\n")
+
+        os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+        manifest_path = os.path.join(IMAGE_CACHE_DIR, manifest_name)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.writelines(manifest_lines)
+        log_print(f"[{label}] Prepared slideshow manifest with {len(images)} photos "
+                  f"(duration: {duration_val}s/photo, start #{start + 1}, "
+                  f"next #{self.slideshow_cursor + 1}).")
+        return manifest_path
+
     def play_radio(self, video_info, seek_seconds=0):
         """BGM/ラジオモード: YouTube音声ストリーム / ローカル動画音声 + 静止画/写真を合成し、極小帯域でHLS配信"""
         url = video_info.get("url", "")
@@ -2326,43 +3668,8 @@ class StreamerCore:
 
         slideshow_manifest_path = None
         if source == "slideshow" and auto_advance:
-            images = self.get_slideshow_images()
-            if images:
-                duration_val = float(self.config.get("image_display_duration", 15))
-
-                # スライドショーは曲をまたいで続きから再生する。
-                # concat + -stream_loop -1 は常にマニフェストの先頭から再生されるため、
-                # 「写真枚数 x 表示秒数」が曲の長さを超えると後半の写真が一度も表示されないまま
-                # 次の曲でまた1枚目に戻ってしまい、特定の写真が永久にスキップされていた。
-                # 曲ごとに開始位置をずらし、消化した枚数だけカーソルを進めることで全写真を巡回させる。
-                start = self.slideshow_cursor % len(images)
-                images = images[start:] + images[:start]
-                try:
-                    track_seconds = float(duration or 0)
-                except (TypeError, ValueError):
-                    track_seconds = 0.0
-                if track_seconds > 0 and duration_val > 0:
-                    consumed = max(1, int(math.ceil(track_seconds / duration_val)))
-                else:
-                    consumed = 1
-                self.slideshow_cursor = (start + consumed) % len(images)
-
-                manifest_lines = ["ffconcat version 1.0\n"]
-                for idx, img in enumerate(images):
-                    pb_path = self.get_image_for_playback(img, unique_id=idx)
-                    pb_path_clean = os.path.abspath(pb_path).replace("\\", "/")
-                    manifest_lines.append(f"file '{pb_path_clean}'\n")
-                    manifest_lines.append(f"duration {duration_val}\n")
-                # concat demuxer の最終要素の持続時間を有効にするため末尾に複製
-                last_pb = self.get_image_for_playback(images[-1], unique_id=len(images))
-                last_pb_clean = os.path.abspath(last_pb).replace("\\", "/")
-                manifest_lines.append(f"file '{last_pb_clean}'\n")
-
-                os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
-                slideshow_manifest_path = os.path.join(IMAGE_CACHE_DIR, "slideshow_manifest.txt")
-                with open(slideshow_manifest_path, "w", encoding="utf-8") as f:
-                    f.writelines(manifest_lines)
-                log_print(f"[Radio] Prepared slideshow manifest with {len(images)} photos (duration: {duration_val}s/photo, start #{start + 1}, next #{self.slideshow_cursor + 1}).")
+            slideshow_manifest_path = self.build_slideshow_manifest(
+                track_seconds=duration, label="Radio")
 
         if slideshow_manifest_path and os.path.exists(slideshow_manifest_path):
             video_input_opts = [
@@ -2440,9 +3747,17 @@ class StreamerCore:
         # ★送出経路ごとに画質が大きく違う（ラジオ200k / 写真1500k / 動画2500k）。
         # VRC側で「これだけ汚い」と感じたとき、どの経路を通ったのかが
         # 分からないと切り分けができないため、必ず名前とビットレートを残す。
+        # 曲間フェード（タスク17）。ホットリロードでの復帰(seek>0)では
+        # フェードインを掛けない ＝ 設定保存のたびに音量が揺れるのを防ぐ。
+        radio_af = build_radio_audio_filter(
+            self.get_radio_crossfade_duration(),
+            duration=duration,
+            seek_seconds=seek_seconds,
+        )
         log_print(
             f"[Player] Encoder path=radio 1920x1080@2fps v=200k(max250k/buf200k) "
-            f"baseline/ultrafast bg={'slideshow' if is_slideshow else self.config.get('radio_bg_source', 'card')}"
+            f"baseline/ultrafast bg={'slideshow' if is_slideshow else self.config.get('radio_bg_source', 'card')} "
+            f"af={radio_af}"
         )
         cmd.extend([
             "-c:v", "libx264",
@@ -2462,7 +3777,7 @@ class StreamerCore:
             "-c:a", "aac",
             "-b:a", "128k",
             "-ar", "44100",
-            "-af", "aresample=async=1",
+            "-af", radio_af,
             "-shortest",
             "-fflags", "+nobuffer+flush_packets",
             "-flush_packets", "1",
@@ -2629,15 +3944,10 @@ class StreamerCore:
             log_print(f"[Player] Encoder path=video/reencode v=2500k(max3000k/buf2000k) "
                       f"baseline/ultrafast reason={reason}")
             cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-profile:v", "baseline",
-                "-level", "3.1",
-                "-pix_fmt", "yuv420p",
-                "-b:v", "2500k",
-                "-maxrate", "3000k",
-                "-bufsize", "2000k",
+                *build_video_encoder_opts(
+                    self.get_video_encoder(),
+                    v_kbps=2500, max_kbps=3000, buf_kbps=2000,
+                    h264_profile="baseline", bf_zero=False),
                 "-c:a", "aac", "-b:a", "128k",
                 "-af", "aresample=async=1",
                 "-shortest",
@@ -2984,20 +4294,11 @@ class StreamerCore:
             cmd.extend(["-vf", clock_filter])
         log_print("[Player] Encoder path=image 1920x1080@30fps v=1500k(buf1000k) baseline/ultrafast g=30")
         cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-profile:v", "baseline",
-            "-level", "3.1",
-            "-bf", "0",
-            "-g", "30",
-            "-keyint_min", "30",
-            "-sc_threshold", "0",
-            "-pix_fmt", "yuv420p",
-            "-r", "30",
-            "-b:v", "1500k",
-            "-maxrate", "1500k",
-            "-bufsize", "1000k",
+            *build_video_encoder_opts(
+                self.get_video_encoder(),
+                v_kbps=1500, max_kbps=1500, buf_kbps=1000,
+                h264_profile="baseline", sc_threshold_zero=True,
+                gop_frames=30, fps=30),
             "-c:a", "aac", "-b:a", "64k",
             "-fflags", "+nobuffer+flush_packets",
             "-flush_packets", "1",
@@ -3020,6 +4321,616 @@ class StreamerCore:
 
         with self.process_lock:
             self.send_proc = proc
+
+        stop_event = threading.Event()
+        threading.Thread(target=self.relay_stream_data,
+                         args=(proc, self.current_stdin, stop_event, False), daemon=True).start()
+        threading.Thread(target=self.watch_send_proc,
+                         args=(proc, stop_event), daemon=True).start()
+        return stop_event
+
+    def _resolve_app_audio_pid(self):
+        """設定からアプリ音声の対象PIDを解決する。無効・未選択・不在なら None。
+
+        ★正本はウィンドウタイトル。PIDは対象アプリの再起動で変わるので、
+          配信を始める瞬間にタイトルから引き直す（タスク23と同じ考え方）。
+        """
+        if not self.config.get("live_audio_app_enabled", False):
+            return None
+        title = str(self.config.get("live_audio_app_window_title", "")).strip()
+        if not title:
+            log_print("[AppAudio] 対象ウィンドウ未選択 -> アプリ音声なしで続行")
+            return None
+        win = find_capture_window(title)
+        if not win:
+            log_print(f"[AppAudio] 対象ウィンドウが見つからない: '{title}' -> アプリ音声なしで続行")
+            return None
+        pid = win.get("pid")
+        log_print(f"[AppAudio] 対象ウィンドウ '{title}' -> pid={pid}")
+        return pid
+
+    def start_app_audio_capture(self):
+        """アプリ音声の補助exeを起動する。使えないときは None（fail-soft）。"""
+        pid = self._resolve_app_audio_pid()
+        if not pid:
+            return None
+        proc = start_app_audio_helper(
+            pid,
+            mode=self.config.get("live_audio_app_mode", "include"),
+            stats_sec=int(self.config.get("live_audio_app_stats_sec", 0) or 0)
+        )
+        if proc:
+            self.app_audio_level = None
+            threading.Thread(target=self._pump_app_audio_stderr,
+                             args=(proc,), daemon=True).start()
+        return proc
+
+    def _pump_app_audio_stderr(self, helper_proc):
+        """補助exeの stderr を読み続け、入力レベルを拾い、それ以外はログへ流す。
+
+        ★読み続けること自体が必須。stderr を PIPE にして誰も読まないと、
+          パイプのバッファが埋まった時点で補助exeが書き込みでブロックし、
+          音が止まる。
+        """
+        try:
+            for raw in iter(helper_proc.stderr.readline, b""):
+                try:
+                    line = raw.decode("utf-8", "replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                m = re.search(r"level peak=([\d.]+) rms=([\d.]+)", line)
+                if m:
+                    try:
+                        self.app_audio_level = {
+                            "peak": float(m.group(1)),
+                            "rms": float(m.group(2)),
+                            "ts": time.time(),
+                        }
+                    except ValueError:
+                        pass
+                    continue
+                # レベル以外は診断情報なので残す（従来は捨てていた）。
+                log_print(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                helper_proc.stderr.close()
+            except Exception:
+                pass
+
+    def get_app_audio_level(self):
+        """UIのゲージ用に、直近の入力レベルを返す。古ければ 0 扱い。"""
+        lv = getattr(self, "app_audio_level", None) or {}
+        ts = lv.get("ts", 0.0)
+        age = time.time() - ts if ts else None
+        fresh = bool(ts) and age is not None and age < APP_AUDIO_LEVEL_STALE_SEC
+        return {
+            "peak": float(lv.get("peak", 0.0)) if fresh else 0.0,
+            "rms": float(lv.get("rms", 0.0)) if fresh else 0.0,
+            "fresh": fresh,
+        }
+
+    def pump_sender_stderr(self, proc, label, max_lines=40):
+        """送出FFmpegの stderr を読み、警告・エラーだけをログへ残す。
+
+        ★PIPE にした以上は読み続けること（読まないとバッファが詰まって止まる）。
+          全文を残すと進捗表示で埋まるので、意味のある行だけに絞る。
+        """
+        kept = 0
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                # ★本物のパイプでなければ即やめる。テストのモック相手だと
+                #   readline() が b"" を返さず、このループが終わらなくなる。
+                if not isinstance(raw, (bytes, bytearray)):
+                    break
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                low = line.lower()
+                if ("error" in low or "invalid" in low or "failed" in low
+                        or "no such file" in low or "conversion failed" in low):
+                    if kept < max_lines:
+                        log_print(f"[FFmpeg:{label}] {line}")
+                        kept += 1
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    def reap_app_audio_helper(self, sender_proc, helper_proc):
+        """送出FFmpegが終わったら補助exeを確実に落とす。
+
+        送出側の kill 箇所は多数あるので、個別に手を入れるのではなく
+        送出プロセスの寿命に紐づけて回収する。
+        """
+        if not helper_proc:
+            return
+        try:
+            sender_proc.wait()
+        except Exception:
+            pass
+        kill_proc(helper_proc)
+        self.app_audio_level = None
+        log_print("[AppAudio] helper stopped")
+
+    def set_live_audio_app(self, enabled=None, window_title=None, volume=None, mode=None):
+        """アプリ単位の音声取り込み設定を更新する。"""
+        if enabled is not None:
+            self.config["live_audio_app_enabled"] = bool(enabled)
+        if window_title is not None:
+            self.config["live_audio_app_window_title"] = str(window_title)
+        if volume is not None:
+            try:
+                self.config["live_audio_app_volume"] = max(0.0, min(2.0, float(volume)))
+            except (TypeError, ValueError):
+                pass
+        if mode in ("include", "exclude"):
+            self.config["live_audio_app_mode"] = mode
+        self.save_config()
+        self.request_stream_reload()
+        return {
+            "live_audio_app_enabled": bool(self.config.get("live_audio_app_enabled", False)),
+            "live_audio_app_window_title": str(self.config.get("live_audio_app_window_title", "")),
+            "live_audio_app_volume": float(self.config.get("live_audio_app_volume", 1.0)),
+            "live_audio_app_mode": str(self.config.get("live_audio_app_mode", "include")),
+            "app_audio_available": bool(get_app_audio_capture_cmd()),
+        }
+
+    def set_live_audio_devices(self, mic_device=None, loopback_device=None,
+                               mic_volume=None, loopback_volume=None):
+        """PC音声/マイク取り込みデバイス・音量を設定"""
+        if mic_device is not None:
+            self.config["live_audio_mic_device"] = str(mic_device)
+        if loopback_device is not None:
+            self.config["live_audio_loopback_device"] = str(loopback_device)
+        if mic_volume is not None:
+            try:
+                v = float(mic_volume)
+                self.config["live_audio_mic_volume"] = max(0.0, min(2.0, v))
+            except (TypeError, ValueError):
+                pass
+        if loopback_volume is not None:
+            try:
+                v = float(loopback_volume)
+                self.config["live_audio_loopback_volume"] = max(0.0, min(2.0, v))
+            except (TypeError, ValueError):
+                pass
+        self.save_config()
+        self.request_stream_reload()
+        return {
+            "live_audio_mic_device": self.config.get("live_audio_mic_device", ""),
+            "live_audio_loopback_device": self.config.get("live_audio_loopback_device", ""),
+            "live_audio_mic_volume": self.config.get("live_audio_mic_volume", 1.0),
+            "live_audio_loopback_volume": self.config.get("live_audio_loopback_volume", 0.7),
+        }
+
+    def set_live_audio_bg_source(self, source: str):
+        """ライブ音声の背景を切り替える。想定外の値は無視して現状を返す。"""
+        if source in ("standby", "slideshow"):
+            self.config["live_audio_bg_source"] = source
+            self.save_config()
+            self.request_stream_reload()
+        return self.config.get("live_audio_bg_source", "standby")
+
+    def set_screen_capture_source(self, source_type=None, display_index=None, window_title=None,
+                                  framerate=None, width=None, height=None,
+                                  draw_mouse=None, bitrate_kbps=None):
+        """画面キャプチャ設定（入力ソース・フレームレート・解像度等）を更新"""
+        if source_type in ("display", "window"):
+            self.config["screen_capture_source_type"] = source_type
+        if display_index is not None:
+            try:
+                idx = int(display_index)
+                self.config["screen_capture_display_index"] = max(0, min(7, idx))
+            except (TypeError, ValueError):
+                pass
+        if window_title is not None:
+            new_title = str(window_title)
+            # 選び直したらハンドルも取り直す（前のウィンドウを掴み続けない）
+            if new_title != self.config.get("screen_capture_window_title"):
+                self._screen_capture_hwnd = None
+            self.config["screen_capture_window_title"] = new_title
+            found = find_capture_window(new_title) if new_title else None
+            self._screen_capture_hwnd = found.get("hwnd") if found else None
+        if framerate is not None:
+            try:
+                fps = int(framerate)
+                self.config["screen_capture_framerate"] = max(1, min(60, fps))
+            except (TypeError, ValueError):
+                pass
+        if width is not None:
+            try:
+                w = int(width)
+                w_clamped = max(320, min(3840, w))
+                self.config["screen_capture_width"] = even_dimension(w_clamped)
+            except (TypeError, ValueError):
+                pass
+        if height is not None:
+            try:
+                h = int(height)
+                h_clamped = max(240, min(2160, h))
+                self.config["screen_capture_height"] = even_dimension(h_clamped)
+            except (TypeError, ValueError):
+                pass
+        if draw_mouse is not None:
+            self.config["screen_capture_draw_mouse"] = bool(draw_mouse)
+        if bitrate_kbps is not None:
+            try:
+                b = int(bitrate_kbps)
+                self.config["screen_capture_bitrate_kbps"] = max(500, min(20000, b))
+            except (TypeError, ValueError):
+                pass
+
+        self.save_config()
+        self.request_stream_reload()
+        return {
+            "source_type": self.config.get("screen_capture_source_type", "display"),
+            "display_index": self.config.get("screen_capture_display_index", 0),
+            "window_title": self.config.get("screen_capture_window_title", ""),
+            "framerate": self.config.get("screen_capture_framerate", 30),
+            "width": self.config.get("screen_capture_width", 1920),
+            "height": self.config.get("screen_capture_height", 1080),
+            "draw_mouse": self.config.get("screen_capture_draw_mouse", True),
+            "bitrate_kbps": self.config.get("screen_capture_bitrate_kbps", 4000),
+        }
+
+    def play_live_audio(self):
+        """PC音声・マイク（dshow経路）を静止画背景でHLS/RTMPライブ配信"""
+        mic_dev = str(self.config.get("live_audio_mic_device", "")).strip()
+        loop_dev = str(self.config.get("live_audio_loopback_device", "")).strip()
+        # タスク25: アプリ音声だけでも成立するので、3つとも無いときだけ弾く。
+        app_on = bool(self.config.get("live_audio_app_enabled", False))
+        if not mic_dev and not loop_dev and not app_on:
+            log_print("[Player] Live audio capture warning: No devices selected")
+            self.status = "error"
+            self.status_detail = "ライブ音声デバイスが未選択です"
+            return None
+
+        if not self.ensure_stream_sink():
+            self.status = "error"
+            self.status_detail = "FFmpeg Error"
+            return None
+
+        # 背景。ラジオと同じ仕組みで「待機画面」か「スライドショー」を選べる。
+        # ★スライドショーは ffconcat + -stream_loop -1 で ffmpeg 自身が巡回するので、
+        #   写真を送るために配信を張り直す必要がない。終わりのないライブ音声に向く。
+        bg_source = str(self.config.get("live_audio_bg_source", "standby"))
+        auto_advance = bool(self.config.get("image_auto_advance", False)) and not self.image_paused
+
+        slideshow_manifest_path = None
+        if bg_source == "slideshow" and auto_advance:
+            slideshow_manifest_path = self.build_slideshow_manifest(
+                track_seconds=0, label="LiveAudio",
+                manifest_name="slideshow_manifest_live.txt")
+
+        if slideshow_manifest_path:
+            # ★concat 入力に -re を付けてはいけない。付けると送出FFmpegが数秒で死に、
+            #   再起動を繰り返してアプリ音声が流れなくなる。FFmpeg自身は
+            #   「[dec:png] Decoding error: Invalid data found」を出しており、
+            #   ループで画像を読み直す時に前処理PNGの書き込みと噛み合っていると見られる。
+            #   実測（同一ビルドで -re の有無だけ変更・配布物で確認）:
+            #     -re あり -> 入力レベル 0/12 秒（死亡）
+            #     -re なし -> 入力レベル 12/12 秒（正常）
+            #   ラジオの concat にも -re は付いていない。
+            video_input_opts = [
+                "-stream_loop", "-1",
+                "-f", "concat", "-safe", "0",
+                "-i", os.path.abspath(slideshow_manifest_path)
+            ]
+        else:
+            # スライドショー指定でも、写真が無い/自動送りOFFなら1枚で見せる。
+            bg_image_path = None
+            if bg_source == "slideshow":
+                images = self.get_slideshow_images()
+                if images:
+                    bg_image_path = self.get_image_for_playback(images[0])
+            # 待機画面。generate_standby_image() は描画に失敗しても例外を出さず
+            # 進むことがあるため、パスの実在をここで必ず確かめる。None を
+            # os.path.abspath() に渡すと TypeError で監視ループ側に飛ぶ。
+            if not bg_image_path:
+                bg_image_path = self.generate_standby_image()
+            if not bg_image_path or not os.path.exists(bg_image_path):
+                log_print(f"[Player] Live audio: background image unavailable ({bg_image_path})")
+                self.status = "error"
+                self.status_detail = "Live audio: background image unavailable"
+                return None
+            video_input_opts = ["-re", "-loop", "1", "-i", os.path.abspath(bg_image_path)]
+
+        has_clock = bool(self.config.get("overlay_clock_enabled", False) or self.config.get("overlay_clock_video", False))
+        clock_filter = get_clock_filter_for_config(self.config) if has_clock else None
+
+        mic_vol = self.config.get("live_audio_mic_volume", 1.0)
+        loop_vol = self.config.get("live_audio_loopback_volume", 0.7)
+
+        app_helper = self.start_app_audio_capture()
+        app_vol = self.config.get("live_audio_app_volume", 1.0)
+
+        input_args, audio_filter, audio_map = build_audio_inputs(
+            app_enabled=bool(app_helper),
+            app_volume=app_vol,
+            mic_device=mic_dev,
+            loopback_device=loop_dev,
+            mic_volume=mic_vol,
+            loopback_volume=loop_vol,
+            start_index=1
+        )
+
+        # ★入口のガードは「設定上どれか有効か」しか見ていない。アプリ音声だけを
+        #   有効にしていて、いざ始める段になって対象ウィンドウが見つからない
+        #   （補助exeが起動できない）と、ここで音声入力がゼロになる。
+        #   そのまま進むと "-map None" という壊れたコマンドをFFmpegに渡し、
+        #   何が悪いのか分からないまま配信が失敗していた。
+        #   ★画面共有と違い、ここは音声だけのモード。無音を流しても意味が無く、
+        #     機能が壊れているように見えるだけなので、理由を出して止める。
+        if not audio_map:
+            log_print("[Player] Live audio: 利用できる音声ソースがありません")
+            kill_proc(app_helper)
+            self.status = "error"
+            self.status_detail = "音声ソースが利用できません（対象ウィンドウやデバイスを確認してください）"
+            return None
+
+        cmd = [get_ffmpeg_cmd()] + video_input_opts
+        cmd.extend(input_args)
+
+        if audio_filter and (has_clock and clock_filter):
+            cmd.extend(["-filter_complex", f"[0:v]{clock_filter}[vout];{audio_filter}", "-map", "[vout]", "-map", audio_map])
+        elif audio_filter and not (has_clock and clock_filter):
+            cmd.extend(["-filter_complex", audio_filter, "-map", "0:v:0", "-map", audio_map])
+        elif not audio_filter and (has_clock and clock_filter):
+            cmd.extend(["-vf", clock_filter, "-map", "0:v:0", "-map", audio_map])
+        else:
+            cmd.extend(["-map", "0:v:0", "-map", audio_map])
+
+        bitrate_kbps = str(int(self.config.get("live_audio_bitrate_kbps", 192)))
+        cmd.extend([
+            *build_video_encoder_opts(
+                self.get_video_encoder(),
+                v_kbps=800, max_kbps=1000, buf_kbps=800,
+                h264_profile="baseline", sc_threshold_zero=True,
+                gop_frames=15, fps=5),
+            "-c:a", "aac",
+            "-b:a", f"{bitrate_kbps}k",
+            "-ar", "44100",
+            "-fflags", "+nobuffer+flush_packets",
+            "-flush_packets", "1",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-max_interleave_delta", "0",
+            *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"
+        ])
+
+        log_print(f"[Player] Encoder path=live_audio mic='{mic_dev}' loopback='{loop_dev}' "
+                  f"mic_vol={mic_vol} loopback_vol={loop_vol} b:a={bitrate_kbps}k "
+                  f"bg={'slideshow(concat)' if slideshow_manifest_path else bg_source + '(still)'}")
+
+        try:
+            # ★stderr を捨てない。今回、送出FFmpegが即死する不具合を追ったとき、
+            #   ここを DEVNULL にしていたせいで「なぜ死んだか」を誰も知り得なかった。
+            proc = subprocess.Popen(
+                cmd,
+                stdin=(app_helper.stdout if app_helper else subprocess.DEVNULL),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=0,
+                creationflags=CREATE_NO_WINDOW
+            )
+        except Exception as e:
+            log_print(f"[Player] Error starting live audio sender: {e}")
+            kill_proc(app_helper)
+            self.status = "error"
+            self.status_detail = f"Live audio sender error: {e}"
+            return None
+
+        with self.process_lock:
+            self.send_proc = proc
+
+        # ★親側の読み口は閉じる。閉じないと補助exeが終わってもEOFが伝わらない。
+        if app_helper and app_helper.stdout:
+            try:
+                app_helper.stdout.close()
+            except Exception:
+                pass
+        if app_helper:
+            threading.Thread(target=self.reap_app_audio_helper,
+                             args=(proc, app_helper), daemon=True).start()
+
+        threading.Thread(target=self.pump_sender_stderr,
+                         args=(proc, "live_audio"), daemon=True).start()
+
+        stop_event = threading.Event()
+        threading.Thread(target=self.relay_stream_data,
+                         args=(proc, self.current_stdin, stop_event, False), daemon=True).start()
+        threading.Thread(target=self.watch_send_proc,
+                         args=(proc, stop_event), daemon=True).start()
+        return stop_event
+
+    def play_screen_capture(self):
+        """ホストPCの画面（ディスプレイ or ウィンドウ）を音声つきでライブ配信"""
+        source_type = self.config.get("screen_capture_source_type", "display")
+        display_index = self.config.get("screen_capture_display_index", 0)
+        window_title = self.config.get("screen_capture_window_title", "")
+        framerate = self.config.get("screen_capture_framerate", 30)
+        width = self.config.get("screen_capture_width", 1920)
+        height = self.config.get("screen_capture_height", 1080)
+        draw_mouse = self.config.get("screen_capture_draw_mouse", True)
+        bitrate_kbps = self.config.get("screen_capture_bitrate_kbps", 4000)
+
+        win = None
+        if source_type == "window":
+            if not window_title:
+                self.status = "error"
+                self.status_detail = "キャプチャ対象のウィンドウが未選択です"
+                return None
+            # ★同一性はハンドルで持つ。タイトルで引き直すと、YouTubeが次の動画へ
+            #   進んだだけで見失う（実測: 配信開始12秒で停止し、以後15秒間隔で
+            #   失敗し続けた）。ハンドルが生きている限り、タイトルが変わっても
+            #   「利用者が選んだそのウィンドウ」を追い続ける。
+            win = get_window_rect_by_hwnd(getattr(self, "_screen_capture_hwnd", None))
+            if win is None:
+                win = find_capture_window(window_title)
+                if win is not None:
+                    self._screen_capture_hwnd = win.get("hwnd")
+            elif win.get("title") and win["title"] != window_title:
+                log_print(f"[Player] Screen capture window title changed: "
+                          f"'{window_title}' -> '{win['title']}' (ハンドルで追跡継続)")
+            if win is None:
+                log_print(f"[Player] Screen capture window not found: '{window_title}'")
+                self.status = "error"
+                self.status_detail = f"ウィンドウが見つかりません: {window_title}"
+                return None
+
+        if not self.ensure_stream_sink():
+            self.status = "error"
+            self.status_detail = "FFmpeg Error"
+            return None
+
+        has_clock = bool(self.config.get("overlay_clock_enabled", False) or self.config.get("overlay_clock_video", False))
+        clock_filter = get_clock_filter_for_config(self.config) if has_clock else None
+
+        mic_dev = self.config.get("live_audio_mic_device", "")
+        loop_dev = self.config.get("live_audio_loopback_device", "")
+        mic_vol = self.config.get("live_audio_mic_volume", 1.0)
+        loop_vol = self.config.get("live_audio_loopback_volume", 0.7)
+
+        # タスク25: アプリ単位の音声。使えないときは None が返り、従来の dshow 経路だけになる。
+        app_helper = self.start_app_audio_capture()
+        app_vol = self.config.get("live_audio_app_volume", 1.0)
+
+        input_args_a, audio_filter, audio_map = build_audio_inputs(
+            app_enabled=bool(app_helper),
+            app_volume=app_vol,
+            mic_device=mic_dev,
+            loopback_device=loop_dev,
+            mic_volume=mic_vol,
+            loopback_volume=loop_vol,
+            start_index=1
+        )
+
+        # ★ウィンドウ矩形は「配信を始める瞬間」の値を使う。以降ウィンドウを
+        #   動かしても切り出し位置は追従しない（追従させるには送出の張り直しが
+        #   要り、そのたびに画が飛ぶ）。動かしたら「適用」で取り直す運用にする。
+        # ★配信先がRTMP系ならシンクが必ず作り直すので、それを超える寸法で送らない。
+        if self.get_active_output_mode() in RTMP_OUTPUT_MODES:
+            dest_w = self.config.get("rtmp_video_width", 1280)
+            dest_h = self.config.get("rtmp_video_height", 720)
+            capped_w, capped_h = clamp_capture_size_to_destination(width, height, dest_w, dest_h)
+            if (capped_w, capped_h) != (width, height):
+                log_print(f"[Player] Screen capture size capped to destination: "
+                          f"{width}x{height} -> {capped_w}x{capped_h}")
+                width, height = capped_w, capped_h
+
+        window_plan = resolve_window_capture_plan(win) if win else None
+        if source_type == "window" and window_plan is None:
+            log_print("[Player] Screen capture: could not resolve window capture plan.")
+            kill_proc(app_helper)   # ここで抜けるなら補助exeも道連れにする
+            self.status = "error"
+            self.status_detail = "ウィンドウの取り込み方を決められませんでした"
+            return None
+
+        input_args_v, needs_hwdownload = build_screen_capture_input(
+            source_type=source_type,
+            display_index=display_index,
+            window_title=window_title,
+            framerate=framerate,
+            draw_mouse=draw_mouse,
+            window_plan=window_plan
+        )
+        if window_plan:
+            log_print(f"[Player] Window capture via {window_plan[0]} {window_plan[1:]}")
+
+        # ★音声デバイスが未設定でも**無音トラックを必ず載せる**。
+        #   映像だけのストリームにすると HLS(-c copy) では再生できるのに、
+        #   RTMP/FLV 経由（TopazChat -> VRChat/AVPro）でカクついて見える。
+        #   待機画面・ラジオなど他のモードは元から anullsrc を入れており、
+        #   画面共有だけが「音声トラックの無いストリーム」を送る唯一の例外だった。
+        silent_audio = not audio_map
+        if silent_audio:
+            input_args_a = ["-f", "lavfi", "-i",
+                            "anullsrc=channel_layout=stereo:sample_rate=44100"]
+
+        cmd = [get_ffmpeg_cmd()] + input_args_v + input_args_a
+
+        video_chain = build_screen_video_filter(needs_hwdownload, width, height, clock_filter)
+
+        if audio_filter:
+            cmd.extend(["-filter_complex", f"{video_chain};{audio_filter}"])
+        else:
+            cmd.extend(["-filter_complex", video_chain])
+
+        cmd.extend(["-map", "[vout]"])
+        if audio_map:
+            cmd.extend(["-map", audio_map])
+        else:
+            # 無音入力は映像の次（index 1）に入る
+            cmd.extend(["-map", "1:a"])
+
+        try:
+            fps = int(framerate)
+        except (TypeError, ValueError):
+            fps = 30
+        fps = max(1, min(60, fps))
+
+        try:
+            b_kbps = int(bitrate_kbps)
+        except (TypeError, ValueError):
+            b_kbps = 4000
+        b_kbps = max(500, min(20000, b_kbps))
+
+        cmd.extend([
+            *build_video_encoder_opts(
+                self.get_video_encoder(),
+                v_kbps=b_kbps, max_kbps=int(b_kbps * 1.15), buf_kbps=b_kbps,
+                h264_profile="baseline", sc_threshold_zero=True,
+                # ★GOPは必ず1秒。hls_segment_time(既定3秒)を割り切れる値でないと、
+                #   HLSはキーフレームでしか切れないためセグメント長が振れる。
+                #   実測: GOP2秒だと 120/60/120/60 フレーム＝4秒・2秒・4秒・2秒に
+                #   なり、再生側にはカクつきとして出た。1秒にすると 90 フレーム
+                #   ＝3.0秒でぴたりと揃う。他の再生モードも1秒で揃えている。
+                gop_frames=fps, fps=fps)
+        ])
+
+        cmd.extend(["-c:a", "aac", "-b:a", "192k" if audio_map else "64k", "-ar", "44100"])
+
+        cmd.extend([
+            "-fflags", "+nobuffer+flush_packets", "-flush_packets", "1",
+            "-muxdelay", "0", "-muxpreload", "0", "-max_interleave_delta", "0",
+            *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"
+        ])
+
+        log_print(f"[Player] Encoder path=screen_capture source={source_type} display={display_index} window='{window_title}' fps={fps} size={width}x{height} b:v={b_kbps}k")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=(app_helper.stdout if app_helper else subprocess.DEVNULL),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0,
+                creationflags=CREATE_NO_WINDOW
+            )
+        except Exception as e:
+            log_print(f"[Player] Error starting screen capture sender: {e}")
+            kill_proc(app_helper)
+            self.status = "error"
+            self.status_detail = f"Screen capture sender error: {e}"
+            return None
+
+        with self.process_lock:
+            self.send_proc = proc
+
+        # ★親側の読み口は閉じる。閉じないと補助exeが終わってもEOFが伝わらない。
+        if app_helper and app_helper.stdout:
+            try:
+                app_helper.stdout.close()
+            except Exception:
+                pass
+        if app_helper:
+            threading.Thread(target=self.reap_app_audio_helper,
+                             args=(proc, app_helper), daemon=True).start()
 
         stop_event = threading.Event()
         threading.Thread(target=self.relay_stream_data,
@@ -3113,6 +5024,12 @@ class StreamerCore:
 
     def generate_qr_overlay_image(self):
         """動画・写真ストリーム上に重ねて表示するQRコードカード (RGBA) を生成（右下コンパクト/フル画面）"""
+        # ホスト専用モードではQRは焼かない。ここが唯一の生成口なので、
+        # 呼び出し側（動画・写真・ラジオ・待機画面）を1つずつ直す必要はない。
+        # 呼び出し側はいずれも None を「オーバーレイ無し」として扱える作りになっている。
+        if not self.is_web_remote_enabled():
+            return None
+
         is_tunnel_ready = bool(self.tunnel_raw_url and "trycloudflare.com" in self.tunnel_raw_url)
         is_tunnel_enabled = getattr(self, "enable_tunnel", True)
         port = self.config.get("port", 8000)
@@ -3335,6 +5252,11 @@ class StreamerCore:
     def generate_standby_image(self, notice_text=None):
         """待機用画面（固定画像またはQRコード & URL付き 1920x1080）を生成して保存"""
         standby_mode = self.config.get("standby_mode", "image")
+        # QR案内画面は「このURLへスマホでアクセスして」という画面そのもの。
+        # ホスト専用モードでは誰もアクセスできないので、固定画像モードへ倒す。
+        if standby_mode == "qr" and not self.is_web_remote_enabled():
+            log_print("[Core] Web remote is disabled; standby QR screen falls back to image mode.")
+            standby_mode = "image"
 
         if standby_mode == "image":
             # ==================== 固定画像モード (デフォルト) ====================
@@ -3389,7 +5311,7 @@ class StreamerCore:
                         final_img = self._draw_notice_banner(final_img, notice_text)
 
                     final_img.save(STANDBY_IMAGE_PATH, "PNG")
-                    return
+                    return STANDBY_IMAGE_PATH
                 except Exception as e:
                     log_print(f"[Core] Error rendering custom standby image ({target_image_path}): {e}")
 
@@ -3426,7 +5348,7 @@ class StreamerCore:
                 img.save(STANDBY_IMAGE_PATH, "PNG")
             except Exception as e:
                 log_print(f"[Core] Failed to save fallback standby image: {e}")
-            return
+            return STANDBY_IMAGE_PATH
 
         # ==================== QRコード & URL 案内画面モード ====================
         is_tunnel_ready = bool(self.tunnel_raw_url and "trycloudflare.com" in self.tunnel_raw_url)
@@ -3559,14 +5481,48 @@ class StreamerCore:
             img.save(STANDBY_IMAGE_PATH, "PNG")
         except Exception as e:
             log_print(f"[Core] Failed to save standby image: {e}")
+        return STANDBY_IMAGE_PATH
 
-    def play_standby_loop(self, empty_slideshow=False):
-        """キューが空、またはスライドショー写真未登録時に待機画面（QRコード・URL付き静止画）をHLS配信"""
+    def screen_capture_source_available(self):
+        """画面共有の取り込み対象が今この瞬間に掴めるか。"""
+        if str(self.config.get("screen_capture_source_type", "display")) != "window":
+            return True
+        if get_window_rect_by_hwnd(getattr(self, "_screen_capture_hwnd", None)):
+            return True
+        title = str(self.config.get("screen_capture_window_title", "")).strip()
+        if not title:
+            return False
+        found = find_capture_window(title)
+        if found:
+            self._screen_capture_hwnd = found.get("hwnd")
+            return True
+        return False
+
+    def play_standby_loop(self, empty_slideshow=False, screen_unavailable=False):
+        """キューが空、スライドショー写真未登録、または画面共有の対象が見つからないときに
+        待機画面（QRコード・URL付き静止画）をHLS配信する。
+
+        ★画面共有で対象を見失ったときに「何も送らない」を選んではいけない。
+          ワールド側は映像が来ないだけで、利用者からは配信そのものが死んだように見える
+          （実機で実際にそうなった）。待機画面を出し続け、対象が戻れば自動で復帰する。
+        """
         last_tunnel_url = self.tunnel_raw_url
-        notice_text = "📷 スライドショー写真が未登録です（Webリモコンから写真をアップロードできます）" if empty_slideshow else None
+        if empty_slideshow:
+            notice_text = "📷 スライドショー写真が未登録です（Webリモコンから写真をアップロードできます）"
+        elif screen_unavailable:
+            notice_text = "🖥️ 画面共有: 共有対象のウィンドウが見つかりません（Webリモコンで選び直してください）"
+        else:
+            notice_text = None
 
         while self.is_running and not self.skip_event.is_set():
-            if empty_slideshow:
+            if screen_unavailable:
+                if self.get_playback_mode() != "screen":
+                    break
+                if self.screen_capture_source_available():
+                    break
+                self.status = "offline"
+                self.status_detail = "画面共有: 対象が見つかりません（待機画面を配信中）"
+            elif empty_slideshow:
                 if self.get_playback_mode() != "slideshow":
                     break
                 with self.photo_lock:
@@ -3575,7 +5531,10 @@ class StreamerCore:
                 self.status = "offline"
                 self.status_detail = "Slideshow (No Photos — Standby Notice)"
             else:
-                if self.get_playback_mode() == "slideshow":
+                # 実時間ソースのモードへ切り替えたら待機ループから抜ける。
+                # ここを slideshow だけにしていると、切り替えても待機画面が
+                # 出続けて「切り替わらない」ように見える。
+                if self.get_playback_mode() in ("slideshow", "live", "screen"):
                     break
                 with self.queue_lock:
                     if len(self.play_queue) > 0:
@@ -3607,20 +5566,11 @@ class StreamerCore:
             if has_clock and clock_filter:
                 cmd.extend(["-vf", clock_filter])
             cmd.extend([
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-profile:v", "baseline",
-                "-level", "3.1",
-                "-bf", "0",
-                "-g", "30",
-                "-keyint_min", "30",
-                "-sc_threshold", "0",
-                "-pix_fmt", "yuv420p",
-                "-r", "30",
-                "-b:v", "1500k",
-                "-maxrate", "1500k",
-                "-bufsize", "1000k",
+                *build_video_encoder_opts(
+                    self.get_video_encoder(),
+                    v_kbps=1500, max_kbps=1500, buf_kbps=1000,
+                    h264_profile="baseline", sc_threshold_zero=True,
+                    gop_frames=30, fps=30),
                 "-c:a", "aac", "-b:a", "64k",
                 "-fflags", "+nobuffer+flush_packets",
                 "-flush_packets", "1",
@@ -3696,6 +5646,155 @@ class StreamerCore:
         while self.is_running:
             try:
                 current_mode = self.get_playback_mode()
+
+                # ==================== モード0: ライブ音声取り込み ====================
+                if current_mode == "live":
+                    self.current_video = {"title": "ライブ音声取り込み", "url": "", "duration": 0, "type": "live_audio"}
+                    self.skip_event.clear()
+                    self.video_done_event.clear()
+                    self.status = "streaming"
+                    self.status_detail = "Live audio capture"
+
+                    # ★ライブモードには「曲の終わり」が無いので、失敗しても
+                    # すぐ同じ分岐へ戻ってくる。デバイスが掴めない状態
+                    # （抜かれた・他アプリが排他で握っている）だと ffmpeg が
+                    # 即死し、0.1秒間隔でプロセスを生成し続ける暴走になる。
+                    # 短命で終わった回数に応じて待ち時間を伸ばす。
+                    fail_streak = getattr(self, "_live_audio_fail_streak", 0)
+                    live_started_at = time.time()
+
+                    stop_event = self.play_live_audio()
+                    if stop_event is None:
+                        self._live_audio_fail_streak = min(fail_streak + 1, 10)
+                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                        continue
+
+                    while self.is_running and not self.skip_event.is_set():
+                        if self.get_playback_mode() != "live":
+                            break
+
+                        if self._reload_due():
+                            self.reload_stream_event.clear()
+                            stop_event.set()
+                            with self.process_lock:
+                                if self.send_proc:
+                                    kill_proc(self.send_proc)
+                                self.send_proc = None
+                            time.sleep(0.2)
+                            break
+
+                        with self.process_lock:
+                            proc = self.send_proc
+                            h_proc = self.hls_proc
+
+                        if proc and proc.poll() is not None:
+                            log_print(f"[Monitor] Live audio sender exited (exit={proc.returncode}).")
+                            self.status = "error"
+                            self.status_detail = "Live audio sender exited (check capture device)"
+                            break
+
+                        if h_proc and h_proc.poll() is not None:
+                            log_print("[Monitor] Receiver FFmpeg crashed or exited during live audio.")
+                            self.status = "error"
+                            self.status_detail = "Offline (Receiver Error)"
+                            break
+
+                        time.sleep(0.2)
+
+                    stop_event.set()
+                    with self.process_lock:
+                        if self.send_proc:
+                            kill_proc(self.send_proc)
+                        self.send_proc = None
+
+                    self.accumulated_pts += self.last_stream_duration + 0.1
+                    if self.skip_event.is_set():
+                        self.skip_event.clear()
+                    self.video_done_event.clear()
+
+                    # 3秒未満で終わった＝掴めていない。連続したぶんだけ待つ。
+                    if (time.time() - live_started_at) < 3.0:
+                        self._live_audio_fail_streak = min(fail_streak + 1, 10)
+                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                    else:
+                        self._live_audio_fail_streak = 0
+                        time.sleep(0.1)
+                    continue
+
+                # ==================== モード0b: 画面共有 ====================
+                if current_mode == "screen":
+                    self.current_video = {"title": "画面共有", "url": "", "duration": 0, "type": "screen_capture"}
+                    self.skip_event.clear()
+                    self.video_done_event.clear()
+                    self.status = "streaming"
+                    self.status_detail = "Screen capture"
+
+                    fail_streak = getattr(self, "_screen_capture_fail_streak", 0)
+                    screen_started_at = time.time()
+
+                    stop_event = self.play_screen_capture()
+                    if stop_event is None:
+                        self._screen_capture_fail_streak = min(fail_streak + 1, 10)
+                        # ★無映像のまま放置しない。待機画面を出し続け、対象が
+                        #   戻ってきたら自動で復帰する（この関数は対象が掴めた
+                        #   時点で抜ける）。実機で「配信自体が死ぬ」と見えたのは
+                        #   ここで何も送っていなかったため。
+                        self.current_video = {"title": "画面共有（対象を待機中）", "url": "",
+                                              "duration": 0, "type": "screen_capture"}
+                        self.play_standby_loop(screen_unavailable=True)
+                        time.sleep(min(0.5 + fail_streak * 0.5, 5.0))
+                        continue
+
+                    while self.is_running and not self.skip_event.is_set():
+                        if self.get_playback_mode() != "screen":
+                            break
+
+                        if self._reload_due():
+                            self.reload_stream_event.clear()
+                            stop_event.set()
+                            with self.process_lock:
+                                if self.send_proc:
+                                    kill_proc(self.send_proc)
+                                self.send_proc = None
+                            time.sleep(0.2)
+                            break
+
+                        with self.process_lock:
+                            proc = self.send_proc
+                            h_proc = self.hls_proc
+
+                        if proc and proc.poll() is not None:
+                            log_print(f"[Monitor] Screen capture sender exited (exit={proc.returncode}).")
+                            self.status = "error"
+                            self.status_detail = "Screen capture sender exited"
+                            break
+
+                        if h_proc and h_proc.poll() is not None:
+                            log_print("[Monitor] Receiver FFmpeg crashed or exited during screen capture.")
+                            self.status = "error"
+                            self.status_detail = "Offline (Receiver Error)"
+                            break
+
+                        time.sleep(0.2)
+
+                    stop_event.set()
+                    with self.process_lock:
+                        if self.send_proc:
+                            kill_proc(self.send_proc)
+                        self.send_proc = None
+
+                    self.accumulated_pts += self.last_stream_duration + 0.1
+                    if self.skip_event.is_set():
+                        self.skip_event.clear()
+                    self.video_done_event.clear()
+
+                    if (time.time() - screen_started_at) < 3.0:
+                        self._screen_capture_fail_streak = min(fail_streak + 1, 10)
+                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                    else:
+                        self._screen_capture_fail_streak = 0
+                        time.sleep(0.1)
+                    continue
 
                 # ==================== モード1: 写真スライドショー ====================
                 if current_mode == "slideshow":

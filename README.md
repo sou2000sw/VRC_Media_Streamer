@@ -48,6 +48,7 @@ AIバイブコーディング製のため手厚いサポートはできません
   UIに必要な部品（CSS・アイコン・プレイヤー）はすべてEXEに同梱されているため、ホストPCがインターネットに繋がっていない場面や、外部CDNが遮断された回線でも画面が崩れません。
 * **📻 BGM / ラジオモード（超低帯域配信 & サムネイル自動生成）**
   YouTube動画から高音質音声ストリームのみを抽出し、自動生成された「サムネイル＆楽曲情報カード画面」（または待機画面/写真スライドショー）と合成して超低帯域（約250〜350kbps、通常動画比90%以上削減）でHLS配信。VRChatでのバッファ詰まりや多人数インスタンスでの遅延を極小化します。
+  曲の変わり目は、頭をフェードイン・終わりをフェードアウトして滑らかに繋ぎます（既定3秒 / `config.json` の `radio_crossfade_duration` で 0〜5秒。0で無効）。
 * **🖼️ 写真・画像アップロード＆スライドショー配信**
   スマホやPCから複数枚の画像（JPEG, PNG, WebP等）をまとめてキューへ追加可能。表示秒数切り替え（5s〜120s）や自動送りON/OFFをGUI/Webリモコンからリアルタイム操作できます。
 * **🎬 ローカル動画ファイルの配信（MP4 / MOV / WebM 等）**
@@ -66,6 +67,10 @@ AIバイブコーディング製のため手厚いサポートはできません
   - Webリモコン（ゲスト側）には**「配信・QR設定」タブを一切出しません**。ストリームキー・パスワード・権限設定が読めてしまうためで、`/api/status` でもストリームキーはゲストには伏せ字で返します。
   - リモコンURLと共有QRを載せた「接続 & スマホ共有」タブは**既定で非公開**。ホストが `allow_web_share_info` を有効にしたときだけゲストに表示されます（`/api/qrcode` も同じ判定で 403）。
   - 許可フラグが取得できない場合は**非表示側に倒す**（fail-closed）設計です。
+  - **🛡️ ホスト専用モード**: `enable_web_remote: false`（設定画面のトグル、または起動時の `--host-only`）で、
+    ホストPC以外からのリモコン画面・APIを**すべて 403 で遮断**します。QRオーバーレイと待機画面のQR案内も自動で消えます。
+    VRChatが再生に使う `stream.m3u8` / `*.ts` だけは開けたままなので、**配信は止まりません**
+    （逆に、視聴そのものを止めたい場合はRTMP押し出し + トンネル無効を選んでください）。
 * **🎬 多様な動画元・SNSプラットフォームに対応（実機検証済み）**
   YouTube動画だけでなく、YouTubeショート、YouTubeライブ、X（旧Twitter）動画、Instagramリール動画等、幅広いWeb動画の再生に対応しています。
 
@@ -233,10 +238,12 @@ VRC_Media_Streamer.exe --set loop_queue=true --set image_display_duration=30
   "image_auto_advance": false,
   "overlay_qr_enabled": false,
   "overlay_qr_mode": "bottom-right",
+  "enable_web_remote": true,
   "permissions": {
     "allow_web_queue_add": true,
     "allow_web_queue_edit": true,
-    "allow_web_playback_control": true
+    "allow_web_playback_control": true,
+    "enable_web_remote": true
   }
 }
 ```

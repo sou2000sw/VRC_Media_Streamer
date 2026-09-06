@@ -8,8 +8,8 @@ import threading
 import time
 import ipaddress
 import hmac
-from urllib.parse import urlparse
-from streamer_core import BASE_PATH, HLS_DIR, StreamerCore, log_print, is_video_url_or_file, is_image_url_or_file
+from urllib.parse import urlparse, parse_qs
+from streamer_core import BASE_PATH, HLS_DIR, StreamerCore, log_print, is_video_url_or_file, is_image_url_or_file, enumerate_dshow_audio_devices, enumerate_capture_displays, enumerate_capture_windows
 from version import APP_VERSION
 
 def _ui_html_candidates():
@@ -286,6 +286,30 @@ def parse_multipart_file(body_bytes, content_type_header):
             return file_data, filename
     return None, None
 
+# ホスト専用モード（enable_web_remote:false）で、ゲストに返す案内ページ。
+# トンネル経由で不特定多数が見るため、バージョン・機器名・URLは一切載せない。
+# 同梱アセット (/vendor/*) も無効時は塞ぐので、CSSはここに直書きする。
+HOST_ONLY_NOTICE_HTML = """<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>403 Forbidden</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{display:flex;align-items:center;justify-content:center;
+       background:#0F172A;color:#E2E8F0;
+       font-family:system-ui,-apple-system,"Segoe UI","Hiragino Kaku Gothic ProN",sans-serif}
+  .card{max-width:30rem;padding:2rem;text-align:center;line-height:1.7}
+  h1{margin:0 0 1rem;font-size:1.15rem;color:#38BDF8}
+  p{margin:.4rem 0;font-size:.9rem;color:#94A3B8}
+</style></head>
+<body><div class="card">
+<h1>&#x1F6E1;&#xFE0F; リモート操作は無効になっています</h1>
+<p>この配信はホスト専用モードで動作しており、ホストPC以外からの操作は受け付けていません。</p>
+<p>映像・音声の配信は通常どおり続いています。</p>
+</div></body></html>
+"""
+
+
 class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
     # MIMEタイプの明示（Windows等で .ts が text/plain になる問題やプレイヤー互換性を防止）
     extensions_map = {
@@ -398,6 +422,99 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
         if not self._host_header_is_safe():
             log_print(f"[APIServer] Rejected local privilege: suspicious Host {self.headers.get('Host')!r}")
             return False
+        return True
+
+    def web_remote_enabled(self):
+        """Webリモコン（ゲスト向けの画面とAPI）を開いているか。タスク21。
+
+        未設定は True。既存の config.json にはこのキーが無く、
+        fail-closed にすると更新しただけで全員のリモコンが黙って死ぬ。
+        「閉じる」は利用者が明示的に選んだときだけ。
+        """
+        if not self.streamer_core:
+            return True
+        return bool(self.streamer_core.config.get("enable_web_remote", True))
+
+    def _client_is_strict_loopback(self):
+        """ホスト専用モードで唯一通す相手＝ホストPC本人か。
+
+        is_local_request() をそのまま使わないのは trust_lan_clients を見ないため。
+        「ホスト専用」を選んだ利用者にとって、同一LANの別端末も"他人"である。
+
+        中継ヘッダの確認は必須。cloudflared はこのPCの 127.0.0.1 へ繋いでくるので、
+        接続元IPだけを見るとトンネル経由の全員がホスト扱いになり、ゲートが素通りする。
+        """
+        if "cf-connecting-ip" in self.headers or "x-forwarded-for" in self.headers:
+            return False
+        client_ip = self.client_address[0] if self.client_address else ""
+        if client_ip not in ("127.0.0.1", "::1", "localhost"):
+            return False
+        # ホスト本人のブラウザでも、外部サイトに埋め込まれた状態からの呼び出しは通さない
+        if not self._origin_is_self():
+            return False
+        if not self._host_header_is_safe():
+            return False
+        return True
+
+    def _is_media_path(self, path):
+        """VRChatのプレイヤーが再生に使うファイルか（ホスト専用モードでも開けておく対象）。
+
+        許可リスト方式。HLS_DIR には写真プール (/images/*) も同居しており、
+        「静的ファイルなら通す」にすると共有済みの写真まで外へ出る。
+        """
+        return path.lower().endswith((".m3u8", ".ts", ".m4s", ".mp4", ".aac"))
+
+    def _wants_ui_document(self, path, accept_header):
+        """ブラウザがリモコン画面（HTML）を開こうとしているか。
+
+        /stream.m3u8 はアドレスバー直打ちのときだけ画面を返し、
+        プレイヤー・XHR からのリクエストにはマニフェストを返す。
+        """
+        if path == "/":
+            return True
+        if path != "/stream.m3u8":
+            return False
+        return (
+            "text/html" in accept_header
+            and self.headers.get("Sec-Fetch-Dest", "") in ("document", "")
+            and self.headers.get("Sec-Fetch-Mode", "") in ("navigate", "")
+            and not self.headers.get("X-Requested-With")
+            and "video" not in accept_header
+            and "application/vnd.apple.mpegurl" not in accept_header
+            and "application/x-mpegurl" not in accept_header
+        )
+
+    def reject_if_web_remote_disabled(self, path, accept_header=""):
+        """ホスト専用モードの関門。塞いだら True を返す（呼び出し側は即 return）。
+
+        認証・権限判定より前に置くこと。閉じているなら、パスワードが合っているかも、
+        allow_web_* で何が許されているかも、そもそも問う必要がない。
+        """
+        if self.web_remote_enabled():
+            return False
+        if self._client_is_strict_loopback():
+            return False
+        # 配信そのものは止めない。VRChatのプレイヤーは認証ヘッダを付けられず、
+        # ここを塞ぐと「リモコンを切ったら映像も消えた」になる。
+        if self._is_media_path(path) and not self._wants_ui_document(path, accept_header):
+            return False
+
+        if self._wants_ui_document(path, accept_header):
+            content = HOST_ONLY_NOTICE_HTML.encode("utf-8")
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return True
+
+        self.send_json_response(403, {
+            "success": False,
+            "error": "Forbidden: the web remote is disabled by the host.",
+            "message": "Forbidden: the web remote is disabled by the host.",
+            "enable_web_remote": False
+        })
         return True
 
     def check_rate_limit(self):
@@ -648,6 +765,10 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
         if self.reject_if_auth_blocked(path):
             return
 
+        # ホスト専用モード（タスク21）。認証も権限も、受け付けると決めた後の話。
+        if self.reject_if_web_remote_disabled(path, accept_header):
+            return
+
         # 0. API: Auth Check
         if path == "/api/auth":
             configured_pw = str(self.streamer_core.config.get("web_password", "")).strip() if self.streamer_core else ""
@@ -702,6 +823,52 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_response(200, safe_config)
             else:
                 self.send_json_response(500, {"error": "Core not initialized"})
+            return
+
+        elif path == "/api/audio_devices":
+            if not self.check_web_password_auth():
+                self.send_json_response(401, {
+                    "success": False,
+                    "error": "Unauthorized: Web password required or invalid.",
+                    "has_web_password": True
+                })
+                return
+            if not self.is_local_request():
+                self.send_json_response(403, {
+                    "error": "Forbidden: Audio device enumeration is restricted to localhost."
+                })
+                return
+            query_params = parse_qs(parsed.query)
+            use_cache = query_params.get("refresh", ["0"])[0] != "1"
+            devices = enumerate_dshow_audio_devices(use_cache=use_cache)
+            self.send_json_response(200, {
+                "success": True,
+                "devices": devices
+            })
+            return
+
+        elif path == "/api/capture_sources":
+            if not self.check_web_password_auth():
+                self.send_json_response(401, {
+                    "success": False,
+                    "error": "Unauthorized: Web password required or invalid.",
+                    "has_web_password": True
+                })
+                return
+            if not self.is_local_request():
+                self.send_json_response(403, {
+                    "error": "Forbidden: Capture source enumeration is restricted to localhost."
+                })
+                return
+            query_params = parse_qs(parsed.query)
+            use_cache = query_params.get("refresh", ["0"])[0] != "1"
+            displays = enumerate_capture_displays(use_cache=use_cache)
+            windows = enumerate_capture_windows()
+            self.send_json_response(200, {
+                "success": True,
+                "displays": displays,
+                "windows": windows
+            })
             return
 
         # 3. API: QR Code Image
@@ -804,16 +971,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
         # 4. HTML Player (Root or /stream.m3u8 directly navigated in browser)
         # /stream.m3u8 はブラウザのアドレスバー直接入力（Sec-Fetch-Dest: document 等）の場合のみ UI を返し、
         # メディアプレイヤー・XHR・Fetch 等によるリクエストには HLS マニフェスト（m3u8）を返す
-        elif path == "/" or (
-            path == "/stream.m3u8"
-            and "text/html" in accept_header
-            and self.headers.get("Sec-Fetch-Dest", "") in ("document", "")
-            and self.headers.get("Sec-Fetch-Mode", "") in ("navigate", "")
-            and not self.headers.get("X-Requested-With")
-            and "video" not in accept_header
-            and "application/vnd.apple.mpegurl" not in accept_header
-            and "application/x-mpegurl" not in accept_header
-        ):
+        elif self._wants_ui_document(path, accept_header):
             live_sync = self.streamer_core.config.get("live_sync_duration_count", 4) if self.streamer_core else 4
             tunnel_stream_url = ""
             if self.streamer_core:
@@ -849,6 +1007,10 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
 
         # 認証ロックアウト中のゲストは API に触れない（総当たり対策）
         if self.reject_if_auth_blocked(path):
+            return
+
+        # ホスト専用モード（タスク21）。POST は全部 /api/* なので丸ごと塞がる。
+        if self.reject_if_web_remote_disabled(path, self.headers.get("Accept", "")):
             return
 
         # 1. API: Media Upload (写真・画像・動画アップロード)
@@ -1064,7 +1226,9 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
             is_local = self.is_local_request()
 
             # 破壊的・全消去操作は常にローカルホスト限定
-            if action in ("clear_queue", "clear_photos", "stop") and not is_local:
+            if action in ("clear_queue", "clear_photos", "stop", "set_live_audio",
+                          "set_live_audio_app", "set_live_audio_bg_source",
+                          "set_screen_capture") and not is_local:
                 self.send_json_response(403, {
                     "success": False,
                     "message": f"Forbidden: Action '{action}' is restricted to localhost."
@@ -1081,7 +1245,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     return
 
             # 再生制御操作の権限チェック
-            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode") and not is_local:
+            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode", "set_live_audio", "set_live_audio_app", "set_live_audio_bg_source", "set_screen_capture") and not is_local:
                 if not self.streamer_core.config.get("allow_web_playback_control", True):
                     self.send_json_response(403, {
                         "success": False,
@@ -1102,6 +1266,54 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 mode = str(body_json.get("mode", "video")).strip().lower()
                 res = self.streamer_core.set_playback_mode(mode)
                 self.send_json_response(200, {"success": True, "playback_mode": res, "message": f"Playback mode set to {res}."})
+            elif action == "set_live_audio":
+                mic_dev = body_json.get("mic_device")
+                loop_dev = body_json.get("loopback_device")
+                mic_vol = body_json.get("mic_volume")
+                loop_vol = body_json.get("loopback_volume")
+                res = self.streamer_core.set_live_audio_devices(
+                    mic_device=mic_dev,
+                    loopback_device=loop_dev,
+                    mic_volume=mic_vol,
+                    loopback_volume=loop_vol
+                )
+                self.send_json_response(200, {
+                    "success": True,
+                    "live_audio": res,
+                    "message": "Live audio device settings updated."
+                })
+            elif action == "set_live_audio_app":
+                res = self.streamer_core.set_live_audio_app(
+                    enabled=body_json.get("enabled"),
+                    window_title=body_json.get("window_title"),
+                    volume=body_json.get("volume"),
+                    mode=body_json.get("mode")
+                )
+                self.send_json_response(200, {
+                    "success": True,
+                    "live_audio_app": res,
+                    "message": "App audio capture settings updated."
+                })
+            elif action == "set_live_audio_bg_source":
+                source = str(body_json.get("source", "standby")).strip().lower()
+                res = self.streamer_core.set_live_audio_bg_source(source)
+                self.send_json_response(200, {
+                    "success": True,
+                    "live_audio_bg_source": res,
+                    "message": f"Live audio background source set to {res}."
+                })
+            elif action == "set_screen_capture":
+                res = self.streamer_core.set_screen_capture_source(
+                    source_type=body_json.get("source_type"),
+                    display_index=body_json.get("display_index"),
+                    window_title=body_json.get("window_title"),
+                    framerate=body_json.get("framerate"),
+                    width=body_json.get("width"),
+                    height=body_json.get("height"),
+                    draw_mouse=body_json.get("draw_mouse"),
+                    bitrate_kbps=body_json.get("bitrate_kbps"))
+                self.send_json_response(200, {"success": True, "screen_capture": res,
+                                              "message": "Screen capture source updated."})
             elif action == "set_radio_mode":
                 enabled = bool(body_json.get("enabled", True))
                 res = self.streamer_core.set_radio_mode(enabled)
