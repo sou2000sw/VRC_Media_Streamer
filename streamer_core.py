@@ -866,8 +866,8 @@ def _probe_monitor_vs_ddagrab(px, py, pw, ph, ox, oy, output_idx, timeout=15):
         "-f", "lavfi", "-i",
         f"ddagrab=output_idx={output_idx}:framerate=10:video_size={pw}x{ph}"
         f":offset_x={ox}:offset_y={oy}",
-        "-map", "0:v", "-frames:v", "1", "-y", a,
-        "-map", "1:v", "-vf", "hwdownload,format=bgra", "-frames:v", "1", "-y", b,
+        "-map", "0:v", "-vf", "scale=32:18", "-frames:v", "1", "-y", a,
+        "-map", "1:v", "-vf", "hwdownload,format=bgra,scale=32:18", "-frames:v", "1", "-y", b,
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
@@ -876,8 +876,8 @@ def _probe_monitor_vs_ddagrab(px, py, pw, ph, ox, oy, output_idx, timeout=15):
             return None
         from PIL import Image
         with Image.open(a) as ia, Image.open(b) as ib:
-            ta = list(ia.convert("L").resize((32, 18)).getdata())
-            tb = list(ib.convert("L").resize((32, 18)).getdata())
+            ta = list(ia.convert("L").getdata())
+            tb = list(ib.convert("L").getdata())
         return sum(abs(x - y) for x, y in zip(ta, tb)) / len(ta)
     except Exception:
         return None
@@ -908,9 +908,13 @@ def resolve_ddagrab_output_for_monitor(monitor, max_outputs=8):
         return _ddagrab_output_map_cache[key]
 
     mx, my = monitor["left"], monitor["top"]
-    pw, ph = 640, 360
-    px = mx + max(0, (monitor["width"] - pw) // 2)
-    py = my + max(0, (monitor["height"] - ph) // 2)
+    # ★照合窓は**モニタ全体**にする。中央だけを見ると再生中の動画に支配されて
+    #   識別できない。実測（同一条件・4試行）で、中央640x360では比が
+    #   1.31/1.14/2.32/1.14 となり3回は**誤った出力が最良**になったが、
+    #   モニタ全体なら 4.25/49.16/6.32/4.80 と4回とも正解を明確に判別できた。
+    #   タスクバー・ウィンドウ配置・壁紙まで入るぶん、モニタごとの違いが際立つ。
+    px, py = mx, my
+    pw, ph = monitor["width"], monitor["height"]
 
     # 動きの大きい瞬間に当たると差が開かず決められない。数回試す。
     # 一度決まればモニタ単位で覚えるので、費用は実質1回きり。
