@@ -4422,6 +4422,10 @@ class StreamerCore:
         kept = 0
         try:
             for raw in iter(proc.stderr.readline, b""):
+                # ★本物のパイプでなければ即やめる。テストのモック相手だと
+                #   readline() が b"" を返さず、このループが終わらなくなる。
+                if not isinstance(raw, (bytes, bytearray)):
+                    break
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
