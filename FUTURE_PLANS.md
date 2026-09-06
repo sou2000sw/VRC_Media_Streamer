@@ -32,7 +32,7 @@
 | **22** | 🎙️ 音声配信 | **PC出力音声（ループバック）＆マイク入力音声の取り込み・配信** (PC Audio & Mic Capture) | develop | 🟡 **実装完了・VRC実機未確認** |
 | **23** | 🖥️ 画面配信 | **PCデスクトップ画面・ウィンドウのリアルタイムキャプチャ配信** (Desktop Screen Share) | feature/task23-screen-share | 🟡 **実装完了・VRC実機未確認** |
 | **24** | 🎤 参加型 | **Webリモコンからの参加型カラオケ・楽器セッション機能** (Remote Karaoke & Session) | 未定 | 🔵 **検討中 📋** |
-| **25** | 🎚️ 音声配信 | **アプリ単位の音声取り込み（WASAPIプロセスループバック）** (Per-Application Audio Capture) | feature/task25-app-audio-capture | 🟡 **実装完了・VRC実機未確認** |
+| **25** | 🎚️ 音声配信 | **アプリ単位の音声取り込み（WASAPIプロセスループバック）** (Per-Application Audio Capture) | feature/task25-app-audio-capture | 🟡 **実装完了・ホスト側実機確認済み / VRChat内は未確認** |
 
 ---
 
