@@ -378,6 +378,7 @@ int main(int argc, char* argv[]) {
     bool stopOnExit = false;
     int statsInterval = 0;
 
+    int levelIntervalMs = 0;
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -405,6 +406,10 @@ int main(int argc, char* argv[]) {
             probe = true;
         } else if (arg == "--stop-on-exit") {
             stopOnExit = true;
+        } else if (arg == "--level" && i + 1 < argc) {
+            // 入力レベルの通知間隔[ms]。0で無効。
+            // ★UIのゲージ用。取り込めているのかを配信中に目で確かめられるようにする。
+            levelIntervalMs = std::atoi(argv[++i]);
         } else if (arg == "--stats" && i + 1 < argc) {
             statsInterval = std::stoi(argv[++i]);
         } else {
@@ -491,6 +496,10 @@ int main(int argc, char* argv[]) {
     uint64_t totalBytesCaptured = 0;
     uint64_t totalProducedFrames = 0;
     uint64_t totalSilenceFilledFrames = 0;
+    // 入力レベル集計（--level 用）。区間ごとに peak と RMS を出して、そのつど捨てる。
+    double levelSumSq = 0.0;
+    uint64_t levelSampleCount = 0;
+    int levelPeakAbs = 0;
     bool hasNonZeroSample = false;
     int exitCode = 0;
     bool targetExitLogged = false;
@@ -499,6 +508,7 @@ int main(int argc, char* argv[]) {
     auto lastPacketOrGuardTime = startTime;
     auto lastProcCheckTime = startTime;
     auto lastStatsTime = startTime;
+    auto lastLevelTime = lastStatsTime;
 
     // Main capture loop
     while (!g_stopRequested.load()) {
@@ -517,6 +527,22 @@ int main(int argc, char* argv[]) {
                     targetExitLogged = true;
                 }
             }
+        }
+
+        // 入力レベルの通知（UIのゲージ用）
+        if (levelIntervalMs > 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLevelTime).count() >= levelIntervalMs) {
+            lastLevelTime = now;
+            double rms = 0.0;
+            if (levelSampleCount > 0) {
+                rms = std::sqrt(levelSumSq / static_cast<double>(levelSampleCount));
+            }
+            double peak = static_cast<double>(levelPeakAbs) / 32768.0;
+            fprintf(stderr, "[AppAudio] level peak=%.5f rms=%.5f\n", peak, rms);
+            fflush(stderr);
+            levelSumSq = 0.0;
+            levelSampleCount = 0;
+            levelPeakAbs = 0;
         }
 
         // Stats output (Section 3.5)
@@ -589,6 +615,20 @@ int main(int argc, char* argv[]) {
                         size_t bytesToWrite = sampleCount * sizeof(int16_t);
                         totalBytesCaptured += bytesToWrite;
                         totalProducedFrames += numFramesToRead;
+
+                        // ★レベル集計は無音パケットも必ず含める。含めないと、鳴り止んだ
+                        //   ときにゲージが最後の値のまま張り付いて「入力できている」と
+                        //   誤読させてしまう。
+                        if (levelIntervalMs > 0) {
+                            for (size_t i = 0; i < sampleCount; ++i) {
+                                int v = s16Buf[i];
+                                int a = (v < 0) ? -v : v;
+                                if (a > levelPeakAbs) levelPeakAbs = a;
+                                double f = static_cast<double>(v) / 32768.0;
+                                levelSumSq += f * f;
+                            }
+                            levelSampleCount += sampleCount;
+                        }
 
                         if (!WritePCMData(s16Buf.data(), sampleCount, wavPath, wavFile, wavDataBytesWritten, probe)) {
                             fprintf(stderr, "[AppAudio] stdout write failed or pipe closed by downstream, exiting cleanly\n");

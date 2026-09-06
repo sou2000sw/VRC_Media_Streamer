@@ -518,6 +518,10 @@ def build_dshow_audio_inputs(mic_device=None, loopback_device=None,
 # --------------------------------------------------------------------------
 
 APP_AUDIO_RATE = 48000
+# 入力レベルの通知間隔[ms]。UIのゲージ用。細かすぎても人には読めないので5回/秒。
+APP_AUDIO_LEVEL_INTERVAL_MS = 200
+# レベルがこの秒数より古ければ「来ていない」と扱う。
+APP_AUDIO_LEVEL_STALE_SEC = 2.0
 APP_AUDIO_CHANNELS = 2
 
 
@@ -587,7 +591,8 @@ def build_audio_inputs(app_enabled=False, app_volume=1.0,
 
 
 def start_app_audio_helper(pid, mode="include", rate=APP_AUDIO_RATE,
-                           channels=APP_AUDIO_CHANNELS, stats_sec=0):
+                           channels=APP_AUDIO_CHANNELS, stats_sec=0,
+                           level_ms=APP_AUDIO_LEVEL_INTERVAL_MS):
     """補助exeを起動し Popen を返す。起動できなければ None。
 
     ★戻り値が None でも配信は止めない（fail-soft）。音が取れないことより、
@@ -611,10 +616,15 @@ def start_app_audio_helper(pid, mode="include", rate=APP_AUDIO_RATE,
            "--rate", str(int(rate)), "--channels", str(int(channels))]
     if stats_sec:
         cmd += ["--stats", str(int(stats_sec))]
+    if level_ms:
+        cmd += ["--level", str(int(level_ms))]
     try:
+        # ★stderr を DEVNULL にしてはいけない。補助exeの診断ログと入力レベルが
+        #   そこにしか出ないため、捨てると「音が来ているのか」を誰も知り得なくなる。
+        #   PIPE にした以上は必ず読み続けること（読まないとバッファが詰まって止まる）。
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, bufsize=0,
+            stderr=subprocess.PIPE, bufsize=0,
             creationflags=CREATE_NO_WINDOW
         )
     except Exception as e:
@@ -2340,6 +2350,7 @@ class StreamerCore:
             "live_audio_app_volume": float(self.config.get("live_audio_app_volume", 1.0)),
             "live_audio_app_mode": str(self.config.get("live_audio_app_mode", "include")),
             "app_audio_available": bool(get_app_audio_capture_cmd()),
+            "app_audio_level": self.get_app_audio_level(),
             "screen_capture_source_type": str(self.config.get("screen_capture_source_type", "display")),
             "screen_capture_display_index": int(self.config.get("screen_capture_display_index", 0)),
             "screen_capture_window_title": str(self.config.get("screen_capture_window_title", "")),
@@ -4319,11 +4330,64 @@ class StreamerCore:
         pid = self._resolve_app_audio_pid()
         if not pid:
             return None
-        return start_app_audio_helper(
+        proc = start_app_audio_helper(
             pid,
             mode=self.config.get("live_audio_app_mode", "include"),
             stats_sec=int(self.config.get("live_audio_app_stats_sec", 0) or 0)
         )
+        if proc:
+            self.app_audio_level = None
+            threading.Thread(target=self._pump_app_audio_stderr,
+                             args=(proc,), daemon=True).start()
+        return proc
+
+    def _pump_app_audio_stderr(self, helper_proc):
+        """補助exeの stderr を読み続け、入力レベルを拾い、それ以外はログへ流す。
+
+        ★読み続けること自体が必須。stderr を PIPE にして誰も読まないと、
+          パイプのバッファが埋まった時点で補助exeが書き込みでブロックし、
+          音が止まる。
+        """
+        try:
+            for raw in iter(helper_proc.stderr.readline, b""):
+                try:
+                    line = raw.decode("utf-8", "replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                m = re.search(r"level peak=([\d.]+) rms=([\d.]+)", line)
+                if m:
+                    try:
+                        self.app_audio_level = {
+                            "peak": float(m.group(1)),
+                            "rms": float(m.group(2)),
+                            "ts": time.time(),
+                        }
+                    except ValueError:
+                        pass
+                    continue
+                # レベル以外は診断情報なので残す（従来は捨てていた）。
+                log_print(line)
+        except Exception:
+            pass
+        finally:
+            try:
+                helper_proc.stderr.close()
+            except Exception:
+                pass
+
+    def get_app_audio_level(self):
+        """UIのゲージ用に、直近の入力レベルを返す。古ければ 0 扱い。"""
+        lv = getattr(self, "app_audio_level", None) or {}
+        ts = lv.get("ts", 0.0)
+        age = time.time() - ts if ts else None
+        fresh = bool(ts) and age is not None and age < APP_AUDIO_LEVEL_STALE_SEC
+        return {
+            "peak": float(lv.get("peak", 0.0)) if fresh else 0.0,
+            "rms": float(lv.get("rms", 0.0)) if fresh else 0.0,
+            "fresh": fresh,
+        }
 
     def reap_app_audio_helper(self, sender_proc, helper_proc):
         """送出FFmpegが終わったら補助exeを確実に落とす。
@@ -4338,6 +4402,7 @@ class StreamerCore:
         except Exception:
             pass
         kill_proc(helper_proc)
+        self.app_audio_level = None
         log_print("[AppAudio] helper stopped")
 
     def set_live_audio_app(self, enabled=None, window_title=None, volume=None, mode=None):

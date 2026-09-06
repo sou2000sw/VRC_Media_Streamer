@@ -777,6 +777,16 @@
                             <input type="range" id="liveAudioAppVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioAppSettings()" class="flex-1 accent-emerald-400">
                             <span id="liveAudioAppVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
                         </div>
+                        <!-- 入力レベルのゲージ。「取り込めているのか」を配信中に目で確かめるためのもの。
+                             補助exeが 200ms ごとに報告する peak/rms を /api/status 経由で受け取る。 -->
+                        <div class="flex items-center gap-2">
+                            <span class="text-[11px] text-zinc-400 w-16 shrink-0">入力レベル</span>
+                            <div class="flex-1 h-2 bg-zinc-800 rounded overflow-hidden">
+                                <div id="liveAudioAppMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
+                            </div>
+                            <span id="liveAudioAppMeterText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">停止中</span>
+                        </div>
+
                         <p id="liveAudioAppUnavailable" class="hidden text-[11px] text-amber-400/90">
                             &#9888; アプリ単位の音声取り込みに必要な補助プログラム（app_audio_capture.exe）が見つかりません。この項目を有効にしても、従来のPC出力音声／マイクだけで配信されます。
                         </p>
@@ -3090,6 +3100,10 @@
         // （スライダーを動かしている途中でポーリングに値を戻される事故を防ぐ）。
         function syncLiveAudioFromStatus(data) {
             if (!data) return;
+            // ★ゲージは操作中でも止めない。ここより下の「4秒間は上書きしない」ガードは
+            //   スライダーを触っている最中に値を巻き戻さないためのもので、
+            //   読み取り専用のゲージには当てはまらない（止まると壊れて見える）。
+            updateAppAudioMeter(data);
             if (Date.now() - liveAudioUserChangedAt < 4000) return;
             const micSel = document.getElementById('liveAudioMicDevice');
             const loopSel = document.getElementById('liveAudioLoopbackDevice');
@@ -3165,6 +3179,33 @@
             } catch (e) {
                 showToast('アプリ音声設定の保存に失敗しました', 'danger');
             }
+        }
+
+        // 入力レベルのゲージ。
+        // ★リニアで描くとバーがほとんど動かない。実測では rms 0.009（= -40dBFS）でも
+        //   はっきり聞こえるため、-60〜0dBFS を 0〜100% に写す。
+        function updateAppAudioMeter(data) {
+            const bar = document.getElementById('liveAudioAppMeterBar');
+            const txt = document.getElementById('liveAudioAppMeterText');
+            if (!bar || !txt) return;
+            const lv = (data && data.app_audio_level) ? data.app_audio_level : null;
+            if (!lv || !lv.fresh) {
+                // 配信していない、または補助exeが動いていない。
+                bar.style.width = '0%';
+                bar.style.backgroundColor = '#52525b';
+                txt.textContent = '停止中';
+                txt.className = 'w-16 text-right text-[11px] text-zinc-500 font-mono';
+                return;
+            }
+            const rms = Number(lv.rms) || 0;
+            const db = rms > 0 ? 20 * Math.log10(rms) : -100;
+            const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+            const silent = db < -55;
+            bar.style.width = pct.toFixed(1) + '%';
+            bar.style.backgroundColor = silent ? '#52525b' : (db > -6 ? '#f59e0b' : '#34d399');
+            txt.textContent = silent ? '無音' : Math.round(db) + ' dB';
+            txt.className = 'w-16 text-right text-[11px] font-mono ' +
+                (silent ? 'text-zinc-500' : (db > -6 ? 'text-amber-400' : 'text-emerald-400'));
         }
 
         function syncLiveAudioAppFromStatus(data) {
