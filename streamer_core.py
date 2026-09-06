@@ -4603,13 +4603,6 @@ class StreamerCore:
         bg_source = str(self.config.get("live_audio_bg_source", "standby"))
         auto_advance = bool(self.config.get("image_auto_advance", False)) and not self.image_paused
 
-        # ★ライブ音声では concat（写真の自動送り）を使わない。
-        #   実測: 背景を slideshow(concat) にすると送出FFmpegが1〜3秒で死に、
-        #   再起動を繰り返す。そのたび補助exeが道連れになるため音声が流れず、
-        #   入力ゲージも無反応になり、RTMPシンクまで落ちた（standby では正常）。
-        #   同じコマンドを手で実行しても再現しないため原因は未特定。
-        #   分かるまでは写真1枚の静止画に落とす（音声が流れないより実害が小さい）。
-        #   ラジオ側の concat 経路は従来どおりで、こちらは触っていない。
         slideshow_manifest_path = None
         if bg_source == "slideshow" and auto_advance:
             slideshow_manifest_path = self.build_slideshow_manifest(
@@ -4617,8 +4610,6 @@ class StreamerCore:
                 manifest_name="slideshow_manifest_live.txt")
 
         if slideshow_manifest_path:
-            # 現在ここには来ない（上でスライドショーを無効にしている）。
-            # 原因が判明したら上のガードを外して復帰させる。
             # ★concat 入力に -re を付けてはいけない。付けると送出FFmpegが数秒で死に、
             #   再起動を繰り返してアプリ音声が流れなくなる。FFmpeg自身は
             #   「[dec:png] Decoding error: Invalid data found」を出しており、
