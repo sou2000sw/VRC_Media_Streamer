@@ -836,7 +836,7 @@
                             <input type="checkbox" id="screenCaptureDrawMouse" checked class="rounded bg-zinc-900 border-zinc-700 text-emerald-400 focus:ring-0">
                             <span class="text-xs text-zinc-300">マウスカーソルを含める</span>
                         </label>
-                        <button onclick="applyScreenCaptureSettings()" class="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-zinc-950 font-bold rounded text-xs transition">
+                        <button id="screenCaptureApplyBtn" onclick="applyScreenCaptureSettings()" class="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-zinc-950 font-bold rounded text-xs transition">
                             適用
                         </button>
                     </div>
@@ -3087,12 +3087,32 @@
         //   毎回更新され、この問題が起きない。こちらは「適用」を押すまで何も記録されず、
         //   /api/status のポーリング（約0.5秒）が選択をサーバー値へ巻き戻していた
         //   （実測: ラジオを「ウィンドウ」にしても 517ms で「モニター」へ戻る）。
-        //   触った時点から一定時間は上書きしない。
-        let screenCaptureEditingUntil = 0;
-        const SCREEN_CAPTURE_EDIT_GRACE_MS = 20000;
+        //   ★守り方は「時間」ではなく「触ったかどうか」にする。
+        //     猶予時間方式（20秒）にすると、利用者が迷っている間に黙って巻き戻り、
+        //     そのまま適用を押すと古い値が飛ぶ——最初の不具合と同じ壊れ方が、
+        //     再現しにくいぶん**もっと気付きにくい形**で残る（実測: 猶予方式でも21.7秒で巻き戻った）。
+        //     一度触ったら、適用するか再取得するまで上書きしない。時計に頼らない。
+        let screenCaptureDirty = false;
 
         function markScreenCaptureEditing() {
-            screenCaptureEditingUntil = Date.now() + SCREEN_CAPTURE_EDIT_GRACE_MS;
+            if (screenCaptureDirty) return;
+            screenCaptureDirty = true;
+            updateScreenCaptureDirtyUI();
+        }
+
+        function clearScreenCaptureDirty() {
+            screenCaptureDirty = false;
+            updateScreenCaptureDirtyUI();
+        }
+
+        // 「押したかどうか」が見て分からないと、巻き戻りに気付けないまま
+        // 古い設定で配信し続けることになる。未反映を明示する。
+        function updateScreenCaptureDirtyUI() {
+            const btn = document.getElementById('screenCaptureApplyBtn');
+            if (!btn) return;
+            btn.textContent = screenCaptureDirty ? '適用（未反映）' : '適用';
+            btn.classList.toggle('ring-2', screenCaptureDirty);
+            btn.classList.toggle('ring-amber-300', screenCaptureDirty);
         }
 
         function toggleScreenCaptureSourceFields(sourceType) {
@@ -3193,6 +3213,14 @@
             const bInput = document.getElementById('screenCaptureBitrateKbps');
             const mouseChk = document.getElementById('screenCaptureDrawMouse');
 
+            // ★ウィンドウ指定なのに未選択のまま送ると、配信中のストリームが
+            //   error（「キャプチャ対象のウィンドウが未選択です」）へ落ちる。
+            //   実測で踏んだので、送る前に止める。
+            if (sourceType === 'window' && !(windowSel && windowSel.value)) {
+                showToast('共有するウィンドウを選んでください', 'danger');
+                return;
+            }
+
             let w = 1920, h = 1080;
             if (resSel && resSel.value) {
                 const parts = resSel.value.split('x');
@@ -3221,7 +3249,7 @@
                 if (res.ok) {
                     // 保存できたので編集中の保護は解く。以降は screenCaptureUserChangedAt の
                     // 4秒間だけ待って、サーバーの確定値に追随させる。
-                    screenCaptureEditingUntil = 0;
+                    clearScreenCaptureDirty();
                     showToast('画面共有設定を保存しました', 'success');
                     checkServerHealth(true);
                 } else {
@@ -3235,8 +3263,8 @@
         function syncScreenCaptureFromStatus(data) {
             if (!data) return;
             if (Date.now() - screenCaptureUserChangedAt < 4000) return;
-            // ユーザーが選択中はサーバー値で上書きしない（「適用」を押す前に巻き戻さない）
-            if (Date.now() < screenCaptureEditingUntil) return;
+            // ユーザーが触った後はサーバー値で上書きしない（「適用」を押す前に巻き戻さない）
+            if (screenCaptureDirty) return;
 
             const sourceRadios = document.getElementsByName('screenCaptureSourceType');
             if (typeof data.screen_capture_source_type === 'string') {
