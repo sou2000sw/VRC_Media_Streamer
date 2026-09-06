@@ -167,6 +167,10 @@
                 <i class="ri-qr-code-line text-base text-emerald-400"></i>
                 <span class="whitespace-nowrap">接続 & スマホ共有</span>
             </button>
+            <button onclick="switchTab('karaoke')" id="nav-karaoke" class="nav-tab flex items-center justify-center md:justify-start gap-2 px-2.5 sm:px-3 py-2 rounded text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50 text-xs font-medium transition shrink-0 flex-1 md:flex-none">
+                <i class="ri-mic-2-line text-base text-rose-400"></i>
+                <span class="whitespace-nowrap">カラオケ参加</span>
+            </button>
 
             <div class="hidden md:flex mt-auto border-t border-border pt-2 text-[11px] text-zinc-500 flex-col gap-1">
                 <div class="flex justify-between">
@@ -1097,6 +1101,225 @@
                 </div>
             </div>
 
+            <!-- TAB 4: 参加型カラオケ・セッション（タスク27） -->
+            <div id="tab-karaoke" class="tab-pane hidden flex flex-col gap-4">
+
+                <!-- 4-1. 参加者パネル（全員に見せる） -->
+                <div class="bg-card border border-border rounded-lg p-4 flex flex-col gap-3">
+                    <div class="flex items-center justify-between gap-2 flex-wrap">
+                        <h3 class="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                            <i class="ri-mic-2-line text-primary"></i> マイクで参加する
+                        </h3>
+                        <div id="kaStatusBadge" class="flex items-center gap-2 text-[11px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-400">
+                            <span id="kaStateDot" class="w-2 h-2 rounded-full bg-zinc-600"></span>
+                            <span id="kaStateText">未接続</span>
+                        </div>
+                    </div>
+
+                    <!-- セッションが閉じているときの案内 -->
+                    <div id="kaClosedNotice" class="hidden text-xs text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded p-2.5 leading-relaxed">
+                        <i class="ri-lock-line"></i>
+                        ホストがカラオケ・セッションを開いていません。ホストが受付を開始するまでお待ちください。
+                    </div>
+
+                    <!-- HTTPS でないと getUserMedia が使えない、という最頻出の詰まりどころ -->
+                    <div id="kaInsecureNotice" class="hidden text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded p-2.5 leading-relaxed">
+                        <i class="ri-error-warning-line"></i>
+                        <b>このページではマイクを使えません。</b>
+                        ブラウザは <code class="bg-zinc-900 px-1 rounded">https://</code> か
+                        <code class="bg-zinc-900 px-1 rounded">localhost</code> でしかマイクを許可しません。
+                        ホストから共有された <b>https の共有URL（QRコード）</b> から開き直してください。
+                    </div>
+
+                    <div class="flex flex-col sm:flex-row gap-2 items-stretch sm:items-end">
+                        <label class="flex-1 flex flex-col gap-1">
+                            <span class="text-[11px] text-zinc-400">表示名（ホストの画面に出ます）</span>
+                            <input id="kaName" type="text" maxlength="24" placeholder="なまえ"
+                                   class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-2 text-xs text-zinc-100 focus:border-primary outline-none">
+                        </label>
+                        <button id="kaConnectBtn" onclick="karaokeToggleConnection()"
+                                class="flex items-center justify-center gap-1.5 px-4 py-2 bg-primary hover:bg-primary-hover text-zinc-950 font-bold rounded text-xs transition shrink-0">
+                            <i class="ri-mic-line text-base"></i><span id="kaConnectLabel">マイクをつなぐ</span>
+                        </button>
+                    </div>
+
+                    <!-- 接続後の操作 -->
+                    <div id="kaLiveControls" class="hidden flex-col gap-3 pt-1">
+
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button id="kaRaiseBtn" onclick="karaokeRaiseHand()"
+                                    class="flex items-center gap-1.5 px-3 py-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-xs text-zinc-200 transition">
+                                <i class="ri-hand text-base text-amber-400"></i><span>手を挙げる</span>
+                            </button>
+                            <button id="kaMuteBtn" onclick="karaokeToggleMute()"
+                                    class="flex items-center gap-1.5 px-3 py-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-xs text-zinc-200 transition">
+                                <i id="kaMuteIcon" class="ri-mic-line text-base"></i><span id="kaMuteLabel">ミュート</span>
+                            </button>
+                            <div class="flex items-center gap-1.5 text-[11px] font-mono text-zinc-400 ml-auto">
+                                <i id="kaNetIcon" class="ri-signal-wifi-line text-base"></i>
+                                <span id="kaNetText">-- ms</span>
+                            </div>
+                        </div>
+
+                        <!-- 入力ゲイン と VU -->
+                        <div class="flex flex-col gap-1.5">
+                            <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                <span>入力ゲイン</span><span id="kaGainVal" class="font-mono text-zinc-300">1.00</span>
+                            </div>
+                            <input id="kaGain" type="range" min="0" max="2" step="0.05" value="1"
+                                   oninput="karaokeSetGain(this.value)" class="w-full accent-emerald-500">
+                            <div class="h-2.5 w-full bg-zinc-900 border border-zinc-700 rounded overflow-hidden">
+                                <div id="kaVuBar" class="h-full w-0" style="background:linear-gradient(90deg,#34d399 0%,#34d399 60%,#fbbf24 80%,#f43f5e 100%)"></div>
+                            </div>
+                        </div>
+
+                        <!-- 手元モニター（SYNCROOM方式） -->
+                        <div class="border-t border-border pt-3 flex flex-col gap-3">
+                            <div class="flex items-center gap-2 text-xs font-semibold text-zinc-200">
+                                <i class="ri-headphone-line text-primary"></i> 手元モニター
+                            </div>
+                            <div class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded p-2 leading-relaxed">
+                                <i class="ri-alarm-warning-line"></i>
+                                <b>必ずイヤホン・ヘッドホンを使ってください。</b>
+                                スピーカーで鳴らすと自分の声が自分のマイクに戻り、ハウリングします。
+                            </div>
+
+                            <div class="flex flex-col gap-1.5">
+                                <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                    <span>自分の声の返り（サイドトーン）</span><span id="kaSideVal" class="font-mono text-zinc-300">0%</span>
+                                </div>
+                                <input id="kaSidetone" type="range" min="0" max="1" step="0.05" value="0"
+                                       oninput="karaokeSetSidetone(this.value)" class="w-full accent-sky-500">
+                                <p class="text-[10px] text-zinc-500">音程が取りやすくなります。既定はオフ。</p>
+                            </div>
+
+                            <!-- 手元伴奏 -->
+                            <div class="flex flex-col gap-2 bg-zinc-900/60 border border-zinc-700 rounded p-2.5">
+                                <div class="flex items-center justify-between gap-2 flex-wrap">
+                                    <span class="text-[11px] text-zinc-300 font-semibold">手元の伴奏ファイル</span>
+                                    <input id="kaBgmFile" type="file" accept="audio/*" onchange="karaokeLoadBgm(this)"
+                                           class="text-[10px] text-zinc-400 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-zinc-700 file:text-zinc-200 file:text-[10px]">
+                                </div>
+                                <p class="text-[10px] text-zinc-500 leading-relaxed">
+                                    自分の端末の伴奏を再生しながら歌えます。伴奏は歌声と一緒に送られるので、
+                                    <b>ホスト側でズレの調整は要りません</b>。
+                                </p>
+                                <div class="flex items-center gap-2">
+                                    <button id="kaBgmPlayBtn" onclick="karaokeToggleBgm()" disabled
+                                            class="flex items-center gap-1 px-2.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[11px] text-zinc-200 disabled:opacity-40 transition">
+                                        <i id="kaBgmPlayIcon" class="ri-play-fill"></i><span id="kaBgmPlayLabel">再生</span>
+                                    </button>
+                                    <span id="kaBgmName" class="text-[10px] text-zinc-500 truncate flex-1">未選択</span>
+                                </div>
+                                <div class="flex flex-col gap-1">
+                                    <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                        <span>伴奏（手元で聴く音量）</span><span id="kaBgmMonVal" class="font-mono text-zinc-300">80%</span>
+                                    </div>
+                                    <input id="kaBgmMonitor" type="range" min="0" max="1.5" step="0.05" value="0.8"
+                                           oninput="karaokeSetBgmMonitor(this.value)" class="w-full accent-sky-500">
+                                </div>
+                                <div class="flex flex-col gap-1">
+                                    <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                        <span>伴奏（配信へ送る音量）</span><span id="kaBgmSendVal" class="font-mono text-zinc-300">60%</span>
+                                    </div>
+                                    <input id="kaBgmSend" type="range" min="0" max="1.5" step="0.05" value="0.6"
+                                           oninput="karaokeSetBgmSend(this.value)" class="w-full accent-emerald-500">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 4-2. ホスト卓（ホストPCからのみ） -->
+                <div id="kaHostPanel" class="hidden bg-card border border-border rounded-lg p-4 flex-col gap-4">
+                    <div class="flex items-center justify-between gap-2 flex-wrap">
+                        <h3 class="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                            <i class="ri-sound-module-line text-primary"></i> ホスト卓（ミキサー）
+                        </h3>
+                        <div class="flex items-center gap-2">
+                            <span id="kaPipeState" class="text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500">配信未接続</span>
+                            <button id="kaRecBtn" onclick="karaokeToggleRecording()"
+                                    class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[11px] text-zinc-200 transition">
+                                <i id="kaRecIcon" class="ri-record-circle-line text-rose-400"></i><span id="kaRecLabel">セッション録音</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 受付の開閉 -->
+                    <div class="flex flex-wrap items-center gap-3 bg-zinc-900/60 border border-zinc-700 rounded p-3">
+                        <label class="flex items-center gap-2 cursor-pointer">
+                            <input id="kaEnabled" type="checkbox" onchange="karaokeSaveSettings()" class="accent-emerald-500 w-4 h-4">
+                            <span class="text-xs text-zinc-200 font-semibold">カラオケ受付を有効にする</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer ml-auto">
+                            <input id="kaApproval" type="checkbox" checked onchange="karaokeSaveSettings()" class="accent-amber-500 w-4 h-4">
+                            <span class="text-xs text-zinc-300">承認制（挙手→許可）</span>
+                        </label>
+                    </div>
+                    <p class="text-[10px] text-zinc-500 -mt-2 leading-relaxed">
+                        承認制を外すと、URLを知っている人は誰でも即座に配信へ声を乗せられます。荒らし対策として既定は承認制です。
+                    </p>
+
+                    <!-- マスター -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="flex flex-col gap-1.5">
+                            <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                <span>歌声マスター音量</span><span id="kaMasterVal" class="font-mono text-zinc-300">1.00</span>
+                            </div>
+                            <input id="kaMaster" type="range" min="0" max="2" step="0.05" value="1"
+                                   oninput="karaokeOnMasterInput(this.value)" onchange="karaokeSaveSettings()" class="w-full accent-emerald-500">
+                            <div class="h-2 w-full bg-zinc-900 border border-zinc-700 rounded overflow-hidden">
+                                <div id="kaMasterVu" class="h-full w-0" style="background:linear-gradient(90deg,#34d399 0%,#34d399 60%,#fbbf24 80%,#f43f5e 100%)"></div>
+                            </div>
+                        </div>
+                        <div class="flex flex-col gap-1.5">
+                            <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                <span>遅延補正</span><span id="kaOffsetVal" class="font-mono text-zinc-300">0 ms</span>
+                            </div>
+                            <input id="kaOffset" type="range" min="-500" max="500" step="10" value="0"
+                                   oninput="karaokeOnOffsetInput(this.value)" onchange="karaokeSaveSettings()" class="w-full accent-sky-500">
+                            <p class="text-[10px] text-zinc-500 leading-relaxed">
+                                ホスト側で伴奏を鳴らすときに、歌声とのズレを詰めます。
+                                <b>＋で歌声を遅らせ、−で歌声を早めます。</b>配信中に動かせます。
+                            </p>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <label class="flex flex-col gap-1">
+                            <span class="text-[11px] text-zinc-400">遅延モード</span>
+                            <select id="kaLatency" onchange="karaokeSaveSettings()"
+                                    class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-100 outline-none focus:border-primary">
+                                <option value="low">低遅延 40ms（カラオケ・掛け合い）</option>
+                                <option value="stable">安定 120ms（弾き語り・楽器）</option>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-1">
+                            <span class="text-[11px] text-zinc-400">リバーブ（歌声全体）</span>
+                            <select id="kaReverb" onchange="karaokeSaveSettings()"
+                                    class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-100 outline-none focus:border-primary">
+                                <option value="off">なし</option>
+                                <option value="weak">弱</option>
+                                <option value="mid">中</option>
+                                <option value="strong">強</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <!-- 参加者スロット -->
+                    <div class="border-t border-border pt-3 flex flex-col gap-2">
+                        <div class="flex items-center justify-between">
+                            <span class="text-xs font-semibold text-zinc-200">参加者</span>
+                            <span id="kaCounts" class="text-[10px] font-mono text-zinc-500">0 人</span>
+                        </div>
+                        <div id="kaParticipants" class="flex flex-col gap-2"></div>
+                        <div id="kaEmptyNote" class="text-[11px] text-zinc-500 py-4 text-center">
+                            まだ誰も接続していません。共有QRのURLを参加者に渡してください。
+                        </div>
+                    </div>
+                </div>
+            </div>
+
         </main>
     </div>
 
@@ -1694,6 +1917,10 @@
             const btnShareQr = document.getElementById('btnGoShareQr');
             if (btnShareQr) btnShareQr.classList.toggle('hidden', !showInfo);
 
+            // タスク27: カラオケ「参加」は誰でも使える。ホスト卓（承認・ミキサー）だけ
+            // ホストPCに限る。ここを開けると参加者が自分で自分を承認できてしまう。
+            karaokeApplyHostVisibility(isHost);
+
             // ライブ音声（タスク22）: 取り込みデバイスはホストPCにしか存在せず、
             // 列挙も設定変更も localhost 限定。ゲストにはモードボタンごと見せない。
             const btnModeLive = document.getElementById('modeLiveBtn');
@@ -1778,6 +2005,10 @@
                 targetNav.classList.add('active', 'bg-zinc-800', 'text-zinc-200');
                 targetNav.classList.remove('text-zinc-400');
             }
+
+            // タスク27: カラオケ卓の更新は、その画面を開いている間だけ回す。
+            // 常時ポーリングすると、使っていない人にも毎秒の通信が走る。
+            karaokeOnTabShown(tabId === 'karaoke');
         }
 
         // HLS Player Live Preview
@@ -4336,6 +4567,831 @@
                 toast.classList.add('opacity-0', 'translate-y-12');
             }, 3000);
         }
+
+        // ===================================================================
+        // タスク27: 参加型カラオケ・セッション（Webリモコン側）
+        //
+        // 音声の流れ（設計書 4.1 / 4.2）
+        //   マイク --> 入力ゲイン --+--> アナライザ（VUメーター）
+        //                          +--> サイドトーン --> イヤホン（手元モニター）
+        //                          +--> アップリンク合流点 --> PCM化 --> WebSocket
+        //   手元伴奏 --------------+--> 伴奏モニター音量 --> イヤホン
+        //                          +--> 伴奏送出音量 -----> アップリンク合流点
+        //
+        // ★手元伴奏を「歌声と一緒に送る」ようにしてある理由
+        //   歌声だけを送ってホスト側で伴奏と混ぜると、ネットワークの遅れぶんだけ
+        //   必ずズレる。ブラウザの中で混ぜてから送れば、伴奏と歌声は出発時点で
+        //   貼り合わさっているのでズレようがない。ホスト側の遅延補正スライダは
+        //   「ホストが伴奏を鳴らす」使い方のために残してある。
+        // ===================================================================
+        const KARAOKE_SAMPLE_RATE = 48000;
+        const KARAOKE_CHUNK_FRAMES = 1920;     // 40ms。低遅延モードの上限に合わせる
+        // 送信キューが溜まりすぎたら捨てる。溜め続けると遅延が伸びる一方で、
+        // しかも古い音（もう意味のない音）を後生大事に送ることになる。
+        const KARAOKE_MAX_BUFFERED = 192000;   // 約1秒ぶん
+
+        const ka = {
+            ws: null,
+            id: null,
+            state: 'idle',            // idle | connecting | waiting | active | denied
+            ac: null,
+            micStream: null,
+            micGain: null,
+            analyser: null,
+            analyserBuf: null,
+            uplink: null,             // アップリンクの合流点（GainNode を加算器として使う）
+            sidetoneGain: null,
+            processor: null,
+            silentSink: null,
+            bgmEl: null,
+            bgmSrcNode: null,
+            bgmMonGain: null,
+            bgmSendGain: null,
+            muted: false,
+            pingTimer: null,
+            vuTimer: null,
+            pollTimer: null,
+            hostTimer: null,
+            lastRtt: 0,
+            jitter: 0,
+            prevRtt: null,
+            netReportAt: 0,
+            sessionEnabled: false,
+            hostView: false,
+            hostDragging: false,      // スライダ操作中はポーリング反映を止める
+        };
+
+        function karaokeIsSecureForMic() {
+            // getUserMedia は https か localhost でしか動かない。ここを黙って通すと
+            // 「つないでも何も起きない」という一番分かりにくい失敗になる。
+            if (window.isSecureContext) return true;
+            const h = location.hostname;
+            return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+        }
+
+        function karaokeWsUrl() {
+            let base;
+            try {
+                base = new URL(apiBase);
+            } catch (e) {
+                base = new URL(location.origin);
+            }
+            const scheme = base.protocol === 'https:' ? 'wss:' : 'ws:';
+            return `${scheme}//${base.host}/ws/audio_session`;
+        }
+
+        function karaokeSetState(state, note) {
+            ka.state = state;
+            const dot = document.getElementById('kaStateDot');
+            const text = document.getElementById('kaStateText');
+            if (!dot || !text) return;
+            const map = {
+                idle:       ['bg-zinc-600',    '未接続'],
+                connecting: ['bg-sky-400',     '接続中...'],
+                waiting:    ['bg-amber-400',   '挙手中（承認待ち）'],
+                active:     ['bg-rose-500',    'ON AIR'],
+                denied:     ['bg-zinc-500',    '許可されていません'],
+            };
+            const [cls, label] = map[state] || map.idle;
+            dot.className = `w-2 h-2 rounded-full ${cls}`;
+            if (state === 'active') dot.className += ' animate-pulse';
+            text.innerText = note || label;
+
+            const live = document.getElementById('kaLiveControls');
+            const connected = state !== 'idle' && state !== 'connecting';
+            if (live) {
+                live.classList.toggle('hidden', !connected);
+                live.classList.toggle('flex', connected);
+            }
+            const label2 = document.getElementById('kaConnectLabel');
+            if (label2) label2.innerText = (state === 'idle') ? 'マイクをつなぐ' : '切断する';
+        }
+
+        // ------------------------------------------------------------------
+        // 接続・切断
+        // ------------------------------------------------------------------
+        async function karaokeToggleConnection() {
+            if (ka.state !== 'idle') { karaokeDisconnect('自分で切断しました'); return; }
+            if (!karaokeIsSecureForMic()) {
+                document.getElementById('kaInsecureNotice').classList.remove('hidden');
+                showToast('このURLではマイクを使えません（https か localhost が必要）', 'danger');
+                return;
+            }
+            karaokeSetState('connecting');
+            try {
+                await karaokeStartAudio();
+            } catch (e) {
+                karaokeSetState('idle');
+                showToast(`マイクを取得できませんでした: ${e.message || e}`, 'danger');
+                return;
+            }
+            try {
+                await karaokeOpenSocket();
+            } catch (e) {
+                karaokeStopAudio();
+                karaokeSetState('idle');
+                showToast(`接続できませんでした: ${e.message || e}`, 'danger');
+            }
+        }
+
+        function karaokeDisconnect(reason) {
+            if (ka.ws) {
+                try { ka.ws.send(JSON.stringify({ type: 'leave' })); } catch (e) {}
+                try { ka.ws.close(); } catch (e) {}
+                ka.ws = null;
+            }
+            karaokeStopAudio();
+            if (ka.pingTimer) { clearInterval(ka.pingTimer); ka.pingTimer = null; }
+            if (ka.vuTimer) { clearInterval(ka.vuTimer); ka.vuTimer = null; }
+            karaokeSetState('idle');
+            const vu = document.getElementById('kaVuBar');
+            if (vu) vu.style.width = '0%';
+            if (reason) showToast(reason, 'info');
+        }
+
+        function karaokeOpenSocket() {
+            return new Promise((resolve, reject) => {
+                let ws;
+                try {
+                    ws = new WebSocket(karaokeWsUrl());
+                } catch (e) { reject(e); return; }
+                ws.binaryType = 'arraybuffer';
+                let settled = false;
+
+                ws.onopen = () => {
+                    // ★PIN はハンドシェイク後の最初のメッセージで渡す。
+                    //   URL のクエリに入れると履歴・ログ・共有経路に残ってしまう。
+                    ws.send(JSON.stringify({
+                        type: 'hello',
+                        name: (document.getElementById('kaName').value || '').trim(),
+                        password: getStoredWebPassword() || '',
+                    }));
+                };
+
+                ws.onmessage = (ev) => {
+                    if (typeof ev.data !== 'string') return;
+                    let msg;
+                    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+                    karaokeHandleMessage(msg);
+                    if (!settled && (msg.type === 'welcome' || msg.type === 'error')) {
+                        settled = true;
+                        if (msg.type === 'welcome') resolve();
+                        else reject(new Error(msg.message || msg.code));
+                    }
+                };
+
+                ws.onerror = () => {
+                    if (!settled) { settled = true; reject(new Error('WebSocket に接続できません')); }
+                };
+
+                ws.onclose = () => {
+                    ka.ws = null;
+                    if (ka.state !== 'idle') karaokeDisconnect('接続が切れました');
+                };
+
+                ka.ws = ws;
+            });
+        }
+
+        function karaokeHandleMessage(msg) {
+            if (msg.type === 'welcome') {
+                ka.id = msg.id;
+                karaokeSetState(msg.state === 'active' ? 'active' : 'waiting');
+                karaokeStartPing();
+                karaokeStartVu();
+                if (msg.state !== 'active') {
+                    showToast('接続しました。「手を挙げる」でホストに知らせてください', 'success');
+                } else {
+                    showToast('接続しました。声が配信に乗ります', 'success');
+                }
+            } else if (msg.type === 'state') {
+                if (msg.state === 'active') {
+                    karaokeSetState('active', msg.host_muted ? 'ホストがミュート中' : null);
+                    if (!msg.host_muted) showToast('ホストがマイクを許可しました', 'success');
+                } else if (msg.state === 'denied') {
+                    karaokeSetState('denied');
+                    showToast('ホストが参加を許可しませんでした', 'warning');
+                    setTimeout(() => karaokeDisconnect(null), 800);
+                } else {
+                    karaokeSetState('waiting');
+                }
+            } else if (msg.type === 'pong') {
+                karaokeOnPong(msg);
+            } else if (msg.type === 'error') {
+                showToast(msg.message || 'エラー', 'danger');
+            }
+        }
+
+        function karaokeRaiseHand() {
+            if (!ka.ws) return;
+            ka.ws.send(JSON.stringify({ type: 'request_join' }));
+            showToast('ホストに手を挙げました', 'info');
+        }
+
+        function karaokeToggleMute() {
+            ka.muted = !ka.muted;
+            if (ka.micGain) ka.micGain.gain.value = ka.muted ? 0 : karaokeGainValue();
+            if (ka.ws) ka.ws.send(JSON.stringify({ type: 'mute', muted: ka.muted }));
+            const icon = document.getElementById('kaMuteIcon');
+            const label = document.getElementById('kaMuteLabel');
+            if (icon) icon.className = ka.muted ? 'ri-mic-off-line text-base text-rose-400' : 'ri-mic-line text-base';
+            if (label) label.innerText = ka.muted ? 'ミュート中' : 'ミュート';
+        }
+
+        // ------------------------------------------------------------------
+        // 音声グラフ
+        // ------------------------------------------------------------------
+        function karaokeGainValue() {
+            const el = document.getElementById('kaGain');
+            return el ? parseFloat(el.value) : 1.0;
+        }
+
+        async function karaokeStartAudio() {
+            // 音楽・歌唱向けの設定。会話用の補正を全部切る（設計書 4.1）。
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    sampleRate: KARAOKE_SAMPLE_RATE,
+                    echoCancellation: false,   // 音楽用：エコーキャンセルを無効化
+                    noiseSuppression: false,   // 音楽用：歌声の伸びをカットしない
+                    autoGainControl: false,    // 音楽用：抑揚・ダイナミクスを保つ
+                },
+                video: false,
+            });
+            ka.micStream = stream;
+
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            let ac;
+            try {
+                ac = new Ctx({ sampleRate: KARAOKE_SAMPLE_RATE, latencyHint: 'interactive' });
+            } catch (e) {
+                ac = new Ctx();
+            }
+            ka.ac = ac;
+            if (ac.state === 'suspended') await ac.resume();
+
+            const src = ac.createMediaStreamSource(stream);
+            ka.micGain = ac.createGain();
+            ka.micGain.gain.value = ka.muted ? 0 : karaokeGainValue();
+            src.connect(ka.micGain);
+
+            ka.analyser = ac.createAnalyser();
+            ka.analyser.fftSize = 1024;
+            ka.analyserBuf = new Uint8Array(ka.analyser.fftSize);
+            ka.micGain.connect(ka.analyser);
+
+            // アップリンクの合流点。GainNode は入力を素直に足し合わせる。
+            ka.uplink = ac.createGain();
+            ka.uplink.gain.value = 1.0;
+            ka.micGain.connect(ka.uplink);
+
+            // サイドトーン（自分の声の返り）。既定 0＝ハウリング事故を初期状態で起こさない。
+            ka.sidetoneGain = ac.createGain();
+            ka.sidetoneGain.gain.value = parseFloat(document.getElementById('kaSidetone').value || '0');
+            ka.micGain.connect(ka.sidetoneGain);
+            ka.sidetoneGain.connect(ac.destination);
+
+            karaokeAttachBgmToGraph();
+            await karaokeCreateProcessor(ac);
+        }
+
+        async function karaokeCreateProcessor(ac) {
+            // 送出レートは常に 48kHz。AudioContext が別のレートで開いた場合
+            // （iOS は 44.1kHz になることがある）は線形補間で詰める。
+            // ここを放置すると「音は出るが声が高い／低い」という気付きにくい壊れ方をする。
+            const step = ac.sampleRate / KARAOKE_SAMPLE_RATE;
+
+            const workletCode = `
+class MicSender extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    const o = opts.processorOptions;
+    this.step = o.step; this.chunk = o.chunk;
+    this.buf = new Float32Array(this.chunk); this.n = 0;
+    this.phase = 0; this.prev = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch || ch.length === 0) return true;
+    let p = this.phase;
+    while (p < ch.length) {
+      const i0 = Math.floor(p);
+      const frac = p - i0;
+      const a = (i0 < 0) ? this.prev : ch[i0];
+      const b = (i0 + 1 < ch.length) ? ch[i0 + 1] : ch[ch.length - 1];
+      this.buf[this.n++] = a + (b - a) * frac;
+      if (this.n >= this.chunk) {
+        const out = new Int16Array(this.chunk);
+        for (let k = 0; k < this.chunk; k++) {
+          let v = this.buf[k];
+          if (v > 1) v = 1; else if (v < -1) v = -1;
+          out[k] = v < 0 ? v * 32768 : v * 32767;
+        }
+        this.port.postMessage(out.buffer, [out.buffer]);
+        this.n = 0;
+      }
+      p += this.step;
+    }
+    this.phase = p - ch.length;
+    this.prev = ch[ch.length - 1];
+    return true;
+  }
+}
+registerProcessor('mic-sender', MicSender);
+`;
+            let node = null;
+            if (ac.audioWorklet) {
+                try {
+                    const url = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+                    await ac.audioWorklet.addModule(url);
+                    URL.revokeObjectURL(url);
+                    node = new AudioWorkletNode(ac, 'mic-sender', {
+                        numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+                        processorOptions: { step: step, chunk: KARAOKE_CHUNK_FRAMES },
+                    });
+                    node.port.onmessage = (ev) => karaokeSendPcm(ev.data);
+                } catch (e) {
+                    // ★Blob URL の読み込みが塞がれている環境（Beacon の中など）がある。
+                    //   ここで諦めずに古い方式へ落とす。
+                    node = null;
+                }
+            }
+
+            if (!node) {
+                const sp = ac.createScriptProcessor(4096, 1, 1);
+                let buf = new Float32Array(KARAOKE_CHUNK_FRAMES);
+                let n = 0, phase = 0, prev = 0;
+                sp.onaudioprocess = (ev) => {
+                    const ch = ev.inputBuffer.getChannelData(0);
+                    let p = phase;
+                    while (p < ch.length) {
+                        const i0 = Math.floor(p);
+                        const frac = p - i0;
+                        const a = (i0 < 0) ? prev : ch[i0];
+                        const b = (i0 + 1 < ch.length) ? ch[i0 + 1] : ch[ch.length - 1];
+                        buf[n++] = a + (b - a) * frac;
+                        if (n >= KARAOKE_CHUNK_FRAMES) {
+                            const out = new Int16Array(KARAOKE_CHUNK_FRAMES);
+                            for (let k = 0; k < KARAOKE_CHUNK_FRAMES; k++) {
+                                let v = buf[k];
+                                if (v > 1) v = 1; else if (v < -1) v = -1;
+                                out[k] = v < 0 ? v * 32768 : v * 32767;
+                            }
+                            karaokeSendPcm(out.buffer);
+                            n = 0;
+                        }
+                        p += step;
+                    }
+                    phase = p - ch.length;
+                    prev = ch[ch.length - 1];
+                };
+                node = sp;
+            }
+
+            ka.processor = node;
+            ka.uplink.connect(node);
+            // ★ScriptProcessorNode は出力を繋がないと発火しないブラウザがある。
+            //   かといってスピーカーへ出すと自分の声がそのまま鳴ってしまうので、
+            //   音量ゼロのノードを噛ませて捨てる。
+            ka.silentSink = ka.ac.createGain();
+            ka.silentSink.gain.value = 0;
+            node.connect(ka.silentSink);
+            ka.silentSink.connect(ka.ac.destination);
+        }
+
+        function karaokeSendPcm(arrayBuffer) {
+            const ws = ka.ws;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (ka.state !== 'active') return;      // 許可前は送らない（帯域も相手も無駄にしない）
+            if (ws.bufferedAmount > KARAOKE_MAX_BUFFERED) return;   // 詰まっているときは捨てる
+            try { ws.send(arrayBuffer); } catch (e) {}
+        }
+
+        function karaokeStopAudio() {
+            try { if (ka.processor) { ka.processor.disconnect(); if (ka.processor.port) ka.processor.port.onmessage = null; } } catch (e) {}
+            try { if (ka.silentSink) ka.silentSink.disconnect(); } catch (e) {}
+            try { if (ka.sidetoneGain) ka.sidetoneGain.disconnect(); } catch (e) {}
+            try { if (ka.micGain) ka.micGain.disconnect(); } catch (e) {}
+            try { if (ka.uplink) ka.uplink.disconnect(); } catch (e) {}
+            if (ka.micStream) {
+                ka.micStream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
+                ka.micStream = null;
+            }
+            // ★AudioContext は閉じない。閉じると、選び直した伴奏ファイルを
+            //   createMediaElementSource で繋ぎ直せなくなる（要素は1つの context に固定される）。
+            ka.processor = null; ka.micGain = null; ka.uplink = null;
+            ka.analyser = null; ka.silentSink = null;
+        }
+
+        // ------------------------------------------------------------------
+        // 手元モニター
+        // ------------------------------------------------------------------
+        function karaokeSetGain(v) {
+            document.getElementById('kaGainVal').innerText = parseFloat(v).toFixed(2);
+            if (ka.micGain && !ka.muted) ka.micGain.gain.value = parseFloat(v);
+        }
+
+        function karaokeSetSidetone(v) {
+            document.getElementById('kaSideVal').innerText = `${Math.round(parseFloat(v) * 100)}%`;
+            if (ka.sidetoneGain) ka.sidetoneGain.gain.value = parseFloat(v);
+        }
+
+        function karaokeSetBgmMonitor(v) {
+            document.getElementById('kaBgmMonVal').innerText = `${Math.round(parseFloat(v) * 100)}%`;
+            if (ka.bgmMonGain) ka.bgmMonGain.gain.value = parseFloat(v);
+        }
+
+        function karaokeSetBgmSend(v) {
+            document.getElementById('kaBgmSendVal').innerText = `${Math.round(parseFloat(v) * 100)}%`;
+            if (ka.bgmSendGain) ka.bgmSendGain.gain.value = parseFloat(v);
+        }
+
+        function karaokeLoadBgm(input) {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            if (!ka.bgmEl) {
+                ka.bgmEl = new Audio();
+                ka.bgmEl.loop = false;
+                ka.bgmEl.onended = () => karaokeUpdateBgmButton(false);
+            }
+            ka.bgmEl.src = URL.createObjectURL(file);
+            document.getElementById('kaBgmName').innerText = file.name;
+            document.getElementById('kaBgmPlayBtn').disabled = false;
+            karaokeUpdateBgmButton(false);
+            karaokeAttachBgmToGraph();
+        }
+
+        function karaokeAttachBgmToGraph() {
+            if (!ka.ac || !ka.bgmEl || ka.bgmSrcNode) return;
+            // ★createMediaElementSource は 1 要素につき 1 回しか呼べない。
+            //   2 回目は例外になるので、繋いだかどうかを必ず持っておく。
+            try {
+                ka.bgmSrcNode = ka.ac.createMediaElementSource(ka.bgmEl);
+            } catch (e) {
+                return;
+            }
+            ka.bgmMonGain = ka.ac.createGain();
+            ka.bgmMonGain.gain.value = parseFloat(document.getElementById('kaBgmMonitor').value || '0.8');
+            ka.bgmSrcNode.connect(ka.bgmMonGain);
+            ka.bgmMonGain.connect(ka.ac.destination);
+
+            ka.bgmSendGain = ka.ac.createGain();
+            ka.bgmSendGain.gain.value = parseFloat(document.getElementById('kaBgmSend').value || '0.6');
+            ka.bgmSrcNode.connect(ka.bgmSendGain);
+            if (ka.uplink) ka.bgmSendGain.connect(ka.uplink);
+        }
+
+        function karaokeUpdateBgmButton(playing) {
+            const icon = document.getElementById('kaBgmPlayIcon');
+            const label = document.getElementById('kaBgmPlayLabel');
+            if (icon) icon.className = playing ? 'ri-pause-fill' : 'ri-play-fill';
+            if (label) label.innerText = playing ? '一時停止' : '再生';
+        }
+
+        function karaokeToggleBgm() {
+            if (!ka.bgmEl) return;
+            karaokeAttachBgmToGraph();
+            if (ka.bgmEl.paused) {
+                ka.bgmEl.play().then(() => karaokeUpdateBgmButton(true))
+                    .catch(e => showToast(`伴奏を再生できません: ${e.message || e}`, 'danger'));
+            } else {
+                ka.bgmEl.pause();
+                karaokeUpdateBgmButton(false);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // VUメーター・回線品質
+        // ------------------------------------------------------------------
+        function karaokeStartVu() {
+            if (ka.vuTimer) clearInterval(ka.vuTimer);
+            ka.vuTimer = setInterval(() => {
+                if (!ka.analyser) return;
+                ka.analyser.getByteTimeDomainData(ka.analyserBuf);
+                let peak = 0;
+                for (let i = 0; i < ka.analyserBuf.length; i++) {
+                    const v = Math.abs(ka.analyserBuf[i] - 128);
+                    if (v > peak) peak = v;
+                }
+                const pct = Math.min(100, Math.round((peak / 128) * 100));
+                const bar = document.getElementById('kaVuBar');
+                if (bar) bar.style.width = `${pct}%`;
+            }, 60);
+        }
+
+        function karaokeStartPing() {
+            if (ka.pingTimer) clearInterval(ka.pingTimer);
+            ka.pingTimer = setInterval(() => {
+                if (!ka.ws || ka.ws.readyState !== WebSocket.OPEN) return;
+                ka.ws.send(JSON.stringify({ type: 'ping', t: Math.round(performance.now()) }));
+            }, 1000);
+        }
+
+        function karaokeOnPong(msg) {
+            const rtt = Math.max(0, Math.round(performance.now() - (msg.t || 0)));
+            ka.lastRtt = rtt;
+            // ジッタ＝往復遅延の揺らぎ。RFC 3550 と同じ考え方で、直前との差を平滑する。
+            if (ka.prevRtt !== null) {
+                ka.jitter = Math.round(ka.jitter + (Math.abs(rtt - ka.prevRtt) - ka.jitter) / 16);
+            }
+            ka.prevRtt = rtt;
+
+            const icon = document.getElementById('kaNetIcon');
+            const text = document.getElementById('kaNetText');
+            if (text) text.innerText = `${rtt} ms / ゆらぎ ${ka.jitter} ms`;
+            if (icon) {
+                let cls = 'ri-signal-wifi-fill text-base ';
+                if (rtt < 80 && ka.jitter < 20) cls += 'text-emerald-400';
+                else if (rtt < 200 && ka.jitter < 50) cls += 'text-amber-400';
+                else cls += 'text-rose-400';
+                icon.className = cls;
+            }
+
+            // ホストの卓にも見せたいので、たまに報告する（毎回送る必要はない）。
+            const now = performance.now();
+            if (now - ka.netReportAt > 3000 && ka.ws && ka.ws.readyState === WebSocket.OPEN) {
+                ka.netReportAt = now;
+                ka.ws.send(JSON.stringify({ type: 'net', rtt: rtt, jitter: ka.jitter }));
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // ホスト卓
+        // ------------------------------------------------------------------
+        async function karaokeFetchStatus() {
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`);
+                if (!res.ok) return null;
+                return await res.json();
+            } catch (e) { return null; }
+        }
+
+        function karaokeApplyGuestView(data) {
+            ka.sessionEnabled = !!(data && data.enabled);
+            const notice = document.getElementById('kaClosedNotice');
+            if (notice) notice.classList.toggle('hidden', ka.sessionEnabled);
+            const btn = document.getElementById('kaConnectBtn');
+            if (btn) btn.disabled = !ka.sessionEnabled && ka.state === 'idle';
+        }
+
+        let karaokeSettingsLoaded = false;
+
+        function karaokeApplyHostSettings(k) {
+            // スライダを掴んでいる間は書き戻さない。掴んだ端から値が戻ると操作できない。
+            if (ka.hostDragging) return;
+            const set = (id, val) => { const el = document.getElementById(id); if (el && el.value != val) el.value = val; };
+            const chk = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
+            chk('kaEnabled', k.enabled);
+            chk('kaApproval', k.approval_required);
+            set('kaLatency', k.latency_mode);
+            set('kaReverb', k.reverb);
+            set('kaMaster', k.master_volume);
+            set('kaOffset', k.offset_ms);
+            document.getElementById('kaMasterVal').innerText = Number(k.master_volume).toFixed(2);
+            document.getElementById('kaOffsetVal').innerText = `${k.offset_ms} ms`;
+        }
+
+        function karaokeOnMasterInput(v) {
+            ka.hostDragging = true;
+            document.getElementById('kaMasterVal').innerText = parseFloat(v).toFixed(2);
+        }
+
+        function karaokeOnOffsetInput(v) {
+            ka.hostDragging = true;
+            document.getElementById('kaOffsetVal').innerText = `${parseInt(v, 10)} ms`;
+        }
+
+        async function karaokeSaveSettings() {
+            ka.hostDragging = false;
+            const body = {
+                action: 'settings',
+                enabled: document.getElementById('kaEnabled').checked,
+                approval_required: document.getElementById('kaApproval').checked,
+                latency_mode: document.getElementById('kaLatency').value,
+                reverb: document.getElementById('kaReverb').value,
+                master_volume: parseFloat(document.getElementById('kaMaster').value),
+                offset_ms: parseInt(document.getElementById('kaOffset').value, 10),
+            };
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json();
+                if (!data.success) { showToast(data.message || '設定を保存できません', 'danger'); return; }
+                karaokeRenderHost(data.karaoke);
+            } catch (e) {
+                showToast(`設定を保存できません: ${e.message || e}`, 'danger');
+            }
+        }
+
+        async function karaokeHostAction(payload) {
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!data.success) { showToast(data.message || '操作できません', 'warning'); return; }
+                if (data.karaoke) karaokeRenderHost(data.karaoke);
+            } catch (e) {
+                showToast(`操作できません: ${e.message || e}`, 'danger');
+            }
+        }
+
+        function karaokeGrant(id) { karaokeHostAction({ action: 'grant', id }); }
+        function karaokeDeny(id) { karaokeHostAction({ action: 'deny', id }); }
+        function karaokeKick(id) { karaokeHostAction({ action: 'kick', id }); }
+        function karaokeHostMute(id, muted) { karaokeHostAction({ action: 'mix', id, host_muted: muted }); }
+        function karaokeSetParticipantVolume(id, v) {
+            ka.hostDragging = true;
+            karaokeHostAction({ action: 'mix', id, volume: parseFloat(v) });
+        }
+        function karaokeSetParticipantPan(id, v) {
+            ka.hostDragging = true;
+            karaokeHostAction({ action: 'mix', id, pan: parseFloat(v) });
+        }
+
+        async function karaokeToggleRecording() {
+            // 表示中の文字から状態を読むのではなく、直近のサーバ応答を正本にする。
+            const wasRecording = ka.recording === true;
+            await karaokeHostAction({ action: wasRecording ? 'record_stop' : 'record_start' });
+            showToast(wasRecording ? '録音を保存しました（recordings フォルダ）'
+                                   : 'セッション録音を開始しました', 'success');
+        }
+
+        function karaokeEscape(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[c]);
+        }
+
+        function karaokeRenderHost(k) {
+            if (!k) return;
+            karaokeApplyHostSettings(k);
+
+            const pipe = document.getElementById('kaPipeState');
+            if (pipe) {
+                if (k.pipe_connected) {
+                    pipe.innerText = '配信に接続中';
+                    pipe.className = 'text-[10px] font-mono px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300';
+                } else if (k.running) {
+                    pipe.innerText = '待機中（配信開始で接続）';
+                    pipe.className = 'text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-400';
+                } else {
+                    pipe.innerText = '停止中';
+                    pipe.className = 'text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500';
+                }
+            }
+
+            ka.recording = !!k.recording;
+            const recIcon = document.getElementById('kaRecIcon');
+            const recLabel = document.getElementById('kaRecLabel');
+            if (recLabel) {
+                if (k.recording) {
+                    const s = k.recording_seconds || 0;
+                    const mm = String(Math.floor(s / 60)).padStart(2, '0');
+                    const ss = String(s % 60).padStart(2, '0');
+                    recLabel.innerText = `録音停止 (${mm}:${ss})`;
+                    if (recIcon) recIcon.className = 'ri-stop-circle-fill text-rose-400 animate-pulse';
+                } else {
+                    recLabel.innerText = 'セッション録音';
+                    if (recIcon) recIcon.className = 'ri-record-circle-line text-rose-400';
+                }
+            }
+
+            const vu = document.getElementById('kaMasterVu');
+            if (vu) vu.style.width = `${Math.round((k.master_level || 0) * 100)}%`;
+
+            const people = k.participants || [];
+            document.getElementById('kaCounts').innerText =
+                `${people.length} 人（ON AIR ${k.active_count || 0} / 挙手 ${k.waiting_count || 0}）`;
+            document.getElementById('kaEmptyNote').classList.toggle('hidden', people.length > 0);
+
+            const box = document.getElementById('kaParticipants');
+            if (!box) return;
+
+            // ★骨組み（誰が居て、どの状態か）が変わったときだけ作り直す。
+            //   毎回 innerHTML を書き換えると、音量や PAN のスライダを掴んでいる
+            //   最中に要素ごと消えてドラッグが切れる（実機で確認した不具合）。
+            const sig = people.map(p => `${p.id}:${p.state}:${p.host_muted ? 1 : 0}`).join('|');
+            if (sig !== ka.listSig) {
+                ka.listSig = sig;
+                box.innerHTML = people.map(p => karaokeParticipantHtml(p)).join('');
+            }
+
+            // 数値だけを毎回書き換える（要素は作り直さない）。
+            people.forEach(p => {
+                const id = p.id;
+                const vuEl = document.getElementById(`kaPVu-${id}`);
+                if (vuEl) vuEl.style.width = `${Math.round((p.level || 0) * 100)}%`;
+                const netEl = document.getElementById(`kaPNet-${id}`);
+                if (netEl) {
+                    netEl.innerText = `${p.rtt_ms || '--'}ms / ゆらぎ${p.jitter_ms || 0}ms`;
+                    netEl.className = 'text-[10px] font-mono ml-auto ' +
+                        ((p.rtt_ms && p.rtt_ms < 80) ? 'text-emerald-400'
+                         : (p.rtt_ms && p.rtt_ms < 200) ? 'text-amber-400' : 'text-rose-400');
+                }
+                const bufEl = document.getElementById(`kaPBuf-${id}`);
+                if (bufEl) {
+                    // 取りこぼしが起きているなら、それも出す。原因の切り分けに要る。
+                    bufEl.innerText = p.underruns
+                        ? `buf ${p.buffer_ms}ms / 途切れ${p.underruns}`
+                        : `buf ${p.buffer_ms}ms`;
+                }
+            });
+        }
+
+        function karaokeParticipantHtml(p) {
+            const id = karaokeEscape(p.id);
+            const badge = p.state === 'active'
+                ? '<span class="px-1.5 py-0.5 rounded bg-rose-500/15 border border-rose-500/40 text-rose-300 text-[10px]">ON AIR</span>'
+                : p.state === 'waiting'
+                ? '<span class="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300 text-[10px]">挙手中</span>'
+                : '<span class="px-1.5 py-0.5 rounded bg-zinc-700 text-zinc-400 text-[10px]">待機</span>';
+            const actions = p.state === 'active'
+                ? `<button onclick="karaokeHostMute('${id}', ${!p.host_muted})" class="px-2 py-1 rounded border text-[10px] transition ${p.host_muted ? 'bg-rose-500/15 border-rose-500/40 text-rose-300' : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700'}">${p.host_muted ? 'ミュート解除' : 'ミュート'}</button>
+                   <button onclick="karaokeKick('${id}')" class="px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-[10px] text-zinc-300 hover:bg-rose-900/40 transition">退出</button>`
+                : `<button onclick="karaokeGrant('${id}')" class="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-[10px] text-zinc-950 font-bold transition">許可</button>
+                   <button onclick="karaokeDeny('${id}')" class="px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-[10px] text-zinc-300 hover:bg-zinc-700 transition">拒否</button>`;
+            const mixer = p.state === 'active' ? `
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                    <label class="flex items-center gap-2 text-[10px] text-zinc-400">
+                        <span class="w-10 shrink-0">音量</span>
+                        <input type="range" min="0" max="2" step="0.05" value="${p.volume}"
+                               oninput="document.getElementById('kaPVol-${id}').innerText = parseFloat(this.value).toFixed(2)"
+                               onchange="karaokeSetParticipantVolume('${id}', this.value)" class="flex-1 accent-emerald-500">
+                        <span id="kaPVol-${id}" class="font-mono w-8 text-right">${Number(p.volume).toFixed(2)}</span>
+                    </label>
+                    <label class="flex items-center gap-2 text-[10px] text-zinc-400">
+                        <span class="w-10 shrink-0">PAN</span>
+                        <input type="range" min="-1" max="1" step="0.1" value="${p.pan}"
+                               oninput="document.getElementById('kaPPan-${id}').innerText = karaokePanLabel(this.value)"
+                               onchange="karaokeSetParticipantPan('${id}', this.value)" class="flex-1 accent-sky-500">
+                        <span id="kaPPan-${id}" class="font-mono w-8 text-right">${karaokePanLabel(p.pan)}</span>
+                    </label>
+                </div>` : '';
+            return `
+            <div class="bg-zinc-900/60 border border-zinc-700 rounded p-2.5 flex flex-col gap-2">
+                <div class="flex items-center gap-2 flex-wrap">
+                    <span class="text-xs font-semibold text-zinc-100 truncate max-w-[140px]">${karaokeEscape(p.name)}</span>
+                    ${badge}
+                    <span id="kaPNet-${id}" class="text-[10px] font-mono ml-auto text-zinc-500">--ms</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="h-2 flex-1 bg-zinc-950 border border-zinc-700 rounded overflow-hidden">
+                        <div id="kaPVu-${id}" class="h-full w-0" style="background:linear-gradient(90deg,#34d399 0%,#34d399 60%,#fbbf24 80%,#f43f5e 100%)"></div>
+                    </div>
+                    <span id="kaPBuf-${id}" class="text-[10px] font-mono text-zinc-600">buf --</span>
+                </div>
+                <div class="flex items-center gap-1.5 flex-wrap">${actions}</div>
+                ${mixer}
+            </div>`;
+        }
+
+        function karaokePanLabel(v) {
+            const n = parseFloat(v);
+            if (!n) return 'C';
+            return (n < 0 ? 'L' : 'R') + Math.round(Math.abs(n) * 100);
+        }
+
+        // ------------------------------------------------------------------
+        // ポーリング（カラオケタブを開いている間だけ）
+        // ------------------------------------------------------------------
+        function karaokeOnTabShown(shown) {
+            if (ka.pollTimer) { clearInterval(ka.pollTimer); ka.pollTimer = null; }
+            if (!shown) return;
+            const tick = async () => {
+                const data = await karaokeFetchStatus();
+                if (!data) return;
+                if (data.host_view && data.karaoke) {
+                    ka.hostView = true;
+                    karaokeApplyGuestView({ enabled: data.karaoke.enabled });
+                    karaokeRenderHost(data.karaoke);
+                } else {
+                    karaokeApplyGuestView(data);
+                }
+            };
+            tick();
+            // ホストはVUメーターを見たいので速く、ゲストは開いているかどうかだけなので遅く。
+            ka.pollTimer = setInterval(tick, ka.hostView ? 400 : 3000);
+        }
+
+        function karaokeApplyHostVisibility(isHost) {
+            const panel = document.getElementById('kaHostPanel');
+            if (!panel) return;
+            panel.classList.toggle('hidden', !isHost);
+            panel.classList.toggle('flex', isHost);
+        }
+
+        // ページを離れるときはマイクを必ず止める。止め忘れるとブラウザのタブに
+        // 録音中インジケータが残り続け、利用者を不安にさせる。
+        window.addEventListener('beforeunload', () => {
+            if (ka.state !== 'idle') karaokeDisconnect(null);
+        });
+
     </script>
 </body>
 </html>

@@ -541,3 +541,159 @@ def test_large_server_frame_uses_extended_length():
     conn = ws_server.WebSocketConnection(_FakeSock(), io.BytesIO(), io.BytesIO())
     conn.send_binary(b"\x00" * 200)
     assert conn.wfile.getvalue()[:4] == b"\x82\x7e\x00\xc8"
+
+
+# ---------------------------------------------------------------------------
+# 8. API の権限境界（ソケットを張らずにハンドラのメソッドだけ試す）
+#
+# ★ここが破れると承認制が意味を失う。参加者が自分で自分を承認できてしまえば、
+#   「知らないうちに他人の声が配信へ乗る」という一番重い事故がそのまま起きる。
+# ---------------------------------------------------------------------------
+import api_server
+
+
+class _Headers(dict):
+    def __init__(self, mapping=None):
+        super().__init__({k.lower(): v for k, v in (mapping or {}).items()})
+
+    def __contains__(self, key):
+        return super().__contains__(str(key).lower())
+
+    def get(self, key, default=None):
+        return super().get(str(key).lower(), default)
+
+
+class _CoreStub:
+    def __init__(self, session, web_password=""):
+        self.karaoke = session
+        self.config = {"enable_web_remote": True, "trust_lan_clients": False,
+                       "web_password": web_password}
+
+
+def _api_handler(session, client_ip="127.0.0.1", headers=None, web_password=""):
+    h = object.__new__(api_server.APIAndHLSHandler)
+    h.streamer_core = _CoreStub(session, web_password)
+    h.client_address = (client_ip, 12345)
+    h.headers = _Headers(headers)
+    h._origin_is_self = lambda: True
+    h._host_header_is_safe = lambda: True
+    h.sent = []
+    h.send_json_response = lambda code, data: h.sent.append((code, data))
+    return h
+
+
+def test_guest_cannot_reach_host_controls(session):
+    """ゲストのPOSTは 403。ここが開くと参加者が自分を承認できる。"""
+    h = _api_handler(session, client_ip="192.168.1.50")
+    assert h.is_local_request() is False
+
+
+def test_tunnel_client_is_never_treated_as_host(session):
+    """トンネル経由は cloudflared が 127.0.0.1 から繋ぐので IP だけでは見分けられない。
+
+    CF-Connecting-IP / X-Forwarded-For があれば必ずゲスト扱いにすること。
+    """
+    for hdr in ("CF-Connecting-IP", "X-Forwarded-For"):
+        h = _api_handler(session, client_ip="127.0.0.1", headers={hdr: "203.0.113.9"})
+        assert h.is_local_request() is False, hdr
+
+
+def test_ws_password_check_uses_configured_password(session):
+    """PIN が設定されていれば hello の値で検証すること。"""
+    import karaoke_ws
+    h = _api_handler(session, client_ip="192.168.1.50", web_password="1234")
+    h.register_auth_success = lambda: None
+    h.register_auth_failure = lambda: None
+    assert karaoke_ws._check_password(h, "1234") is True
+    assert karaoke_ws._check_password(h, "9999") is False
+    assert karaoke_ws._check_password(h, None) is False
+
+
+def test_ws_password_check_counts_failures_for_lockout(session):
+    """WebSocket の失敗も既存のブルートフォース対策へ合流させること。
+
+    ここを素通しにすると、REST を固めても WS 側から総当たりできてしまう。
+    """
+    import karaoke_ws
+    h = _api_handler(session, client_ip="192.168.1.50", web_password="1234")
+    calls = {"ok": 0, "ng": 0}
+    h.register_auth_success = lambda: calls.__setitem__("ok", calls["ok"] + 1)
+    h.register_auth_failure = lambda: calls.__setitem__("ng", calls["ng"] + 1)
+    karaoke_ws._check_password(h, "9999")
+    karaoke_ws._check_password(h, "1234")
+    assert calls == {"ok": 1, "ng": 1}
+
+
+def test_ws_password_is_not_required_without_configuration(session):
+    """PIN 未設定なら誰でも入れる（既存の Web リモコンと同じ扱い）。"""
+    import karaoke_ws
+    h = _api_handler(session, client_ip="192.168.1.50", web_password="")
+    assert karaoke_ws._check_password(h, None) is True
+
+
+# ---------------------------------------------------------------------------
+# 9. 配布物（PyInstaller）への同梱
+# ---------------------------------------------------------------------------
+def test_build_script_declares_karaoke_modules():
+    """karaoke_ws は関数内で遅延 import しているので、明示しないと取りこぼしうる。
+
+    落ちるのは「実機でマイクを繋ごうとした瞬間」なので、ここで止める。
+    """
+    with io.open(os.path.join(BASE_DIR, "build_exe.py"), encoding="utf-8") as f:
+        src = f.read()
+    for mod in ("remote_mic", "ws_server", "karaoke_ws"):
+        assert f'"--hidden-import", "{mod}"' in src, f"{mod} が build_exe.py に無い"
+
+
+def test_default_config_keeps_karaoke_closed():
+    """既定は必ず「閉じている」。開いた状態を初期値にしてはいけない。"""
+    from streamer_core import DEFAULT_CONFIG
+    assert DEFAULT_CONFIG["karaoke_enabled"] is False
+    assert DEFAULT_CONFIG["karaoke_approval_required"] is True
+
+
+# ---------------------------------------------------------------------------
+# 10. Web UI（配布物のズレと、詰まりどころの案内）
+# ---------------------------------------------------------------------------
+def _ui_html():
+    with io.open(os.path.join(BASE_DIR, "ui", "index.html"), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_ui_has_karaoke_tab_and_host_panel():
+    html = _ui_html()
+    for needle in ('id="tab-karaoke"', 'id="nav-karaoke"', 'id="kaHostPanel"',
+                   'karaokeToggleConnection()', '/ws/audio_session'):
+        assert needle in html, needle
+
+
+def test_ui_warns_about_https_requirement():
+    """getUserMedia は https / localhost でしか動かない。
+
+    ここを黙って通すと「つないでも何も起きない」という一番分かりにくい失敗になる。
+    LAN の http://192.168.x.x で開いた参加者は必ずここに当たる。
+    """
+    html = _ui_html()
+    assert 'id="kaInsecureNotice"' in html
+    assert "karaokeIsSecureForMic" in html
+
+
+def test_ui_defaults_sidetone_to_zero():
+    """サイドトーンの初期値は 0。既定で自分の声を返すとハウリング事故になる。"""
+    html = _ui_html()
+    i = html.index('id="kaSidetone"')
+    snippet = html[i:i + 200]
+    assert 'value="0"' in snippet, snippet[:160]
+
+
+def test_ui_participant_list_is_not_rebuilt_every_poll():
+    """卓は 400ms ごとに更新する。毎回作り直すとスライダのドラッグが切れる。"""
+    html = _ui_html()
+    assert "ka.listSig" in html, "骨組みの差分判定が無い"
+    assert "karaokeParticipantHtml" in html
+
+
+def test_ui_escapes_participant_names():
+    """表示名は参加者が自由に決める。そのまま埋めると HTML を注入できる。"""
+    html = _ui_html()
+    assert "karaokeEscape(p.name)" in html

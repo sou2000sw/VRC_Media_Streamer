@@ -619,6 +619,12 @@ def build(version=APP_VERSION):
         "--collect-all", "webview",
         "--collect-all", "clr_loader",
         "--hidden-import", "clr",
+        # タスク27: 参加型カラオケ。karaoke_ws は api_server の do_GET の中で
+        # 遅延 import しているため、静的解析に頼ると取りこぼす可能性がある。
+        # 落ちるのは「実機でマイクを繋ごうとした瞬間」なので、明示して塞ぐ。
+        "--hidden-import", "remote_mic",
+        "--hidden-import", "ws_server",
+        "--hidden-import", "karaoke_ws",
         "--clean",
         "gui_streamer.py"
     ]
