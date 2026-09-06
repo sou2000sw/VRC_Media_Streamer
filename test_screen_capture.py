@@ -9,7 +9,7 @@ import streamer_core
 from streamer_core import (
     DEFAULT_CONFIG, StreamerCore, even_dimension,
     build_screen_capture_input, build_screen_video_filter,
-    find_capture_window
+    find_capture_window, clamp_window_capture_rect
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,20 +39,54 @@ def test_build_screen_capture_input_display_draw_mouse_false():
 
 
 def test_build_screen_capture_input_window():
-    args, needs_hwdownload = build_screen_capture_input(source_type="window", window_title="メモ帳", framerate=30, draw_mouse=True)
+    """ウィンドウ取り込みは「デスクトップをウィンドウ矩形で切り出す」形になる。
+
+    ★`title=` を使ってはいけない。GPU合成されたウィンドウが真っ黒/真っ白になる
+      （実測: Chrome と Electron は mean=0.0、Unity は mean=255.0）。
+    """
+    args, needs_hwdownload = build_screen_capture_input(
+        source_type="window", window_title="メモ帳", framerate=30, draw_mouse=True,
+        window_rect=(100, 50, 800, 600))
     assert needs_hwdownload is False
     assert "-f" in args and "gdigrab" in args
-    assert "-draw_mouse" in args
-    idx_dm = args.index("-draw_mouse")
-    assert args[idx_dm + 1] == "1"
-    assert "-i" in args
     idx_i = args.index("-i")
-    assert args[idx_i + 1] == "title=メモ帳"
+    assert args[idx_i + 1] == "desktop"
+    assert args[args.index("-offset_x") + 1] == "100"
+    assert args[args.index("-offset_y") + 1] == "50"
+    assert args[args.index("-video_size") + 1] == "800x600"
+    assert args[args.index("-draw_mouse") + 1] == "1"
 
-    # draw_mouse = False -> "0"
-    args0, _ = build_screen_capture_input(source_type="window", window_title="メモ帳", framerate=30, draw_mouse=False)
-    idx_dm0 = args0.index("-draw_mouse")
-    assert args0[idx_dm0 + 1] == "0"
+    # ★回帰ガード: title= 経路へ戻したら落とす
+    assert not any(str(a).startswith("title=") for a in args)
+
+    args0, _ = build_screen_capture_input(
+        source_type="window", window_title="メモ帳", framerate=30, draw_mouse=False,
+        window_rect=(100, 50, 800, 600))
+    assert args0[args0.index("-draw_mouse") + 1] == "0"
+
+
+def test_build_screen_capture_input_window_without_rect_falls_back():
+    """矩形が取れないウィンドウは掴めない。ディスプレイ取り込みへ落とす。"""
+    args, needs_hwdownload = build_screen_capture_input(
+        source_type="window", window_title="メモ帳", framerate=30, window_rect=None)
+    assert needs_hwdownload is True
+    assert "lavfi" in args
+    assert not any(str(a).startswith("title=") for a in args)
+
+
+def test_clamp_window_capture_rect():
+    """仮想デスクトップからはみ出した分を落とす。
+
+    ★落とさないと ffmpeg が `extends outside window area` で起動しない。
+      実測でウィンドウが (-2568, -7) と画面外へわずかに出ていた。
+    """
+    virt = (-2560, 0, 5120, 1441)
+    # 左上が枠外へはみ出しているケース（実測値）
+    assert clamp_window_capture_rect(-2568, -7, 2576, 1408, virt) == (-2560, 0, 2568, 1401)
+    # 完全に内側なら素通し
+    assert clamp_window_capture_rect(672, 296, 1216, 808, virt) == (672, 296, 1216, 808)
+    # 右下がはみ出すケース
+    assert clamp_window_capture_rect(2000, 1200, 1000, 1000, virt) == (2000, 1200, 560, 241)
 
 
 def test_build_screen_capture_input_window_empty_title_fallback():

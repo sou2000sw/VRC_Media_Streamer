@@ -550,8 +550,12 @@ def enumerate_capture_windows():
         import ctypes
         from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
-        dwmapi = ctypes.windll.dwmapi
+        # ★ctypes.windll.user32 はプロセス内で共有・キャッシュされる。ここで
+        #   argtypes を書き換えると、同じプロセスの別の利用者が壊れる（実際に
+        #   検証スクリプトが "expected LP_RECT instead of pointer to RECT" で落ちた）。
+        #   独立インスタンスを作って、この関数の中に閉じ込める。
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 
         WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -636,6 +640,8 @@ def enumerate_capture_windows():
 
                 results.append({
                     "title": title,
+                    "left": int(rect.left),
+                    "top": int(rect.top),
                     "width": int(w),
                     "height": int(h),
                     "pid": int(pid.value)
@@ -656,6 +662,8 @@ def enumerate_capture_windows():
         for r in results:
             final_windows.append({
                 "title": r["title"],
+                "left": r["left"],
+                "top": r["top"],
                 "width": r["width"],
                 "height": r["height"],
                 "pid": r["pid"],
@@ -689,9 +697,61 @@ def even_dimension(value, minimum=2):
     return v
 
 
+def get_virtual_screen_rect():
+    """仮想デスクトップ全体の矩形 (left, top, width, height)。
+
+    マルチモニタでは原点が負になりうる（実測: 左側にもう1枚あると (-2560, 0)）。
+    0 起点だと思い込むと切り出し位置が丸ごとずれる。
+    """
+    if sys.platform != "win32":
+        return (0, 0, 0, 0)
+    try:
+        import ctypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u.GetSystemMetrics.restype = ctypes.c_int
+        # SM_XVIRTUALSCREEN=76 / SM_YVIRTUALSCREEN=77 / SM_CXVIRTUALSCREEN=78 / SM_CYVIRTUALSCREEN=79
+        return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),
+                u.GetSystemMetrics(78), u.GetSystemMetrics(79))
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+def clamp_window_capture_rect(left, top, width, height, virtual_rect=None):
+    """ウィンドウ矩形を仮想デスクトップの内側へ収めて (x, y, w, h) を返す。
+
+    ★はみ出しを落とさないと ffmpeg が起動しない。実測でウィンドウが
+    `(-2568, -7)` のように画面外へわずかに出ていることがあり、そのまま渡すと
+    `Capture area ... extends outside window area ...` で I/O error になる。
+    """
+    vx, vy, vw, vh = virtual_rect if virtual_rect else get_virtual_screen_rect()
+    try:
+        left, top, width, height = int(left), int(top), int(width), int(height)
+    except (TypeError, ValueError):
+        return (0, 0, 0, 0)
+    if vw <= 0 or vh <= 0:
+        return (left, top, max(0, width), max(0, height))
+
+    x = max(vx, left)
+    y = max(vy, top)
+    w = min(left + width, vx + vw) - x
+    h = min(top + height, vy + vh) - y
+    return (x, y, max(0, w), max(0, h))
+
+
 def build_screen_capture_input(source_type="display", display_index=0, window_title="",
-                               framerate=30, draw_mouse=True):
-    """画面キャプチャ入力の ffmpeg 引数を組み立てる。(input_args, needs_hwdownload) を返す。"""
+                               framerate=30, draw_mouse=True, window_rect=None):
+    """画面キャプチャ入力の ffmpeg 引数を組み立てる。(input_args, needs_hwdownload) を返す。
+
+    ★ウィンドウ取り込みに `gdigrab -i "title=..."` を使ってはいけない。
+      あれはウィンドウのDCから BitBlt するので、**GPU合成されたウィンドウが
+      真っ黒（または真っ白）になる**。実測: Chrome / Electron(Claude) は
+      mean=0.0 の完全な黒、Unity(VRChat) は mean=255.0 の完全な白だった。
+      共有したいアプリはほぼ全部これに当たるので、事実上使えない。
+      代わりに **合成済みのデスクトップをウィンドウ矩形で切り出す**。
+      同じ3ウィンドウが mean=30.6 / 37.2 / 133.7 と正しく映ることを実測で確認済み。
+      副作用として、手前に重なった別ウィンドウはそのまま映り込む。
+    """
     try:
         fps = int(framerate)
     except (TypeError, ValueError):
@@ -699,27 +759,34 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
     if fps < 1 or fps > 60:
         fps = 30
 
-    if source_type == "window" and window_title:
-        dm = "1" if draw_mouse else "0"
-        input_args = [
-            "-f", "gdigrab", "-thread_queue_size", "1024",
-            "-framerate", str(fps), "-draw_mouse", dm,
-            "-i", f"title={window_title}"
-        ]
-        return (input_args, False)
-    else:
-        try:
-            idx = int(display_index)
-            if idx < 0:
-                idx = 0
-        except (TypeError, ValueError):
+    if source_type == "window" and window_title and window_rect:
+        x, y, w, h = clamp_window_capture_rect(*window_rect)
+        if w >= 16 and h >= 16:
+            dm = "1" if draw_mouse else "0"
+            # ★offset_x/offset_y は仮想画面の**絶対座標**。原点からの相対値を
+            #   渡すと `extends outside window area` で起動しない（実測で確認）。
+            input_args = [
+                "-f", "gdigrab", "-thread_queue_size", "1024",
+                "-framerate", str(fps), "-draw_mouse", dm,
+                "-offset_x", str(x), "-offset_y", str(y),
+                "-video_size", f"{w}x{h}",
+                "-i", "desktop"
+            ]
+            return (input_args, False)
+
+    # ディスプレイ取り込み（ウィンドウを解決できなかった場合もここへ落ちる）
+    try:
+        idx = int(display_index)
+        if idx < 0:
             idx = 0
-        dm = "true" if draw_mouse else "false"
-        input_args = [
-            "-f", "lavfi", "-thread_queue_size", "1024",
-            "-i", f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
-        ]
-        return (input_args, True)
+    except (TypeError, ValueError):
+        idx = 0
+    dm = "true" if draw_mouse else "false"
+    input_args = [
+        "-f", "lavfi", "-thread_queue_size", "1024",
+        "-i", f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
+    ]
+    return (input_args, True)
 
 
 def build_screen_video_filter(needs_hwdownload, out_width=1920, out_height=1080,
@@ -3961,6 +4028,7 @@ class StreamerCore:
         draw_mouse = self.config.get("screen_capture_draw_mouse", True)
         bitrate_kbps = self.config.get("screen_capture_bitrate_kbps", 4000)
 
+        win = None
         if source_type == "window":
             if not window_title:
                 self.status = "error"
@@ -3994,12 +4062,21 @@ class StreamerCore:
             start_index=1
         )
 
+        # ★ウィンドウ矩形は「配信を始める瞬間」の値を使う。以降ウィンドウを
+        #   動かしても切り出し位置は追従しない（追従させるには送出の張り直しが
+        #   要り、そのたびに画が飛ぶ）。動かしたら「適用」で取り直す運用にする。
+        window_rect = None
+        if win:
+            window_rect = (win.get("left", 0), win.get("top", 0),
+                           win.get("width", 0), win.get("height", 0))
+
         input_args_v, needs_hwdownload = build_screen_capture_input(
             source_type=source_type,
             display_index=display_index,
             window_title=window_title,
             framerate=framerate,
-            draw_mouse=draw_mouse
+            draw_mouse=draw_mouse,
+            window_rect=window_rect
         )
 
         cmd = [get_ffmpeg_cmd()] + input_args_v + input_args_a
@@ -4034,7 +4111,12 @@ class StreamerCore:
                 self.get_video_encoder(),
                 v_kbps=b_kbps, max_kbps=int(b_kbps * 1.15), buf_kbps=b_kbps,
                 h264_profile="baseline", sc_threshold_zero=True,
-                gop_frames=fps * 2, fps=fps)
+                # ★GOPは必ず1秒。hls_segment_time(既定3秒)を割り切れる値でないと、
+                #   HLSはキーフレームでしか切れないためセグメント長が振れる。
+                #   実測: GOP2秒だと 120/60/120/60 フレーム＝4秒・2秒・4秒・2秒に
+                #   なり、再生側にはカクつきとして出た。1秒にすると 90 フレーム
+                #   ＝3.0秒でぴたりと揃う。他の再生モードも1秒で揃えている。
+                gop_frames=fps, fps=fps)
         ])
 
         if audio_map:
