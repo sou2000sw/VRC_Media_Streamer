@@ -4384,6 +4384,16 @@ class StreamerCore:
         if window_plan:
             log_print(f"[Player] Window capture via {window_plan[0]} {window_plan[1:]}")
 
+        # ★音声デバイスが未設定でも**無音トラックを必ず載せる**。
+        #   映像だけのストリームにすると HLS(-c copy) では再生できるのに、
+        #   RTMP/FLV 経由（TopazChat -> VRChat/AVPro）でカクついて見える。
+        #   待機画面・ラジオなど他のモードは元から anullsrc を入れており、
+        #   画面共有だけが「音声トラックの無いストリーム」を送る唯一の例外だった。
+        silent_audio = not audio_map
+        if silent_audio:
+            input_args_a = ["-f", "lavfi", "-i",
+                            "anullsrc=channel_layout=stereo:sample_rate=44100"]
+
         cmd = [get_ffmpeg_cmd()] + input_args_v + input_args_a
 
         video_chain = build_screen_video_filter(needs_hwdownload, width, height, clock_filter)
@@ -4397,7 +4407,8 @@ class StreamerCore:
         if audio_map:
             cmd.extend(["-map", audio_map])
         else:
-            cmd.extend(["-an"])
+            # 無音入力は映像の次（index 1）に入る
+            cmd.extend(["-map", "1:a"])
 
         try:
             fps = int(framerate)
@@ -4424,8 +4435,7 @@ class StreamerCore:
                 gop_frames=fps, fps=fps)
         ])
 
-        if audio_map:
-            cmd.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "44100"])
+        cmd.extend(["-c:a", "aac", "-b:a", "192k" if audio_map else "64k", "-ar", "44100"])
 
         cmd.extend([
             "-fflags", "+nobuffer+flush_packets", "-flush_packets", "1",

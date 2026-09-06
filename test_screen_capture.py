@@ -229,3 +229,48 @@ def test_ddagrab_output_mapping_requires_clear_winner(monkeypatch):
     assert streamer_core.resolve_ddagrab_output_for_monitor(mon) == 1
     monkeypatch.setattr(streamer_core, "_probe_monitor_vs_ddagrab", make([20.0, 90.0]))
     assert streamer_core.resolve_ddagrab_output_for_monitor(mon) == 1
+
+
+def test_screen_capture_always_has_audio_track(monkeypatch):
+    """音声デバイス未設定でも**無音トラックを必ず載せる**。
+
+    ★映像だけのストリームは HLS(-c copy) では再生できるのに、
+      RTMP/FLV 経由（TopazChat -> VRChat/AVPro）でカクついて見える。
+      実機で「HLSモードだと滑らか、TopazChatだとガタつく」という形で出た。
+      待機画面・ラジオなど他モードは元から anullsrc を入れており、
+      画面共有だけが音声トラック無しを送る唯一の例外だった。
+    """
+    core = StreamerCore(override_port=8993, override_enable_tunnel=False)
+    captured = {}
+
+    class _FakeProc:
+        returncode = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def _fake_popen(cmd, *a, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    try:
+        core.set_live_audio_devices(mic_device="", loopback_device="")
+        core.set_screen_capture_source(source_type="display", display_index=0, framerate=30)
+        monkeypatch.setattr(core, "ensure_stream_sink", lambda: True)
+        monkeypatch.setattr(core, "get_video_encoder", lambda: "libx264")
+        monkeypatch.setattr(streamer_core.subprocess, "Popen", _fake_popen)
+        monkeypatch.setattr(core, "relay_stream_data", lambda *a, **k: None)
+        monkeypatch.setattr(core, "watch_send_proc", lambda *a, **k: None)
+
+        core.play_screen_capture()
+        cmd = captured.get("cmd")
+        assert cmd is not None, "送出プロセスが組み立てられていない"
+        joined = " ".join(str(c) for c in cmd)
+
+        # ★音声を捨てていないこと
+        assert "-an" not in cmd, "映像のみのストリームを送っている（RTMP経路で再生が乱れる）"
+        assert "anullsrc" in joined, "無音トラックが入っていない"
+        assert "-c:a" in cmd and "aac" in cmd, "音声コーデックが指定されていない"
+    finally:
+        core.shutdown()
