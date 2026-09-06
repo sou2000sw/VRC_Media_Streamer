@@ -95,15 +95,21 @@ def handle_audio_session(handler):
 
     client_id = new_client_id()
     participant = None
-    try:
-        handler.connection.settimeout(IDLE_TIMEOUT_SEC)
-    except Exception:
-        pass
 
+    def set_timeout(sec):
+        # ★受信タイムアウトが無いと、黙り込んだ相手の接続がスレッドごと居座る。
+        #   名乗るまでは短く、名乗ってからは ping の間隔（1秒）に対して十分長く。
+        try:
+            handler.connection.settimeout(sec)
+        except Exception:
+            pass
+
+    set_timeout(HELLO_TIMEOUT_SEC)
     try:
         participant = _do_hello(handler, conn, session, client_id)
         if participant is None:
             return
+        set_timeout(IDLE_TIMEOUT_SEC)
         _serve(handler, conn, session, participant)
     except WebSocketError as e:
         log_print(f"[Karaoke] ws closed: {e}")
