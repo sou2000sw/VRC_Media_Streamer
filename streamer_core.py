@@ -131,6 +131,10 @@ DEFAULT_CONFIG = {
     "live_audio_app_window_title": "",
     "live_audio_app_volume": 1.0,
     "live_audio_app_mode": "include",   # "include" | "exclude"
+    # ライブ音声の背景。ラジオと同じ選び方にする。
+    # ★"card"（サムネイルカード）は入れない。あれはYouTubeのメタデータから作るもので、
+    #   ライブ音声には元データが無い。
+    "live_audio_bg_source": "standby",  # "standby" | "slideshow"
     "screen_capture_source_type": "display",   # "display" | "window"
     "screen_capture_display_index": 0,
     "screen_capture_window_title": "",
@@ -2351,6 +2355,7 @@ class StreamerCore:
             "live_audio_app_mode": str(self.config.get("live_audio_app_mode", "include")),
             "app_audio_available": bool(get_app_audio_capture_cmd()),
             "app_audio_level": self.get_app_audio_level(),
+            "live_audio_bg_source": str(self.config.get("live_audio_bg_source", "standby")),
             "screen_capture_source_type": str(self.config.get("screen_capture_source_type", "display")),
             "screen_capture_display_index": int(self.config.get("screen_capture_display_index", 0)),
             "screen_capture_window_title": str(self.config.get("screen_capture_window_title", "")),
@@ -3539,6 +3544,56 @@ class StreamerCore:
             return STANDBY_IMAGE_PATH
         return None
 
+    def build_slideshow_manifest(self, track_seconds=0, label="Radio",
+                                 manifest_name="slideshow_manifest.txt"):
+        """スライドショー用の ffconcat マニフェストを作る。写真が無ければ None。
+
+        ★concat + -stream_loop -1 は常にマニフェストの先頭から再生される。
+          「写真枚数 x 表示秒数」が曲の長さを超えると後半の写真が一度も表示されないまま
+          次の曲でまた1枚目に戻り、特定の写真が永久にスキップされていた。
+          開始位置をずらし、消化した枚数だけカーソルを進めることで全写真を巡回させる。
+
+        track_seconds に 0 を渡すと「1枚消化」として扱う。ライブ音声のように
+        終わりのない配信では曲の長さという概念が無いため。
+        """
+        images = self.get_slideshow_images()
+        if not images:
+            return None
+
+        duration_val = float(self.config.get("image_display_duration", 15))
+
+        start = self.slideshow_cursor % len(images)
+        images = images[start:] + images[:start]
+        try:
+            secs = float(track_seconds or 0)
+        except (TypeError, ValueError):
+            secs = 0.0
+        if secs > 0 and duration_val > 0:
+            consumed = max(1, int(math.ceil(secs / duration_val)))
+        else:
+            consumed = 1
+        self.slideshow_cursor = (start + consumed) % len(images)
+
+        manifest_lines = ["ffconcat version 1.0\n"]
+        for idx, img in enumerate(images):
+            pb_path = self.get_image_for_playback(img, unique_id=idx)
+            pb_path_clean = os.path.abspath(pb_path).replace("\\", "/")
+            manifest_lines.append(f"file '{pb_path_clean}'\n")
+            manifest_lines.append(f"duration {duration_val}\n")
+        # concat demuxer の最終要素の持続時間を有効にするため末尾に複製
+        last_pb = self.get_image_for_playback(images[-1], unique_id=len(images))
+        last_pb_clean = os.path.abspath(last_pb).replace("\\", "/")
+        manifest_lines.append(f"file '{last_pb_clean}'\n")
+
+        os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+        manifest_path = os.path.join(IMAGE_CACHE_DIR, manifest_name)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.writelines(manifest_lines)
+        log_print(f"[{label}] Prepared slideshow manifest with {len(images)} photos "
+                  f"(duration: {duration_val}s/photo, start #{start + 1}, "
+                  f"next #{self.slideshow_cursor + 1}).")
+        return manifest_path
+
     def play_radio(self, video_info, seek_seconds=0):
         """BGM/ラジオモード: YouTube音声ストリーム / ローカル動画音声 + 静止画/写真を合成し、極小帯域でHLS配信"""
         url = video_info.get("url", "")
@@ -3609,43 +3664,8 @@ class StreamerCore:
 
         slideshow_manifest_path = None
         if source == "slideshow" and auto_advance:
-            images = self.get_slideshow_images()
-            if images:
-                duration_val = float(self.config.get("image_display_duration", 15))
-
-                # スライドショーは曲をまたいで続きから再生する。
-                # concat + -stream_loop -1 は常にマニフェストの先頭から再生されるため、
-                # 「写真枚数 x 表示秒数」が曲の長さを超えると後半の写真が一度も表示されないまま
-                # 次の曲でまた1枚目に戻ってしまい、特定の写真が永久にスキップされていた。
-                # 曲ごとに開始位置をずらし、消化した枚数だけカーソルを進めることで全写真を巡回させる。
-                start = self.slideshow_cursor % len(images)
-                images = images[start:] + images[:start]
-                try:
-                    track_seconds = float(duration or 0)
-                except (TypeError, ValueError):
-                    track_seconds = 0.0
-                if track_seconds > 0 and duration_val > 0:
-                    consumed = max(1, int(math.ceil(track_seconds / duration_val)))
-                else:
-                    consumed = 1
-                self.slideshow_cursor = (start + consumed) % len(images)
-
-                manifest_lines = ["ffconcat version 1.0\n"]
-                for idx, img in enumerate(images):
-                    pb_path = self.get_image_for_playback(img, unique_id=idx)
-                    pb_path_clean = os.path.abspath(pb_path).replace("\\", "/")
-                    manifest_lines.append(f"file '{pb_path_clean}'\n")
-                    manifest_lines.append(f"duration {duration_val}\n")
-                # concat demuxer の最終要素の持続時間を有効にするため末尾に複製
-                last_pb = self.get_image_for_playback(images[-1], unique_id=len(images))
-                last_pb_clean = os.path.abspath(last_pb).replace("\\", "/")
-                manifest_lines.append(f"file '{last_pb_clean}'\n")
-
-                os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
-                slideshow_manifest_path = os.path.join(IMAGE_CACHE_DIR, "slideshow_manifest.txt")
-                with open(slideshow_manifest_path, "w", encoding="utf-8") as f:
-                    f.writelines(manifest_lines)
-                log_print(f"[Radio] Prepared slideshow manifest with {len(images)} photos (duration: {duration_val}s/photo, start #{start + 1}, next #{self.slideshow_cursor + 1}).")
+            slideshow_manifest_path = self.build_slideshow_manifest(
+                track_seconds=duration, label="Radio")
 
         if slideshow_manifest_path and os.path.exists(slideshow_manifest_path):
             video_input_opts = [
@@ -4456,6 +4476,14 @@ class StreamerCore:
             "live_audio_loopback_volume": self.config.get("live_audio_loopback_volume", 0.7),
         }
 
+    def set_live_audio_bg_source(self, source: str):
+        """ライブ音声の背景を切り替える。想定外の値は無視して現状を返す。"""
+        if source in ("standby", "slideshow"):
+            self.config["live_audio_bg_source"] = source
+            self.save_config()
+            self.request_stream_reload()
+        return self.config.get("live_audio_bg_source", "standby")
+
     def set_screen_capture_source(self, source_type=None, display_index=None, window_title=None,
                                   framerate=None, width=None, height=None,
                                   draw_mouse=None, bitrate_kbps=None):
@@ -4535,15 +4563,42 @@ class StreamerCore:
             self.status_detail = "FFmpeg Error"
             return None
 
-        # 背景静止画。generate_standby_image() は描画に失敗しても例外を出さず
-        # 進むことがあるため、パスの実在をここで必ず確かめる。None を
-        # os.path.abspath() に渡すと TypeError で監視ループ側に飛ぶ。
-        bg_image_path = self.generate_standby_image()
-        if not bg_image_path or not os.path.exists(bg_image_path):
-            log_print(f"[Player] Live audio: standby image unavailable ({bg_image_path})")
-            self.status = "error"
-            self.status_detail = "Live audio: background image unavailable"
-            return None
+        # 背景。ラジオと同じ仕組みで「待機画面」か「スライドショー」を選べる。
+        # ★スライドショーは ffconcat + -stream_loop -1 で ffmpeg 自身が巡回するので、
+        #   写真を送るために配信を張り直す必要がない。終わりのないライブ音声に向く。
+        bg_source = str(self.config.get("live_audio_bg_source", "standby"))
+        auto_advance = bool(self.config.get("image_auto_advance", False)) and not self.image_paused
+
+        slideshow_manifest_path = None
+        if bg_source == "slideshow" and auto_advance:
+            slideshow_manifest_path = self.build_slideshow_manifest(
+                track_seconds=0, label="LiveAudio",
+                manifest_name="slideshow_manifest_live.txt")
+
+        if slideshow_manifest_path:
+            video_input_opts = [
+                "-re", "-stream_loop", "-1",
+                "-f", "concat", "-safe", "0",
+                "-i", os.path.abspath(slideshow_manifest_path)
+            ]
+        else:
+            # スライドショー指定でも、写真が無い/自動送りOFFなら1枚で見せる。
+            bg_image_path = None
+            if bg_source == "slideshow":
+                images = self.get_slideshow_images()
+                if images:
+                    bg_image_path = self.get_image_for_playback(images[0])
+            # 待機画面。generate_standby_image() は描画に失敗しても例外を出さず
+            # 進むことがあるため、パスの実在をここで必ず確かめる。None を
+            # os.path.abspath() に渡すと TypeError で監視ループ側に飛ぶ。
+            if not bg_image_path:
+                bg_image_path = self.generate_standby_image()
+            if not bg_image_path or not os.path.exists(bg_image_path):
+                log_print(f"[Player] Live audio: background image unavailable ({bg_image_path})")
+                self.status = "error"
+                self.status_detail = "Live audio: background image unavailable"
+                return None
+            video_input_opts = ["-re", "-loop", "1", "-i", os.path.abspath(bg_image_path)]
 
         has_clock = bool(self.config.get("overlay_clock_enabled", False) or self.config.get("overlay_clock_video", False))
         clock_filter = get_clock_filter_for_config(self.config) if has_clock else None
@@ -4564,9 +4619,7 @@ class StreamerCore:
             start_index=1
         )
 
-        cmd = [
-            get_ffmpeg_cmd(), "-re", "-loop", "1", "-i", os.path.abspath(bg_image_path)
-        ]
+        cmd = [get_ffmpeg_cmd()] + video_input_opts
         cmd.extend(input_args)
 
         if audio_filter and (has_clock and clock_filter):
@@ -4596,7 +4649,9 @@ class StreamerCore:
             *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"
         ])
 
-        log_print(f"[Player] Encoder path=live_audio mic='{mic_dev}' loopback='{loop_dev}' mic_vol={mic_vol} loopback_vol={loop_vol} b:a={bitrate_kbps}k")
+        log_print(f"[Player] Encoder path=live_audio mic='{mic_dev}' loopback='{loop_dev}' "
+                  f"mic_vol={mic_vol} loopback_vol={loop_vol} b:a={bitrate_kbps}k "
+                  f"bg={'slideshow' if slideshow_manifest_path else bg_source}")
 
         try:
             proc = subprocess.Popen(

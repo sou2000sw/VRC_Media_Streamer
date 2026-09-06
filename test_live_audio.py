@@ -224,3 +224,148 @@ def test_play_live_audio_aborts_when_standby_image_missing(tmp_path):
         popen.assert_not_called()
 
     core.shutdown()
+
+
+# ============================================================
+# タスク25: ライブ音声の配信画面（背景）をラジオと同じように選べる
+# ============================================================
+
+def _live_core():
+    from streamer_core import StreamerCore
+    return StreamerCore(override_port=8969, override_enable_tunnel=False)
+
+
+def _run_live_audio(monkeypatch, core):
+    """play_live_audio を実プロセスなしで走らせ、組み立てたコマンドを返す。"""
+    import streamer_core as sc
+    from unittest.mock import MagicMock
+    captured = {}
+
+    class _FakeProc:
+        returncode = None
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def _fake_popen(cmd, *a, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(core, "ensure_stream_sink", lambda: True)
+    monkeypatch.setattr(core, "get_video_encoder", lambda: "libx264")
+    monkeypatch.setattr(sc.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(core, "relay_stream_data", lambda *a, **k: None)
+    monkeypatch.setattr(core, "watch_send_proc", lambda *a, **k: None)
+    monkeypatch.setattr(core, "start_app_audio_capture", lambda: None)
+    core.play_live_audio()
+    return captured.get("cmd")
+
+
+def test_set_live_audio_bg_source(monkeypatch):
+    core = _live_core()
+    try:
+        monkeypatch.setattr(core, "save_config", lambda: None)
+        monkeypatch.setattr(core, "request_stream_reload", lambda: None)
+        assert core.set_live_audio_bg_source("slideshow") == "slideshow"
+        assert core.set_live_audio_bg_source("standby") == "standby"
+        # ラジオの "card" は流用しない（YouTubeのメタデータが元なので成立しない）
+        core.set_live_audio_bg_source("slideshow")
+        assert core.set_live_audio_bg_source("card") == "slideshow"
+        assert core.set_live_audio_bg_source("でたらめ") == "slideshow"
+    finally:
+        core.shutdown()
+
+
+def test_live_audio_uses_slideshow_when_selected(monkeypatch, tmp_path):
+    """スライドショー指定かつ写真があるなら concat + stream_loop で送る。"""
+    core = _live_core()
+    try:
+        imgs = []
+        for name in ("a.jpg", "b.jpg"):
+            f = tmp_path / name
+            f.write_bytes(b"x")
+            imgs.append(str(f))
+        monkeypatch.setattr(core, "get_slideshow_images", lambda: imgs)
+        monkeypatch.setattr(core, "get_image_for_playback",
+                            lambda img, unique_id=None: img)
+        core.config["live_audio_mic_device"] = "Mic A"
+        core.config["live_audio_bg_source"] = "slideshow"
+        core.config["image_auto_advance"] = True
+        core.image_paused = False
+
+        cmd = _run_live_audio(monkeypatch, core)
+        assert cmd is not None
+        joined = " ".join(str(c) for c in cmd)
+        assert "concat" in joined, "スライドショーなのに concat が使われていない"
+        assert "-stream_loop" in cmd, "巡回しない（1周で止まる）"
+        # 静止画1枚の経路に落ちていないこと
+        assert "-loop" not in cmd or cmd.index("-stream_loop") < cmd.index("-i")
+    finally:
+        core.shutdown()
+
+
+def test_live_audio_falls_back_to_still_without_photos(monkeypatch):
+    """スライドショー指定でも写真が無ければ静止画1枚に落ちる（配信は止めない）。"""
+    core = _live_core()
+    try:
+        monkeypatch.setattr(core, "get_slideshow_images", lambda: [])
+        core.config["live_audio_mic_device"] = "Mic A"
+        core.config["live_audio_bg_source"] = "slideshow"
+        core.config["image_auto_advance"] = True
+        core.image_paused = False
+
+        cmd = _run_live_audio(monkeypatch, core)
+        assert cmd is not None, "写真が無いだけで配信が組み立てられていない"
+        joined = " ".join(str(c) for c in cmd)
+        assert "concat" not in joined
+        assert "-loop" in cmd and "1" in cmd
+    finally:
+        core.shutdown()
+
+
+def test_live_audio_default_is_standby(monkeypatch):
+    """既定は待機画面。従来の挙動を変えない。"""
+    core = _live_core()
+    try:
+        core.config["live_audio_mic_device"] = "Mic A"
+        core.config["live_audio_bg_source"] = "standby"
+        cmd = _run_live_audio(monkeypatch, core)
+        assert cmd is not None
+        assert "concat" not in " ".join(str(c) for c in cmd)
+        assert "-loop" in cmd
+    finally:
+        core.shutdown()
+
+
+def test_build_slideshow_manifest_advances_cursor(monkeypatch, tmp_path):
+    """終わりのない配信（track_seconds=0）でも1枚ぶんカーソルが進む。"""
+    core = _live_core()
+    try:
+        imgs = []
+        for name in ("a.jpg", "b.jpg", "c.jpg"):
+            f = tmp_path / name
+            f.write_bytes(b"x")
+            imgs.append(str(f))
+        monkeypatch.setattr(core, "get_slideshow_images", lambda: imgs)
+        monkeypatch.setattr(core, "get_image_for_playback",
+                            lambda img, unique_id=None: img)
+        core.slideshow_cursor = 0
+        p1 = core.build_slideshow_manifest(track_seconds=0, label="Test",
+                                           manifest_name="t_manifest.txt")
+        assert p1 and os.path.exists(p1)
+        assert core.slideshow_cursor == 1
+        core.build_slideshow_manifest(track_seconds=0, label="Test",
+                                      manifest_name="t_manifest.txt")
+        assert core.slideshow_cursor == 2
+    finally:
+        core.shutdown()
+
+
+def test_build_slideshow_manifest_without_photos(monkeypatch):
+    core = _live_core()
+    try:
+        monkeypatch.setattr(core, "get_slideshow_images", lambda: [])
+        assert core.build_slideshow_manifest(track_seconds=0) is None
+    finally:
+        core.shutdown()
