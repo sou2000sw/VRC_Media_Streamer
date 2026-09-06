@@ -1,0 +1,3 @@
+# .bat / .cmd は CRLF 必須。LF だと cmd.exe が複数行ブロックや for /f を誤解析しうる。
+*.bat text eol=crlf
+*.cmd text eol=crlf

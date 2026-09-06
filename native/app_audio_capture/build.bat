@@ -33,6 +33,9 @@ if not exist "%VCVARS%" (
     exit /b 2
 )
 
+rem  vcvars64.bat itself may print "'vswhere.exe' is not recognized" on stderr.
+rem  That message comes from Microsoft's own script, not from this one, and is harmless.
+rem  Verified 2026-09-06: VSPATH is resolved correctly and the build succeeds.
 call "%VCVARS%" >nul
 if errorlevel 1 (
     echo [build] failed to initialize the MSVC environment.
