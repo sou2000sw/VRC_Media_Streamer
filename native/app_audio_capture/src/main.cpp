@@ -1,5 +1,5 @@
 // native/app_audio_capture/src/main.cpp
-// App Audio Capture Auxiliary Executable (Phase P0)
+// App Audio Capture Auxiliary Executable (Phase P1)
 // Uses Windows WASAPI Process Loopback API to capture audio from a specific PID.
 
 #include <windows.h>
@@ -17,10 +17,37 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include <io.h>
 #include <fcntl.h>
 
 using Microsoft::WRL::ComPtr;
+
+// 【無音埋め（空振りガード）の設計方針について】
+// 当初の想定では「対象が無音の間はパケットが来ないため、壁時計基準で常時無音を生成・埋める必要がある」と考えられていた。
+// しかし実測検証の結果、WASAPI Process Loopback APIは対象プロセスが無音であっても無音パケットを正常に供給し続け、
+// ドリフトは蓄積しないことが判明した（完全無音30秒で正確に30.000秒のサンプルが供給された）。
+// 
+// したがって、常時動く壁時計無音生成を入れると二重に無音が埋まり逆に音がズレる原因となるため採用しない。
+// 代わりに、デバイス切替や例外的なパケット中断に備えた「空振りガード」として実装する。
+// WaitForSingleObjectタイムアウトかつパケットサイズ0の状態が連続して200msを超えた場合に限り、
+// 壁時計経過時間に対する不足サンプル数を計算して無音データを補填する。
+
+static std::atomic<bool> g_stopRequested{false};
+
+static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+    switch (ctrlType) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        g_stopRequested.store(true);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
 
 // WAV Header struct for 16-bit PCM
 #pragma pack(push, 1)
@@ -85,7 +112,6 @@ public:
         }
     }
 
-    // IUnknown implementation
     STDMETHODIMP QueryInterface(REFIID riid, void** ppvObject) override {
         if (!ppvObject) return E_POINTER;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
@@ -114,7 +140,6 @@ public:
         return count;
     }
 
-    // IActivateAudioInterfaceCompletionHandler implementation
     STDMETHODIMP ActivateCompleted(IActivateAudioInterfaceAsyncOperation* activateOperation) override {
         HRESULT hrActivate = E_FAIL;
         ComPtr<IUnknown> unk;
@@ -173,14 +198,185 @@ static HRESULT ActivateProcessLoopbackClient(DWORD pid, bool includeTree, ComPtr
     return pHandlerRaw->audioInterface.As(&outAudioClient);
 }
 
+// Helper to set up audio client, capture client, and event handle
+static HRESULT SetupAudioCapture(
+    DWORD pid,
+    bool includeTree,
+    int rate,
+    int channels,
+    ComPtr<IAudioClient>& outAudioClient,
+    ComPtr<IAudioCaptureClient>& outCaptureClient,
+    HANDLE& outEventHandle,
+    bool& outIsFloatFormat
+) {
+    ComPtr<IAudioClient> audioClient;
+    HRESULT hrAct = ActivateProcessLoopbackClient(pid, includeTree, audioClient);
+    if (FAILED(hrAct)) {
+        fprintf(stderr, "[AppAudio] ActivateProcessLoopbackClient failed: 0x%08X\n", hrAct);
+        return hrAct;
+    }
+
+    WAVEFORMATEX wfx16 = {};
+    wfx16.wFormatTag = WAVE_FORMAT_PCM;
+    wfx16.nChannels = static_cast<WORD>(channels);
+    wfx16.nSamplesPerSec = static_cast<DWORD>(rate);
+    wfx16.wBitsPerSample = 16;
+    wfx16.nBlockAlign = static_cast<WORD>(wfx16.nChannels * (wfx16.wBitsPerSample / 8));
+    wfx16.nAvgBytesPerSec = wfx16.nSamplesPerSec * wfx16.nBlockAlign;
+    wfx16.cbSize = 0;
+
+    bool isFloat = false;
+    HRESULT hrInit = audioClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        200000, // 20ms in 100ns units
+        0,
+        &wfx16,
+        nullptr
+    );
+
+    if (SUCCEEDED(hrInit)) {
+        fprintf(stderr, "[AppAudio] Initialized audio client with 16-bit PCM format (%d Hz, %d ch)\n", rate, channels);
+        isFloat = false;
+    } else {
+        fprintf(stderr, "[AppAudio] 16-bit PCM format rejected (0x%08X), trying 32-bit float...\n", hrInit);
+        audioClient.Reset();
+        hrAct = ActivateProcessLoopbackClient(pid, includeTree, audioClient);
+        if (FAILED(hrAct)) {
+            fprintf(stderr, "[AppAudio] Re-activation failed: 0x%08X\n", hrAct);
+            return hrAct;
+        }
+
+        WAVEFORMATEX wfx32 = {};
+        wfx32.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        wfx32.nChannels = static_cast<WORD>(channels);
+        wfx32.nSamplesPerSec = static_cast<DWORD>(rate);
+        wfx32.wBitsPerSample = 32;
+        wfx32.nBlockAlign = static_cast<WORD>(wfx32.nChannels * (wfx32.wBitsPerSample / 8));
+        wfx32.nAvgBytesPerSec = wfx32.nSamplesPerSec * wfx32.nBlockAlign;
+        wfx32.cbSize = 0;
+
+        HRESULT hrInitFloat = audioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            200000,
+            0,
+            &wfx32,
+            nullptr
+        );
+
+        if (SUCCEEDED(hrInitFloat)) {
+            fprintf(stderr, "[AppAudio] Initialized audio client with 32-bit float format (%d Hz, %d ch)\n", rate, channels);
+            isFloat = true;
+        } else {
+            audioClient.Reset();
+            hrAct = ActivateProcessLoopbackClient(pid, includeTree, audioClient);
+            if (SUCCEEDED(hrAct)) {
+                WAVEFORMATEXTENSIBLE wfxExt = {};
+                wfxExt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+                wfxExt.Format.nChannels = static_cast<WORD>(channels);
+                wfxExt.Format.nSamplesPerSec = static_cast<DWORD>(rate);
+                wfxExt.Format.wBitsPerSample = 32;
+                wfxExt.Format.nBlockAlign = static_cast<WORD>(wfxExt.Format.nChannels * (wfxExt.Format.wBitsPerSample / 8));
+                wfxExt.Format.nAvgBytesPerSec = wfxExt.Format.nSamplesPerSec * wfxExt.Format.nBlockAlign;
+                wfxExt.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+                wfxExt.Samples.wValidBitsPerSample = 32;
+                wfxExt.dwChannelMask = (channels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : (channels == 1 ? SPEAKER_FRONT_CENTER : 0);
+                wfxExt.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+                hrInitFloat = audioClient->Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    200000,
+                    0,
+                    &wfxExt.Format,
+                    nullptr
+                );
+                if (SUCCEEDED(hrInitFloat)) {
+                    fprintf(stderr, "[AppAudio] Initialized audio client with 32-bit float format (EXTENSIBLE) (%d Hz, %d ch)\n", rate, channels);
+                    isFloat = true;
+                }
+            }
+
+            if (!isFloat) {
+                fprintf(stderr, "[AppAudio] IAudioClient::Initialize failed for both PCM and Float: 0x%08X\n", hrInitFloat);
+                return hrInitFloat;
+            }
+        }
+    }
+
+    HANDLE hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!hEvent) {
+        fprintf(stderr, "[AppAudio] CreateEventW failed\n");
+        return E_FAIL;
+    }
+
+    HRESULT hrEv = audioClient->SetEventHandle(hEvent);
+    if (FAILED(hrEv)) {
+        fprintf(stderr, "[AppAudio] SetEventHandle failed: 0x%08X\n", hrEv);
+        CloseHandle(hEvent);
+        return hrEv;
+    }
+
+    ComPtr<IAudioCaptureClient> captureClient;
+    HRESULT hrSvc = audioClient->GetService(__uuidof(IAudioCaptureClient), &captureClient);
+    if (FAILED(hrSvc)) {
+        fprintf(stderr, "[AppAudio] GetService(IAudioCaptureClient) failed: 0x%08X\n", hrSvc);
+        CloseHandle(hEvent);
+        return hrSvc;
+    }
+
+    HRESULT hrStart = audioClient->Start();
+    if (FAILED(hrStart)) {
+        fprintf(stderr, "[AppAudio] IAudioClient::Start failed: 0x%08X\n", hrStart);
+        CloseHandle(hEvent);
+        return hrStart;
+    }
+
+    outAudioClient = audioClient;
+    outCaptureClient = captureClient;
+    outEventHandle = hEvent;
+    outIsFloatFormat = isFloat;
+
+    return S_OK;
+}
+
+// Write 16-bit PCM buffer to WAV or stdout
+static bool WritePCMData(
+    const int16_t* pcmBuf,
+    size_t sampleCount,
+    const std::string& wavPath,
+    std::ofstream& wavFile,
+    uint32_t& wavDataBytesWritten,
+    bool probe
+) {
+    if (sampleCount == 0) return true;
+    size_t bytes = sampleCount * sizeof(int16_t);
+    if (!wavPath.empty() && wavFile.is_open()) {
+        wavFile.write(reinterpret_cast<const char*>(pcmBuf), bytes);
+        wavDataBytesWritten += static_cast<uint32_t>(bytes);
+    } else if (!probe) {
+        size_t written = fwrite(pcmBuf, sizeof(int16_t), sampleCount, stdout);
+        fflush(stdout);
+        if (written < sampleCount) {
+            return false; // Downstream pipe closed
+        }
+    }
+    return true;
+}
+
 int main(int argc, char* argv[]) {
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+
     DWORD pid = 0;
     bool includeTree = true;
     int rate = 48000;
     int channels = 2;
     std::string wavPath;
-    int seconds = 10;
+    int seconds = -1; // -1 indicates not specified by user
     bool probe = false;
+    bool stopOnExit = false;
+    int statsInterval = 0;
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -207,6 +403,10 @@ int main(int argc, char* argv[]) {
             seconds = std::stoi(argv[++i]);
         } else if (arg == "--probe") {
             probe = true;
+        } else if (arg == "--stop-on-exit") {
+            stopOnExit = true;
+        } else if (arg == "--stats" && i + 1 < argc) {
+            statsInterval = std::stoi(argv[++i]);
         } else {
             fprintf(stderr, "[AppAudio] Unknown or invalid argument: %s\n", arg.c_str());
             return 1;
@@ -218,7 +418,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Exit code 3 if target process does not exist
+    // Default --seconds rules (Section 3.1):
+    // If --wav is specified and --seconds was not passed, default to 10.
+    // If streaming (no --wav, no --probe) and --seconds was not passed, default to 0 (indefinite).
+    if (seconds < 0) {
+        if (!wavPath.empty()) {
+            seconds = 10;
+        } else {
+            seconds = 0;
+        }
+    }
+
+    // Exit code 3 if target process does not exist at startup
     if (!ProcessExists(pid)) {
         fprintf(stderr, "[AppAudio] Target process %lu does not exist\n", pid);
         return 3;
@@ -232,141 +443,16 @@ int main(int argc, char* argv[]) {
     }
 
     ComPtr<IAudioClient> audioClient;
-    HRESULT hrAct = ActivateProcessLoopbackClient(pid, includeTree, audioClient);
-    if (FAILED(hrAct)) {
-        fprintf(stderr, "[AppAudio] ActivateProcessLoopbackClient failed: 0x%08X\n", hrAct);
-        if (hrAct == E_NOTIMPL || hrAct == E_NOINTERFACE || hrAct == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+    ComPtr<IAudioCaptureClient> captureClient;
+    HANDLE hAudioEvent = nullptr;
+    bool isFloatFormat = false;
+
+    HRESULT hrSetup = SetupAudioCapture(pid, includeTree, rate, channels, audioClient, captureClient, hAudioEvent, isFloatFormat);
+    if (FAILED(hrSetup)) {
+        if (hrSetup == E_NOTIMPL || hrSetup == E_NOINTERFACE || hrSetup == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
             CoUninitialize();
             return 4; // OS not supported
         }
-        CoUninitialize();
-        return 2; // Activate failed
-    }
-
-    // Try 16-bit PCM format initialization first
-    WAVEFORMATEX wfx16 = {};
-    wfx16.wFormatTag = WAVE_FORMAT_PCM;
-    wfx16.nChannels = static_cast<WORD>(channels);
-    wfx16.nSamplesPerSec = static_cast<DWORD>(rate);
-    wfx16.wBitsPerSample = 16;
-    wfx16.nBlockAlign = static_cast<WORD>(wfx16.nChannels * (wfx16.wBitsPerSample / 8));
-    wfx16.nAvgBytesPerSec = wfx16.nSamplesPerSec * wfx16.nBlockAlign;
-    wfx16.cbSize = 0;
-
-    bool isFloatFormat = false;
-    HRESULT hrInit = audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        200000, // 20ms in 100ns units
-        0,
-        &wfx16,
-        nullptr
-    );
-
-    if (SUCCEEDED(hrInit)) {
-        fprintf(stderr, "[AppAudio] Initialized audio client with 16-bit PCM format (%d Hz, %d ch)\n", rate, channels);
-        isFloatFormat = false;
-    } else {
-        fprintf(stderr, "[AppAudio] 16-bit PCM format rejected (0x%08X), trying 32-bit float...\n", hrInit);
-
-        // Re-activate to get a fresh IAudioClient instance
-        audioClient.Reset();
-        hrAct = ActivateProcessLoopbackClient(pid, includeTree, audioClient);
-        if (FAILED(hrAct)) {
-            fprintf(stderr, "[AppAudio] Re-activation failed: 0x%08X\n", hrAct);
-            CoUninitialize();
-            return 2;
-        }
-
-        // Try 32-bit float format
-        WAVEFORMATEX wfx32 = {};
-        wfx32.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        wfx32.nChannels = static_cast<WORD>(channels);
-        wfx32.nSamplesPerSec = static_cast<DWORD>(rate);
-        wfx32.wBitsPerSample = 32;
-        wfx32.nBlockAlign = static_cast<WORD>(wfx32.nChannels * (wfx32.wBitsPerSample / 8));
-        wfx32.nAvgBytesPerSec = wfx32.nSamplesPerSec * wfx32.nBlockAlign;
-        wfx32.cbSize = 0;
-
-        HRESULT hrInitFloat = audioClient->Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            200000, // 20ms
-            0,
-            &wfx32,
-            nullptr
-        );
-
-        if (SUCCEEDED(hrInitFloat)) {
-            fprintf(stderr, "[AppAudio] Initialized audio client with 32-bit float format (%d Hz, %d ch)\n", rate, channels);
-            isFloatFormat = true;
-        } else {
-            // Try WAVEFORMATEXTENSIBLE with 32-bit float
-            audioClient.Reset();
-            hrAct = ActivateProcessLoopbackClient(pid, includeTree, audioClient);
-            if (SUCCEEDED(hrAct)) {
-                WAVEFORMATEXTENSIBLE wfxExt = {};
-                wfxExt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-                wfxExt.Format.nChannels = static_cast<WORD>(channels);
-                wfxExt.Format.nSamplesPerSec = static_cast<DWORD>(rate);
-                wfxExt.Format.wBitsPerSample = 32;
-                wfxExt.Format.nBlockAlign = static_cast<WORD>(wfxExt.Format.nChannels * (wfxExt.Format.wBitsPerSample / 8));
-                wfxExt.Format.nAvgBytesPerSec = wfxExt.Format.nSamplesPerSec * wfxExt.Format.nBlockAlign;
-                wfxExt.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-                wfxExt.Samples.wValidBitsPerSample = 32;
-                wfxExt.dwChannelMask = (channels == 2) ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT) : (channels == 1 ? SPEAKER_FRONT_CENTER : 0);
-                wfxExt.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-
-                hrInitFloat = audioClient->Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    200000, // 20ms
-                    0,
-                    &wfxExt.Format,
-                    nullptr
-                );
-                if (SUCCEEDED(hrInitFloat)) {
-                    fprintf(stderr, "[AppAudio] Initialized audio client with 32-bit float format (EXTENSIBLE) (%d Hz, %d ch)\n", rate, channels);
-                    isFloatFormat = true;
-                }
-            }
-
-            if (!isFloatFormat) {
-                fprintf(stderr, "[AppAudio] IAudioClient::Initialize failed for both 16-bit PCM and 32-bit float: 0x%08X\n", hrInitFloat);
-                CoUninitialize();
-                return 2;
-            }
-        }
-    }
-
-    HANDLE hAudioEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!hAudioEvent) {
-        fprintf(stderr, "[AppAudio] CreateEventW failed\n");
-        CoUninitialize();
-        return 2;
-    }
-
-    HRESULT hrEv = audioClient->SetEventHandle(hAudioEvent);
-    if (FAILED(hrEv)) {
-        fprintf(stderr, "[AppAudio] SetEventHandle failed: 0x%08X\n", hrEv);
-        CloseHandle(hAudioEvent);
-        CoUninitialize();
-        return 2;
-    }
-
-    ComPtr<IAudioCaptureClient> captureClient;
-    HRESULT hrSvc = audioClient->GetService(__uuidof(IAudioCaptureClient), &captureClient);
-    if (FAILED(hrSvc)) {
-        fprintf(stderr, "[AppAudio] GetService(IAudioCaptureClient) failed: 0x%08X\n", hrSvc);
-        CloseHandle(hAudioEvent);
-        CoUninitialize();
-        return 2;
-    }
-
-    HRESULT hrStart = audioClient->Start();
-    if (FAILED(hrStart)) {
-        fprintf(stderr, "[AppAudio] IAudioClient::Start failed: 0x%08X\n", hrStart);
-        CloseHandle(hAudioEvent);
         CoUninitialize();
         return 2;
     }
@@ -401,101 +487,250 @@ int main(int argc, char* argv[]) {
         _setmode(_fileno(stdout), _O_BINARY);
     }
 
+    // Capture loop state variables
     uint64_t totalBytesCaptured = 0;
+    uint64_t totalProducedFrames = 0;
+    uint64_t totalSilenceFilledFrames = 0;
     bool hasNonZeroSample = false;
+    int exitCode = 0;
+    bool targetExitLogged = false;
+
     auto startTime = std::chrono::steady_clock::now();
+    auto lastPacketOrGuardTime = startTime;
+    auto lastProcCheckTime = startTime;
+    auto lastStatsTime = startTime;
 
     // Main capture loop
-    while (true) {
-        DWORD waitRes = WaitForSingleObject(hAudioEvent, 200);
-        if (waitRes == WAIT_OBJECT_0) {
-            UINT32 packetLength = 0;
-            HRESULT hrPkt = captureClient->GetNextPacketSize(&packetLength);
-            while (SUCCEEDED(hrPkt) && packetLength > 0) {
-                BYTE* pData = nullptr;
-                UINT32 numFramesToRead = 0;
-                DWORD flags = 0;
-                UINT64 devPos = 0;
-                UINT64 qpcPos = 0;
+    while (!g_stopRequested.load()) {
+        auto now = std::chrono::steady_clock::now();
 
-                HRESULT hrBuf = captureClient->GetBuffer(&pData, &numFramesToRead, &flags, &devPos, &qpcPos);
-                if (FAILED(hrBuf)) {
-                    // ★失敗時に break しないと、パケットを解放できないまま
-                    //   GetNextPacketSize が同じ値を返し続けて無限ループになる。
-                    fprintf(stderr, "[AppAudio] GetBuffer failed: 0x%08X\n", hrBuf);
+        // Check target process status once per second
+        if (now - lastProcCheckTime >= std::chrono::seconds(1)) {
+            lastProcCheckTime = now;
+            if (!ProcessExists(pid)) {
+                if (stopOnExit) {
+                    fprintf(stderr, "[AppAudio] Target process %lu exited (--stop-on-exit specified), stopping\n", pid);
+                    exitCode = 3;
                     break;
+                } else if (!targetExitLogged) {
+                    fprintf(stderr, "[AppAudio] Target process %lu has exited, continuing capture with silence...\n", pid);
+                    targetExitLogged = true;
                 }
-
-                if (numFramesToRead > 0) {
-                    size_t sampleCount = static_cast<size_t>(numFramesToRead) * channels;
-                    std::vector<int16_t> s16Buf(sampleCount);
-
-                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                        std::fill(s16Buf.begin(), s16Buf.end(), static_cast<int16_t>(0));
-                    } else {
-                        if (isFloatFormat) {
-                            const float* floatData = reinterpret_cast<const float*>(pData);
-                            for (size_t i = 0; i < sampleCount; ++i) {
-                                s16Buf[i] = FloatToS16(floatData[i]);
-                                if (s16Buf[i] != 0) {
-                                    hasNonZeroSample = true;
-                                }
-                            }
-                        } else {
-                            const int16_t* pcmData = reinterpret_cast<const int16_t*>(pData);
-                            for (size_t i = 0; i < sampleCount; ++i) {
-                                s16Buf[i] = pcmData[i];
-                                if (s16Buf[i] != 0) {
-                                    hasNonZeroSample = true;
-                                }
-                            }
-                        }
-                    }
-
-                    size_t bytesToWrite = sampleCount * sizeof(int16_t);
-                    totalBytesCaptured += bytesToWrite;
-
-                    if (!wavPath.empty()) {
-                        wavFile.write(reinterpret_cast<const char*>(s16Buf.data()), bytesToWrite);
-                        wavDataBytesWritten += static_cast<uint32_t>(bytesToWrite);
-                    } else if (!probe) {
-                        fwrite(s16Buf.data(), sizeof(int16_t), sampleCount, stdout);
-                        fflush(stdout);
-                    }
-                }
-
-                // ★取得したパケットは 0 フレームでも必ず解放する。
-                //   GetBuffer は AUDCLNT_S_BUFFER_EMPTY（成功扱い・0フレーム）を返すことがあり、
-                //   そこで解放を飛ばすと GetNextPacketSize が同じ値を返し続けて
-                //   内側ループから抜けられなくなる（CPUを焼いたまま --seconds も --probe も効かない）。
-                captureClient->ReleaseBuffer(numFramesToRead);
-
-                // ★hrPkt を更新しないと、以降の失敗を検出できないまま
-                //   古い成功値で回り続ける。
-                hrPkt = captureClient->GetNextPacketSize(&packetLength);
             }
         }
 
-        // TODO(P1): 壁時計基準の無音埋めをここに入れる
+        // Stats output (Section 3.5)
+        if (statsInterval > 0 && (now - lastStatsTime) >= std::chrono::seconds(statsInterval)) {
+            lastStatsTime = now;
+            double producedSec = static_cast<double>(totalProducedFrames) / rate;
+            double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+            long long driftMs = static_cast<long long>(std::round((producedSec - elapsedSec) * 1000.0));
+            long long silenceFilledMs = static_cast<long long>(std::round((static_cast<double>(totalSilenceFilledFrames) / rate) * 1000.0));
 
-        auto now = std::chrono::steady_clock::now();
-        auto elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
+            fprintf(stderr, "[AppAudio] stats: produced=%.2fs elapsed=%.2fs drift=%lldms silence_filled=%lldms\n",
+                    producedSec, elapsedSec, driftMs, silenceFilledMs);
+        }
 
-        if (probe && elapsedSec >= 1) {
+        DWORD waitRes = WaitForSingleObject(hAudioEvent, 50);
+        bool gotPackets = false;
+        bool deviceInvalidated = false;
+
+        if (waitRes == WAIT_OBJECT_0) {
+            UINT32 packetLength = 0;
+            HRESULT hrPkt = captureClient->GetNextPacketSize(&packetLength);
+
+            if (hrPkt == AUDCLNT_E_DEVICE_INVALIDATED) {
+                deviceInvalidated = true;
+            } else {
+                while (SUCCEEDED(hrPkt) && packetLength > 0) {
+                    BYTE* pData = nullptr;
+                    UINT32 numFramesToRead = 0;
+                    DWORD flags = 0;
+                    UINT64 devPos = 0;
+                    UINT64 qpcPos = 0;
+
+                    HRESULT hrBuf = captureClient->GetBuffer(&pData, &numFramesToRead, &flags, &devPos, &qpcPos);
+                    if (hrBuf == AUDCLNT_E_DEVICE_INVALIDATED) {
+                        deviceInvalidated = true;
+                        break;
+                    }
+                    if (FAILED(hrBuf)) {
+                        fprintf(stderr, "[AppAudio] GetBuffer failed: 0x%08X\n", hrBuf);
+                        break;
+                    }
+
+                    if (numFramesToRead > 0) {
+                        gotPackets = true;
+                        size_t sampleCount = static_cast<size_t>(numFramesToRead) * channels;
+                        std::vector<int16_t> s16Buf(sampleCount);
+
+                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                            std::fill(s16Buf.begin(), s16Buf.end(), static_cast<int16_t>(0));
+                        } else {
+                            if (isFloatFormat) {
+                                const float* floatData = reinterpret_cast<const float*>(pData);
+                                for (size_t i = 0; i < sampleCount; ++i) {
+                                    s16Buf[i] = FloatToS16(floatData[i]);
+                                    if (s16Buf[i] != 0) {
+                                        hasNonZeroSample = true;
+                                    }
+                                }
+                            } else {
+                                const int16_t* pcmData = reinterpret_cast<const int16_t*>(pData);
+                                for (size_t i = 0; i < sampleCount; ++i) {
+                                    s16Buf[i] = pcmData[i];
+                                    if (s16Buf[i] != 0) {
+                                        hasNonZeroSample = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        size_t bytesToWrite = sampleCount * sizeof(int16_t);
+                        totalBytesCaptured += bytesToWrite;
+                        totalProducedFrames += numFramesToRead;
+
+                        if (!WritePCMData(s16Buf.data(), sampleCount, wavPath, wavFile, wavDataBytesWritten, probe)) {
+                            fprintf(stderr, "[AppAudio] stdout write failed or pipe closed by downstream, exiting cleanly\n");
+                            exitCode = 0;
+                            g_stopRequested.store(true);
+                            break;
+                        }
+                    }
+
+                    captureClient->ReleaseBuffer(numFramesToRead);
+                    hrPkt = captureClient->GetNextPacketSize(&packetLength);
+                    if (hrPkt == AUDCLNT_E_DEVICE_INVALIDATED) {
+                        deviceInvalidated = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (g_stopRequested.load()) {
+            break;
+        }
+
+        // Handle Device Invalidation (Section 3.4)
+        if (deviceInvalidated) {
+            fprintf(stderr, "[AppAudio] Device invalidated (AUDCLNT_E_DEVICE_INVALIDATED), attempting re-activation...\n");
+
+            if (hAudioEvent) {
+                CloseHandle(hAudioEvent);
+                hAudioEvent = nullptr;
+            }
+            audioClient.Reset();
+            captureClient.Reset();
+
+            bool reconfigOk = false;
+            for (int attempt = 1; attempt <= 5; ++attempt) {
+                if (g_stopRequested.load()) break;
+
+                fprintf(stderr, "[AppAudio] Device re-activation attempt %d/5...\n", attempt);
+
+                // Output 1 second of silence while waiting (10 x 100ms chunks)
+                for (int s = 0; s < 10; ++s) {
+                    if (g_stopRequested.load()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                    size_t silenceFrames = rate / 10;
+                    size_t silenceSamples = silenceFrames * channels;
+                    std::vector<int16_t> silenceBuf(silenceSamples, 0);
+
+                    totalProducedFrames += silenceFrames;
+                    totalSilenceFilledFrames += silenceFrames;
+
+                    if (!WritePCMData(silenceBuf.data(), silenceSamples, wavPath, wavFile, wavDataBytesWritten, probe)) {
+                        fprintf(stderr, "[AppAudio] stdout pipe closed during device re-activation, exiting cleanly\n");
+                        exitCode = 0;
+                        g_stopRequested.store(true);
+                        break;
+                    }
+                }
+
+                if (g_stopRequested.load()) break;
+
+                HRESULT hrRetry = SetupAudioCapture(pid, includeTree, rate, channels, audioClient, captureClient, hAudioEvent, isFloatFormat);
+                if (SUCCEEDED(hrRetry)) {
+                    fprintf(stderr, "[AppAudio] Re-activated audio client successfully on attempt %d\n", attempt);
+                    reconfigOk = true;
+                    lastPacketOrGuardTime = std::chrono::steady_clock::now();
+                    break;
+                } else {
+                    fprintf(stderr, "[AppAudio] Re-activation attempt %d failed: 0x%08X\n", attempt, hrRetry);
+                }
+            }
+
+            if (!reconfigOk && !g_stopRequested.load()) {
+                fprintf(stderr, "[AppAudio] Device re-activation failed after 5 attempts, exiting with code 2\n");
+                exitCode = 2;
+                break;
+            }
+            continue;
+        }
+
+        now = std::chrono::steady_clock::now();
+        if (gotPackets) {
+            lastPacketOrGuardTime = now;
+        } else {
+            // Silence Guard ("空振りガード", Section 2)
+            // When WaitForSingleObject times out or GetNextPacketSize is 0 continuously for > 200ms:
+            auto emptyMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastPacketOrGuardTime).count();
+            if (emptyMs >= 200) {
+                double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+                uint64_t expectedFrames = static_cast<uint64_t>(elapsedSec * rate);
+
+                if (expectedFrames > totalProducedFrames) {
+                    uint64_t missingFrames = expectedFrames - totalProducedFrames;
+                    size_t silenceSamples = static_cast<size_t>(missingFrames) * channels;
+                    std::vector<int16_t> silenceBuf(silenceSamples, 0);
+
+                    totalProducedFrames += missingFrames;
+                    totalSilenceFilledFrames += missingFrames;
+
+                    if (!WritePCMData(silenceBuf.data(), silenceSamples, wavPath, wavFile, wavDataBytesWritten, probe)) {
+                        fprintf(stderr, "[AppAudio] stdout pipe closed during silence fill, exiting cleanly\n");
+                        exitCode = 0;
+                        g_stopRequested.store(true);
+                        break;
+                    }
+
+                    double filledMs = (static_cast<double>(missingFrames) / rate) * 1000.0;
+                    double totalFilledSec = static_cast<double>(totalSilenceFilledFrames) / rate;
+
+                    fprintf(stderr, "[AppAudio] silence guard filled %.0f ms (total %.1f s)\n", filledMs, totalFilledSec);
+                }
+
+                lastPacketOrGuardTime = now;
+            }
+        }
+
+        // Check completion criteria (--seconds or --probe)
+        double elapsedSec = std::chrono::duration<double>(now - startTime).count();
+
+        if (probe && elapsedSec >= 1.0) {
             fprintf(stderr, "[AppAudio] Probe result: %llu bytes captured, non-zero sample found: %s\n",
                     totalBytesCaptured, hasNonZeroSample ? "yes" : "no");
             break;
         }
 
-        if (!wavPath.empty() && elapsedSec >= seconds) {
-            fprintf(stderr, "[AppAudio] WAV capture finished (%d seconds, %u bytes data)\n", seconds, wavDataBytesWritten);
+        if (seconds > 0 && elapsedSec >= static_cast<double>(seconds)) {
+            if (!wavPath.empty()) {
+                fprintf(stderr, "[AppAudio] WAV capture finished (%d seconds, %u bytes data)\n", seconds, wavDataBytesWritten);
+            } else {
+                fprintf(stderr, "[AppAudio] Stream capture finished (%d seconds)\n", seconds);
+            }
             break;
         }
     }
 
-    audioClient->Stop();
+    // Clean up audio resources
+    if (audioClient) {
+        audioClient->Stop();
+    }
 
-    // Finalize WAV file header
+    // Finalize WAV file header if writing WAV
     if (!wavPath.empty() && wavFile.is_open()) {
         uint32_t riffSize = 36 + wavDataBytesWritten;
         uint32_t dataSize = wavDataBytesWritten;
@@ -508,7 +743,14 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "[AppAudio] WAV file closed successfully: %s\n", wavPath.c_str());
     }
 
-    CloseHandle(hAudioEvent);
+    if (hAudioEvent) {
+        CloseHandle(hAudioEvent);
+    }
     CoUninitialize();
-    return 0;
+
+    // Summary of silence guard (Section 2)
+    double totalFilledSec = static_cast<double>(totalSilenceFilledFrames) / rate;
+    fprintf(stderr, "[AppAudio] Silence guard summary: filled total %.2f s of silence\n", totalFilledSec);
+
+    return exitCode;
 }
