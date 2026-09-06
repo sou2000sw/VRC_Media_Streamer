@@ -14,6 +14,7 @@
 #include <vector>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -379,6 +380,7 @@ int main(int argc, char* argv[]) {
     int statsInterval = 0;
 
     int levelIntervalMs = 0;
+    DWORD parentPid = 0;
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -406,6 +408,11 @@ int main(int argc, char* argv[]) {
             probe = true;
         } else if (arg == "--stop-on-exit") {
             stopOnExit = true;
+        } else if (arg == "--parent-pid" && i + 1 < argc) {
+            // 親（本体アプリ）のPID。親が消えたら自分も終わる。
+            // ★これが無いと、本体をタスクマネージャ等で強制終了したとき、
+            //   この exe だけが残って音声を取り込み続ける。実際に2回発生した。
+            parentPid = static_cast<DWORD>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--level" && i + 1 < argc) {
             // 入力レベルの通知間隔[ms]。0で無効。
             // ★UIのゲージ用。取り込めているのかを配信中に目で確かめられるようにする。
@@ -504,6 +511,29 @@ int main(int argc, char* argv[]) {
     int exitCode = 0;
     bool targetExitLogged = false;
 
+    // ★親のハンドルは起動時に1度だけ開いて持ち続ける。毎回PIDで開き直すと、
+    //   親が終了したあとに同じPIDが別プロセスへ再利用された場合に生存と誤判定する。
+    HANDLE hParent = NULL;
+    if (parentPid != 0) {
+        hParent = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                              FALSE, parentPid);
+        if (hParent == NULL) {
+            DWORD err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED) {
+                // 監視はできないが、動作そのものは続けられる。
+                fprintf(stderr, "[AppAudio] Parent %lu: access denied, "
+                                "parent monitoring disabled\n", parentPid);
+            } else {
+                fprintf(stderr, "[AppAudio] Parent %lu is already gone, exiting\n", parentPid);
+                if (audioClient) audioClient->Stop();
+                CoUninitialize();
+                return 0;
+            }
+        } else {
+            fprintf(stderr, "[AppAudio] Watching parent process %lu\n", parentPid);
+        }
+    }
+
     auto startTime = std::chrono::steady_clock::now();
     auto lastPacketOrGuardTime = startTime;
     auto lastProcCheckTime = startTime;
@@ -517,6 +547,14 @@ int main(int argc, char* argv[]) {
         // Check target process status once per second
         if (now - lastProcCheckTime >= std::chrono::seconds(1)) {
             lastProcCheckTime = now;
+
+            // 親が消えていたら、こちらも畳む。対象プロセスの生死とは無関係に、
+            // 本体が居なくなった時点でこの exe の存在意義が無くなるため。
+            if (hParent != NULL && WaitForSingleObject(hParent, 0) == WAIT_OBJECT_0) {
+                fprintf(stderr, "[AppAudio] Parent process %lu exited, stopping\n", parentPid);
+                exitCode = 0;
+                break;
+            }
             if (!ProcessExists(pid)) {
                 if (stopOnExit) {
                     fprintf(stderr, "[AppAudio] Target process %lu exited (--stop-on-exit specified), stopping\n", pid);
@@ -787,6 +825,11 @@ int main(int argc, char* argv[]) {
         CloseHandle(hAudioEvent);
     }
     CoUninitialize();
+
+    if (hParent != NULL) {
+        CloseHandle(hParent);
+        hParent = NULL;
+    }
 
     // Summary of silence guard (Section 2)
     double totalFilledSec = static_cast<double>(totalSilenceFilledFrames) / rate;

@@ -104,6 +104,10 @@ def test_start_helper_builds_expected_command():
     assert cmd[cmd.index("--pid") + 1] == "4321"
     assert cmd[cmd.index("--mode") + 1] == "exclude"
     assert cmd[cmd.index("--stats") + 1] == "5"
+    # ★親PIDを必ず渡す。渡さないと本体を強制終了したとき補助exeが残り、
+    #   音声を取り込み続ける。
+    import os as _os
+    assert cmd[cmd.index("--parent-pid") + 1] == str(_os.getpid())
 
 
 def test_start_helper_is_fail_soft_on_exception():

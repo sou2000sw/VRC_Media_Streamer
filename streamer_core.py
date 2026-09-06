@@ -622,6 +622,10 @@ def start_app_audio_helper(pid, mode="include", rate=APP_AUDIO_RATE,
         cmd += ["--stats", str(int(stats_sec))]
     if level_ms:
         cmd += ["--level", str(int(level_ms))]
+    # ★親（このプロセス）のPIDを渡す。本体がタスクマネージャ等で強制終了されると
+    #   Python側の回収スレッドは動かないため、補助exeだけが残って音声を取り込み
+    #   続けてしまう（実際に2回発生した）。補助exe自身に親を監視させて畳ませる。
+    cmd += ["--parent-pid", str(os.getpid())]
     try:
         # ★stderr を DEVNULL にしてはいけない。補助exeの診断ログと入力レベルが
         #   そこにしか出ないため、捨てると「音が来ているのか」を誰も知り得なくなる。
