@@ -278,11 +278,10 @@ def test_set_live_audio_bg_source(monkeypatch):
 
 
 def test_live_audio_uses_slideshow_when_selected(monkeypatch, tmp_path):
-    """★スライドショーの自動送りは現在無効。写真1枚の静止画に落とす。
+    """スライドショー指定かつ写真があるなら concat + stream_loop で送る。
 
-    背景を concat にすると送出FFmpegが1〜3秒で死んで再起動を繰り返し、
-    そのたび補助exeが道連れになって音声が流れなくなる（standbyでは正常）。
-    原因が特定できるまでは、音が出ないより静止画1枚の方が実害が小さい。
+    ★-re を付けてはいけない。付けると送出FFmpegが数秒で死に、アプリ音声が
+      流れなくなる（実測: -re あり 0/12秒、-re なし 12/12秒）。
     """
     core = _live_core()
     try:
@@ -302,9 +301,9 @@ def test_live_audio_uses_slideshow_when_selected(monkeypatch, tmp_path):
         cmd = _run_live_audio(monkeypatch, core)
         assert cmd is not None
         joined = " ".join(str(c) for c in cmd)
-        assert "concat" not in joined, "concat 経路は無効化されているはず"
-        assert "-stream_loop" not in cmd
-        assert "-loop" in cmd, "静止画1枚の経路になっていない"
+        assert "concat" in joined, "スライドショーなのに concat が使われていない"
+        assert "-stream_loop" in cmd, "巡回しない（1周で止まる）"
+        assert "-re" not in cmd, "-re を付けると送出が死ぬ（0/12秒）"
     finally:
         core.shutdown()
 

@@ -4608,12 +4608,21 @@ class StreamerCore:
         #   ラジオ側の concat 経路は従来どおりで、こちらは触っていない。
         slideshow_manifest_path = None
         if bg_source == "slideshow" and auto_advance:
-            log_print("[LiveAudio] スライドショーの自動送りは一時的に無効です"
-                      "（送出が不安定になる問題の調査中）。写真1枚を背景にします。")
+            slideshow_manifest_path = self.build_slideshow_manifest(
+                track_seconds=0, label="LiveAudio",
+                manifest_name="slideshow_manifest_live.txt")
 
         if slideshow_manifest_path:
             # 現在ここには来ない（上でスライドショーを無効にしている）。
             # 原因が判明したら上のガードを外して復帰させる。
+            # ★concat 入力に -re を付けてはいけない。付けると送出FFmpegが数秒で死に、
+            #   再起動を繰り返してアプリ音声が流れなくなる。FFmpeg自身は
+            #   「[dec:png] Decoding error: Invalid data found」を出しており、
+            #   ループで画像を読み直す時に前処理PNGの書き込みと噛み合っていると見られる。
+            #   実測（同一ビルドで -re の有無だけ変更・配布物で確認）:
+            #     -re あり -> 入力レベル 0/12 秒（死亡）
+            #     -re なし -> 入力レベル 12/12 秒（正常）
+            #   ラジオの concat にも -re は付いていない。
             video_input_opts = [
                 "-stream_loop", "-1",
                 "-f", "concat", "-safe", "0",

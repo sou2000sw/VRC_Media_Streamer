@@ -8,4 +8,4 @@ UI 側の更新が漏れて v2.8.0 / v2.9.0 の2リリースにわたり「v2.7.
 依存を持たせないこと（build_exe.py からも import するため）。
 """
 
-APP_VERSION = "2.10.5"
+APP_VERSION = "2.10.6"
