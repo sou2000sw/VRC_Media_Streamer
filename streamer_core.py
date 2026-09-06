@@ -640,6 +640,7 @@ def enumerate_capture_windows():
 
                 results.append({
                     "title": title,
+                    "hwnd": int(hwnd),
                     "left": int(rect.left),
                     "top": int(rect.top),
                     "width": int(w),
@@ -662,6 +663,7 @@ def enumerate_capture_windows():
         for r in results:
             final_windows.append({
                 "title": r["title"],
+                "hwnd": r["hwnd"],
                 "left": r["left"],
                 "top": r["top"],
                 "width": r["width"],
@@ -695,6 +697,54 @@ def even_dimension(value, minimum=2):
     if v % 2 != 0:
         v -= 1
     return v
+
+
+def get_window_rect_by_hwnd(hwnd):
+    """ウィンドウハンドルから現在のタイトルと矩形を引く。無効なら None。
+
+    ★ウィンドウの同一性は**タイトルではなくハンドルで持つ**。
+      タイトルは動く。実測: YouTube が次の動画へ進んだだけで
+      `黄色Vtuber… - YouTube - Google Chrome` が
+      `親父の仕事初日 #shorts - YouTube - Google Chrome` に変わり、
+      完全一致で引き直していた実装は配信開始12秒で対象を見失って停止した。
+      ハンドルなら「利用者が選んだそのウィンドウ」を取り違えずに追い続けられる。
+    """
+    if sys.platform != "win32" or not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.IsWindow.argtypes = [wintypes.HWND]; u.IsWindow.restype = wintypes.BOOL
+        u.IsWindowVisible.argtypes = [wintypes.HWND]; u.IsWindowVisible.restype = wintypes.BOOL
+        u.IsIconic.argtypes = [wintypes.HWND]; u.IsIconic.restype = wintypes.BOOL
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]; u.GetWindowTextLengthW.restype = ctypes.c_int
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowTextW.restype = ctypes.c_int
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+        u.GetWindowRect.restype = wintypes.BOOL
+
+        h = wintypes.HWND(int(hwnd))
+        if not u.IsWindow(h) or not u.IsWindowVisible(h) or u.IsIconic(h):
+            return None
+        r = _RECT()
+        if not u.GetWindowRect(h, ctypes.byref(r)):
+            return None
+        w, ht = r.right - r.left, r.bottom - r.top
+        if w < 16 or ht < 16:
+            return None
+        n = u.GetWindowTextLengthW(h)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u.GetWindowTextW(h, buf, n + 1)
+        return {"hwnd": int(hwnd), "title": buf.value.strip(),
+                "left": int(r.left), "top": int(r.top), "width": int(w), "height": int(ht)}
+    except Exception:
+        return None
 
 
 def get_virtual_screen_rect():
@@ -3879,7 +3929,13 @@ class StreamerCore:
             except (TypeError, ValueError):
                 pass
         if window_title is not None:
-            self.config["screen_capture_window_title"] = str(window_title)
+            new_title = str(window_title)
+            # 選び直したらハンドルも取り直す（前のウィンドウを掴み続けない）
+            if new_title != self.config.get("screen_capture_window_title"):
+                self._screen_capture_hwnd = None
+            self.config["screen_capture_window_title"] = new_title
+            found = find_capture_window(new_title) if new_title else None
+            self._screen_capture_hwnd = found.get("hwnd") if found else None
         if framerate is not None:
             try:
                 fps = int(framerate)
@@ -4034,7 +4090,18 @@ class StreamerCore:
                 self.status = "error"
                 self.status_detail = "キャプチャ対象のウィンドウが未選択です"
                 return None
-            win = find_capture_window(window_title)
+            # ★同一性はハンドルで持つ。タイトルで引き直すと、YouTubeが次の動画へ
+            #   進んだだけで見失う（実測: 配信開始12秒で停止し、以後15秒間隔で
+            #   失敗し続けた）。ハンドルが生きている限り、タイトルが変わっても
+            #   「利用者が選んだそのウィンドウ」を追い続ける。
+            win = get_window_rect_by_hwnd(getattr(self, "_screen_capture_hwnd", None))
+            if win is None:
+                win = find_capture_window(window_title)
+                if win is not None:
+                    self._screen_capture_hwnd = win.get("hwnd")
+            elif win.get("title") and win["title"] != window_title:
+                log_print(f"[Player] Screen capture window title changed: "
+                          f"'{window_title}' -> '{win['title']}' (ハンドルで追跡継続)")
             if win is None:
                 log_print(f"[Player] Screen capture window not found: '{window_title}'")
                 self.status = "error"
@@ -4696,13 +4763,46 @@ class StreamerCore:
             log_print(f"[Core] Failed to save standby image: {e}")
         return STANDBY_IMAGE_PATH
 
-    def play_standby_loop(self, empty_slideshow=False):
-        """キューが空、またはスライドショー写真未登録時に待機画面（QRコード・URL付き静止画）をHLS配信"""
+    def screen_capture_source_available(self):
+        """画面共有の取り込み対象が今この瞬間に掴めるか。"""
+        if str(self.config.get("screen_capture_source_type", "display")) != "window":
+            return True
+        if get_window_rect_by_hwnd(getattr(self, "_screen_capture_hwnd", None)):
+            return True
+        title = str(self.config.get("screen_capture_window_title", "")).strip()
+        if not title:
+            return False
+        found = find_capture_window(title)
+        if found:
+            self._screen_capture_hwnd = found.get("hwnd")
+            return True
+        return False
+
+    def play_standby_loop(self, empty_slideshow=False, screen_unavailable=False):
+        """キューが空、スライドショー写真未登録、または画面共有の対象が見つからないときに
+        待機画面（QRコード・URL付き静止画）をHLS配信する。
+
+        ★画面共有で対象を見失ったときに「何も送らない」を選んではいけない。
+          ワールド側は映像が来ないだけで、利用者からは配信そのものが死んだように見える
+          （実機で実際にそうなった）。待機画面を出し続け、対象が戻れば自動で復帰する。
+        """
         last_tunnel_url = self.tunnel_raw_url
-        notice_text = "📷 スライドショー写真が未登録です（Webリモコンから写真をアップロードできます）" if empty_slideshow else None
+        if empty_slideshow:
+            notice_text = "📷 スライドショー写真が未登録です（Webリモコンから写真をアップロードできます）"
+        elif screen_unavailable:
+            notice_text = "🖥️ 画面共有: 共有対象のウィンドウが見つかりません（Webリモコンで選び直してください）"
+        else:
+            notice_text = None
 
         while self.is_running and not self.skip_event.is_set():
-            if empty_slideshow:
+            if screen_unavailable:
+                if self.get_playback_mode() != "screen":
+                    break
+                if self.screen_capture_source_available():
+                    break
+                self.status = "offline"
+                self.status_detail = "画面共有: 対象が見つかりません（待機画面を配信中）"
+            elif empty_slideshow:
                 if self.get_playback_mode() != "slideshow":
                     break
                 with self.photo_lock:
@@ -4711,7 +4811,10 @@ class StreamerCore:
                 self.status = "offline"
                 self.status_detail = "Slideshow (No Photos — Standby Notice)"
             else:
-                if self.get_playback_mode() == "slideshow":
+                # 実時間ソースのモードへ切り替えたら待機ループから抜ける。
+                # ここを slideshow だけにしていると、切り替えても待機画面が
+                # 出続けて「切り替わらない」ように見える。
+                if self.get_playback_mode() in ("slideshow", "live", "screen"):
                     break
                 with self.queue_lock:
                     if len(self.play_queue) > 0:
@@ -4912,7 +5015,14 @@ class StreamerCore:
                     stop_event = self.play_screen_capture()
                     if stop_event is None:
                         self._screen_capture_fail_streak = min(fail_streak + 1, 10)
-                        time.sleep(min(1.0 + fail_streak * 2.0, 15.0))
+                        # ★無映像のまま放置しない。待機画面を出し続け、対象が
+                        #   戻ってきたら自動で復帰する（この関数は対象が掴めた
+                        #   時点で抜ける）。実機で「配信自体が死ぬ」と見えたのは
+                        #   ここで何も送っていなかったため。
+                        self.current_video = {"title": "画面共有（対象を待機中）", "url": "",
+                                              "duration": 0, "type": "screen_capture"}
+                        self.play_standby_loop(screen_unavailable=True)
+                        time.sleep(min(0.5 + fail_streak * 0.5, 5.0))
                         continue
 
                     while self.is_running and not self.skip_event.is_set():
