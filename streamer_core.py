@@ -4413,6 +4413,32 @@ class StreamerCore:
             "fresh": fresh,
         }
 
+    def pump_sender_stderr(self, proc, label, max_lines=40):
+        """送出FFmpegの stderr を読み、警告・エラーだけをログへ残す。
+
+        ★PIPE にした以上は読み続けること（読まないとバッファが詰まって止まる）。
+          全文を残すと進捗表示で埋まるので、意味のある行だけに絞る。
+        """
+        kept = 0
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                low = line.lower()
+                if ("error" in low or "invalid" in low or "failed" in low
+                        or "no such file" in low or "conversion failed" in low):
+                    if kept < max_lines:
+                        log_print(f"[FFmpeg:{label}] {line}")
+                        kept += 1
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
     def reap_app_audio_helper(self, sender_proc, helper_proc):
         """送出FFmpegが終わったら補助exeを確実に落とす。
 
@@ -4573,15 +4599,23 @@ class StreamerCore:
         bg_source = str(self.config.get("live_audio_bg_source", "standby"))
         auto_advance = bool(self.config.get("image_auto_advance", False)) and not self.image_paused
 
+        # ★ライブ音声では concat（写真の自動送り）を使わない。
+        #   実測: 背景を slideshow(concat) にすると送出FFmpegが1〜3秒で死に、
+        #   再起動を繰り返す。そのたび補助exeが道連れになるため音声が流れず、
+        #   入力ゲージも無反応になり、RTMPシンクまで落ちた（standby では正常）。
+        #   同じコマンドを手で実行しても再現しないため原因は未特定。
+        #   分かるまでは写真1枚の静止画に落とす（音声が流れないより実害が小さい）。
+        #   ラジオ側の concat 経路は従来どおりで、こちらは触っていない。
         slideshow_manifest_path = None
         if bg_source == "slideshow" and auto_advance:
-            slideshow_manifest_path = self.build_slideshow_manifest(
-                track_seconds=0, label="LiveAudio",
-                manifest_name="slideshow_manifest_live.txt")
+            log_print("[LiveAudio] スライドショーの自動送りは一時的に無効です"
+                      "（送出が不安定になる問題の調査中）。写真1枚を背景にします。")
 
         if slideshow_manifest_path:
+            # 現在ここには来ない（上でスライドショーを無効にしている）。
+            # 原因が判明したら上のガードを外して復帰させる。
             video_input_opts = [
-                "-re", "-stream_loop", "-1",
+                "-stream_loop", "-1",
                 "-f", "concat", "-safe", "0",
                 "-i", os.path.abspath(slideshow_manifest_path)
             ]
@@ -4672,11 +4706,13 @@ class StreamerCore:
                   f"bg={'slideshow(concat)' if slideshow_manifest_path else bg_source + '(still)'}")
 
         try:
+            # ★stderr を捨てない。今回、送出FFmpegが即死する不具合を追ったとき、
+            #   ここを DEVNULL にしていたせいで「なぜ死んだか」を誰も知り得なかった。
             proc = subprocess.Popen(
                 cmd,
                 stdin=(app_helper.stdout if app_helper else subprocess.DEVNULL),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, bufsize=0,
+                stderr=subprocess.PIPE, bufsize=0,
                 creationflags=CREATE_NO_WINDOW
             )
         except Exception as e:
@@ -4698,6 +4734,9 @@ class StreamerCore:
         if app_helper:
             threading.Thread(target=self.reap_app_audio_helper,
                              args=(proc, app_helper), daemon=True).start()
+
+        threading.Thread(target=self.pump_sender_stderr,
+                         args=(proc, "live_audio"), daemon=True).start()
 
         stop_event = threading.Event()
         threading.Thread(target=self.relay_stream_data,
