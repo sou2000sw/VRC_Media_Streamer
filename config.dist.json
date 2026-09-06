@@ -51,7 +51,7 @@
   "setup_completed": false,
   "generic_rtmp_url": "",
   "generic_rtmp_key": "",
-  "rtmp_video_bitrate_kbps": 1500,
+  "rtmp_video_bitrate_kbps": 2000,
   "rtmp_audio_bitrate_kbps": 192,
   "rtmp_video_width": 1280,
   "rtmp_video_height": 720,

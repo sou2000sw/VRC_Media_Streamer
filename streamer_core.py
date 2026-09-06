@@ -154,7 +154,10 @@ DEFAULT_CONFIG = {
     "topaz_stream_key": "",
     "generic_rtmp_url": "",
     "generic_rtmp_key": "",
-    "rtmp_video_bitrate_kbps": 1500,
+    # ★TopazChat の上限（TOPAZ_MAX_VIDEO_KBPS=2000）に合わせる。
+    #   720p30 の画面共有を 1500kbps に通すと1画素あたり0.054ビットしか無く、
+    #   動きのある画面で明確に潰れる（実測）。上限まで使うのを既定にする。
+    "rtmp_video_bitrate_kbps": 2000,
     "rtmp_audio_bitrate_kbps": 192,
     "rtmp_video_width": 1280,
     "rtmp_video_height": 720,
@@ -2573,7 +2576,7 @@ class StreamerCore:
             "generic_rtmp_url": str(self.config.get("generic_rtmp_url", "") or ""),
             "generic_rtmp_key": generic_key if include_secrets else self.mask_stream_key(generic_key),
             "generic_rtmp_key_set": bool(generic_key),
-            "rtmp_video_bitrate_kbps": int(self.config.get("rtmp_video_bitrate_kbps", 1500)),
+            "rtmp_video_bitrate_kbps": int(self.config.get("rtmp_video_bitrate_kbps", 2000)),
             "rtmp_audio_bitrate_kbps": int(self.config.get("rtmp_audio_bitrate_kbps", 192)),
             "rtmp_fallback_to_hls": bool(self.config.get("rtmp_fallback_to_hls", True)),
             "max_video_bitrate_kbps": self.get_rtmp_limits()[0],
@@ -2652,7 +2655,7 @@ class StreamerCore:
             if not url:
                 return None, ""
             self.clamp_rtmp_bitrates()
-            v_kbps = int(self.config.get("rtmp_video_bitrate_kbps", 1500))
+            v_kbps = int(self.config.get("rtmp_video_bitrate_kbps", 2000))
             a_kbps = int(self.config.get("rtmp_audio_bitrate_kbps", 192))
             width = int(self.config.get("rtmp_video_width", 1280))
             height = int(self.config.get("rtmp_video_height", 720))
