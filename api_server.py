@@ -1311,7 +1311,8 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     width=body_json.get("width"),
                     height=body_json.get("height"),
                     draw_mouse=body_json.get("draw_mouse"),
-                    bitrate_kbps=body_json.get("bitrate_kbps"))
+                    bitrate_kbps=body_json.get("bitrate_kbps"),
+                    window_method=body_json.get("window_method"))
                 self.send_json_response(200, {"success": True, "screen_capture": res,
                                               "message": "Screen capture source updated."})
             elif action == "set_radio_mode":

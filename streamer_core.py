@@ -48,6 +48,10 @@ LOCAL_FFPROBE = os.path.join(APP_DIR, "ffprobe.exe")
 LOCAL_APP_AUDIO_EXE = os.path.join(APP_DIR, "app_audio_capture.exe")
 DEV_APP_AUDIO_EXE = os.path.join(BASE_PATH, "native", "app_audio_capture",
                                  "build", "app_audio_capture.exe")
+# タスク26: ウィンドウ単位キャプチャ補助exe。置き場所の規約はタスク25に揃える。
+LOCAL_WINDOW_CAPTURE_EXE = os.path.join(APP_DIR, "window_capture.exe")
+DEV_WINDOW_CAPTURE_EXE = os.path.join(BASE_PATH, "native", "window_capture",
+                                      "build", "window_capture.exe")
 VIDEO_STORAGE_DIR = os.path.join(HLS_DIR, "videos")
 
 def cleanup_hls_dir_completely():
@@ -138,6 +142,11 @@ DEFAULT_CONFIG = {
     "screen_capture_source_type": "display",   # "display" | "window"
     "screen_capture_display_index": 0,
     "screen_capture_window_title": "",
+    # タスク26: ウィンドウ取り込みの方式。
+    #   "auto"         … WGC を試し、駄目なら切り出しへ落ちる（既定）
+    #   "wgc"          … WGC のみ。使えなければウィンドウ取り込み自体を諦める
+    #   "desktop_crop" … 従来どおり合成済みデスクトップの切り出し（重なりが映る）
+    "screen_capture_window_method": "auto",
     "screen_capture_framerate": 30,
     "screen_capture_width": 1920,
     "screen_capture_height": 1080,
@@ -272,6 +281,13 @@ def get_ffprobe_cmd():
 def get_app_audio_capture_cmd():
     """アプリ音声取り込み補助exeのパス。無ければ None（呼び出し側はフォールバックする）。"""
     for path in (LOCAL_APP_AUDIO_EXE, DEV_APP_AUDIO_EXE):
+        if os.path.exists(path):
+            return path
+    return None
+
+def get_window_capture_cmd():
+    """ウィンドウ単位キャプチャ補助exeのパス。無ければ None（呼び出し側は退避する）。"""
+    for path in (LOCAL_WINDOW_CAPTURE_EXE, DEV_WINDOW_CAPTURE_EXE):
         if os.path.exists(path):
             return path
     return None
@@ -640,6 +656,96 @@ def start_app_audio_helper(pid, mode="include", rate=APP_AUDIO_RATE,
         return None
     log_print(f"[AppAudio] helper started pid={target_pid} mode={mode}")
     return proc
+
+
+# 補助exeが出力寸法を知らせてくるまでの待ち時間。実測のハンドシェイクは 0.23 秒。
+WINDOW_CAPTURE_READY_TIMEOUT = 5.0
+
+
+def start_window_capture_helper(hwnd, fps=30, draw_mouse=True,
+                                ready_timeout=WINDOW_CAPTURE_READY_TIMEOUT):
+    """WGC補助exeを起動し (proc, pipe_name, width, height) を返す。駄目なら None。
+
+    ★出力寸法は Python 側では決められない。GetWindowRect は DWM の影や枠を含み、
+      WGC の item size と一致しない（実測: GetWindowRect 1294x1399 に対し
+      WGC は 1280x1392）。**補助exeが決めて stderr の ready 行で知らせる**ので、
+      それを待ってから ffmpeg を起こす。順序を逆にすると ffmpeg が存在しない
+      パイプを開きに行って落ちる。
+
+    ★戻り値が None でも配信は止めない。呼び出し側が従来の切り出しへ退避する。
+    """
+    exe = get_window_capture_cmd()
+    if not exe:
+        log_print("[WinCap] helper exe not found -> 従来の切り出しへ退避")
+        return None
+    try:
+        target = int(hwnd)
+    except (TypeError, ValueError):
+        target = 0
+    if target <= 0:
+        log_print(f"[WinCap] invalid hwnd: {hwnd!r}")
+        return None
+    try:
+        fps_i = max(1, min(60, int(fps)))
+    except (TypeError, ValueError):
+        fps_i = 30
+
+    pipe_name = r"\\.\pipe\vrcms_wincap_%d_%s" % (os.getpid(), uuid.uuid4().hex[:8])
+    cmd = [exe, "--hwnd", str(target), "--pipe", pipe_name,
+           "--fps", str(fps_i),
+           "--draw-mouse", "1" if draw_mouse else "0",
+           "--no-border", "1",
+           "--stats", "30",
+           # ★親を見張らせる。本体がタスクマネージャ等で強制終了されると
+           #   Python側の回収スレッドは動かず、補助exeだけが残る。
+           "--parent-pid", str(os.getpid())]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, bufsize=0, creationflags=CREATE_NO_WINDOW)
+    except Exception as e:
+        log_print(f"[WinCap] helper start failed: {e}")
+        return None
+
+    ready = threading.Event()
+    size = {}
+
+    def pump():
+        # ★stderr は最後まで読み続ける。読まないとバッファが詰まって補助exeが止まる。
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip()
+                if not line:
+                    continue
+                if "w" not in size and "ready" in line and "size=" in line:
+                    try:
+                        w_s, h_s = line.split("size=")[1].split()[0].split("x")
+                        size["w"], size["h"] = int(w_s), int(h_s)
+                        ready.set()
+                    except (IndexError, ValueError):
+                        pass
+                log_print(f"[WinCap] {line}")
+        except Exception:
+            pass
+        finally:
+            ready.set()   # 補助exeが死んだときも待ち側を解放する
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    if not ready.wait(ready_timeout) or "w" not in size:
+        log_print(f"[WinCap] ready 行が {ready_timeout}s 以内に来なかった "
+                  f"(rc={proc.poll()}) -> 退避")
+        kill_proc(proc)
+        return None
+
+    w, h = size["w"], size["h"]
+    if w < 16 or h < 16:
+        log_print(f"[WinCap] 出力寸法が小さすぎる: {w}x{h} -> 退避")
+        kill_proc(proc)
+        return None
+    log_print(f"[WinCap] helper started hwnd={target} {w}x{h} fps={fps_i} pipe={pipe_name}")
+    return (proc, pipe_name, w, h)
+
 
 _capture_displays_cache = (0.0, [])
 
@@ -1179,6 +1285,10 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
       代わりに **合成済みのデスクトップをウィンドウ矩形で切り出す**。
       同じ3ウィンドウが mean=30.6 / 37.2 / 133.7 と正しく映ることを実測で確認済み。
       副作用として、手前に重なった別ウィンドウはそのまま映り込む。
+
+    ★タスク26で "wgc" プランを追加した。補助exeが名前付きパイプへ流す生BGRAを
+      受けるだけなので、ここでは寸法を検証しない（寸法は補助exeが決めて
+      ready 行で知らせたもの。Python 側で採り直すと必ずずれる）。
     """
     try:
         fps = int(framerate)
@@ -1189,6 +1299,17 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
 
     if source_type == "window" and window_title and window_plan:
         kind = window_plan[0]
+        if kind == "wgc":
+            _, pipe_name, w, h = window_plan
+            # ★-framerate は補助exe側の送出レートと必ず一致させること。
+            #   rawvideo にはタイムスタンプが無く、ここの値がそのまま時間軸になる。
+            input_args = [
+                "-f", "rawvideo", "-pixel_format", "bgra",
+                "-video_size", f"{w}x{h}", "-framerate", str(fps),
+                "-thread_queue_size", "1024",
+                "-i", pipe_name
+            ]
+            return (input_args, False)
         if kind == "ddagrab":
             _, idx, ox, oy, w, h = window_plan
             dm = "true" if draw_mouse else "false"
@@ -2368,6 +2489,8 @@ class StreamerCore:
             "screen_capture_height": int(self.config.get("screen_capture_height", 1080)),
             "screen_capture_draw_mouse": bool(self.config.get("screen_capture_draw_mouse", True)),
             "screen_capture_bitrate_kbps": int(self.config.get("screen_capture_bitrate_kbps", 4000)),
+            "screen_capture_window_method": str(self.config.get("screen_capture_window_method", "auto")),
+            "window_capture_available": bool(get_window_capture_cmd()),
             "standby_mode": str(self.config.get("standby_mode", "image")),
             "standby_image_path": str(self.config.get("standby_image_path", "")),
             "has_prev": has_prev,
@@ -4459,6 +4582,21 @@ class StreamerCore:
         self.app_audio_level = None
         log_print("[AppAudio] helper stopped")
 
+    def reap_window_capture_helper(self, sender_proc, helper_proc):
+        """送出FFmpegが終わったらWGC補助exeを確実に落とす。
+
+        補助exe側にも --parent-pid の見張りを入れてあるが、あれは本体ごと
+        落ちたときの保険。通常の停止・曲送りではこちらで回収する。
+        """
+        if not helper_proc:
+            return
+        try:
+            sender_proc.wait()
+        except Exception:
+            pass
+        kill_proc(helper_proc)
+        log_print("[WinCap] helper stopped")
+
     def set_live_audio_app(self, enabled=None, window_title=None, volume=None, mode=None):
         """アプリ単位の音声取り込み設定を更新する。"""
         if enabled is not None:
@@ -4520,10 +4658,13 @@ class StreamerCore:
 
     def set_screen_capture_source(self, source_type=None, display_index=None, window_title=None,
                                   framerate=None, width=None, height=None,
-                                  draw_mouse=None, bitrate_kbps=None):
+                                  draw_mouse=None, bitrate_kbps=None,
+                                  window_method=None):
         """画面キャプチャ設定（入力ソース・フレームレート・解像度等）を更新"""
         if source_type in ("display", "window"):
             self.config["screen_capture_source_type"] = source_type
+        if window_method in ("auto", "wgc", "desktop_crop"):
+            self.config["screen_capture_window_method"] = window_method
         if display_index is not None:
             try:
                 idx = int(display_index)
@@ -4578,6 +4719,8 @@ class StreamerCore:
             "height": self.config.get("screen_capture_height", 1080),
             "draw_mouse": self.config.get("screen_capture_draw_mouse", True),
             "bitrate_kbps": self.config.get("screen_capture_bitrate_kbps", 4000),
+            "window_method": self.config.get("screen_capture_window_method", "auto"),
+            "wgc_available": get_window_capture_cmd() is not None,
         }
 
     def play_live_audio(self):
@@ -4824,10 +4967,34 @@ class StreamerCore:
                           f"{width}x{height} -> {capped_w}x{capped_h}")
                 width, height = capped_w, capped_h
 
-        window_plan = resolve_window_capture_plan(win) if win else None
+        # タスク26: まず WGC（重なりが映らない）を試し、駄目なら従来の切り出しへ。
+        win_helper = None
+        window_plan = None
+        if win:
+            method = str(self.config.get("screen_capture_window_method", "auto"))
+            if method in ("auto", "wgc"):
+                started = start_window_capture_helper(
+                    win.get("hwnd"), fps=framerate, draw_mouse=draw_mouse)
+                if started:
+                    win_helper, pipe_name, ww, wh = started
+                    window_plan = ("wgc", pipe_name, ww, wh)
+                elif method == "wgc":
+                    log_print("[Player] WGC が使えず、方式が 'wgc' 固定のため中止")
+                    kill_proc(app_helper)
+                    self.status = "error"
+                    self.status_detail = "ウィンドウ単位キャプチャ(WGC)を開始できませんでした"
+                    return None
+                else:
+                    # ★黙って落ちてはいけない。画質どころかプライバシー特性
+                    #   （重なりが映るか否か）が変わるので、必ず痕跡を残す。
+                    log_print("[Player] WGC 不可 -> 合成デスクトップの切り出しへ退避"
+                              "（手前に重なったウィンドウが映ります）")
+            if window_plan is None:
+                window_plan = resolve_window_capture_plan(win)
         if source_type == "window" and window_plan is None:
             log_print("[Player] Screen capture: could not resolve window capture plan.")
             kill_proc(app_helper)   # ここで抜けるなら補助exeも道連れにする
+            kill_proc(win_helper)
             self.status = "error"
             self.status_detail = "ウィンドウの取り込み方を決められませんでした"
             return None
@@ -4915,6 +5082,7 @@ class StreamerCore:
         except Exception as e:
             log_print(f"[Player] Error starting screen capture sender: {e}")
             kill_proc(app_helper)
+            kill_proc(win_helper)
             self.status = "error"
             self.status_detail = f"Screen capture sender error: {e}"
             return None
@@ -4931,6 +5099,9 @@ class StreamerCore:
         if app_helper:
             threading.Thread(target=self.reap_app_audio_helper,
                              args=(proc, app_helper), daemon=True).start()
+        if win_helper:
+            threading.Thread(target=self.reap_window_capture_helper,
+                             args=(proc, win_helper), daemon=True).start()
 
         stop_event = threading.Event()
         threading.Thread(target=self.relay_stream_data,

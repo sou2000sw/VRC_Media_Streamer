@@ -212,6 +212,18 @@ def get_app_audio_capture_source():
         return local
     return _find_bundled_tool("app_audio_capture")
 
+def get_window_capture_source():
+    """ウィンドウ単位キャプチャ補助exe（タスク26）のパスを取得。
+
+    無ければ同梱を省く（実行時に自動で従来のデスクトップ切り出しへ落ちる。
+    ただし手前に重なったウィンドウが映るようになる）。
+    """
+    local = os.path.abspath(os.path.join(
+        "native", "window_capture", "build", "window_capture.exe"))
+    if os.path.exists(local):
+        return local
+    return _find_bundled_tool("window_capture")
+
 def copy_media_tools(target_dir, label):
     """ffmpeg.exe / ffprobe.exe を配布先へコピーする"""
     for name, finder in (("ffmpeg", get_ffmpeg_source), ("ffprobe", get_ffprobe_source)):
@@ -231,6 +243,16 @@ def copy_media_tools(target_dir, label):
         print("[WARN] app_audio_capture.exe was not found. "
               "アプリ単位の音声取り込みは無効のまま配布されます "
               "(native/app_audio_capture/build.bat でビルドしてください)。", flush=True)
+
+    window_capture = get_window_capture_source()
+    if window_capture and os.path.exists(window_capture):
+        shutil.copy2(window_capture, os.path.join(target_dir, "window_capture.exe"))
+        print(f"[OK] Copied window_capture.exe -> {label}", flush=True)
+    else:
+        print("[WARN] window_capture.exe was not found. "
+              "ウィンドウ取り込みは従来のデスクトップ切り出しになり、"
+              "手前に重なったウィンドウが映ります "
+              "(native/window_capture/build.bat でビルドしてください)。", flush=True)
 
 def package_plugin(version=APP_VERSION):
     """plugin/ フォルダの資材を整理し、VRCBeacon用プラグインZIPパッケージを生成"""

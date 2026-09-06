@@ -70,6 +70,93 @@ def test_build_screen_capture_input_window_gdigrab_fallback():
     assert not any(str(a).startswith("title=") for a in args)
 
 
+def test_build_screen_capture_input_window_wgc():
+    """タスク26: WGC は補助exeが名前付きパイプへ流す生BGRAを受ける。
+
+    ★寸法は補助exeが ready 行で知らせた値をそのまま使う。Python 側で
+      GetWindowRect から採り直すと必ずずれる（実測: GetWindowRect 1294x1399
+      に対し WGC の item size は 1280x1392）。
+    """
+    args, needs_hwdownload = build_screen_capture_input(
+        source_type="window", window_title="メモ帳", framerate=30, draw_mouse=True,
+        window_plan=("wgc", r"\\.\pipe\vrcms_wincap_1_abcd", 1280, 1392))
+    assert needs_hwdownload is False
+    assert args[args.index("-f") + 1] == "rawvideo"
+    assert args[args.index("-pixel_format") + 1] == "bgra"
+    assert args[args.index("-video_size") + 1] == "1280x1392"
+    assert args[args.index("-i") + 1] == r"\\.\pipe\vrcms_wincap_1_abcd"
+    # ★-framerate は補助exe側の送出レートと一致していなければならない。
+    #   rawvideo にタイムスタンプは無く、ここの値がそのまま時間軸になる。
+    assert args[args.index("-framerate") + 1] == "30"
+    assert not any(str(a).startswith("title=") for a in args)
+
+
+def test_build_screen_capture_input_wgc_framerate_is_clamped_like_the_rest():
+    """異常な fps でも補助exe側のクランプ（1〜60）と食い違わせない。"""
+    args, _ = build_screen_capture_input(
+        source_type="window", window_title="メモ帳", framerate=999,
+        window_plan=("wgc", r"\\.\pipe\x", 640, 480))
+    assert args[args.index("-framerate") + 1] == "30"
+
+
+def test_window_capture_method_default_is_auto():
+    """既定は auto。WGC を試して駄目なら従来の切り出しへ落ちる。"""
+    assert DEFAULT_CONFIG["screen_capture_window_method"] == "auto"
+
+
+def test_set_screen_capture_source_rejects_unknown_window_method(tmp_path):
+    core = StreamerCore.__new__(StreamerCore)
+    core.config = dict(DEFAULT_CONFIG)
+    core.save_config = lambda: None
+    core.request_stream_reload = lambda: None
+    core._screen_capture_hwnd = None
+
+    core.set_screen_capture_source(window_method="desktop_crop")
+    assert core.config["screen_capture_window_method"] == "desktop_crop"
+    core.set_screen_capture_source(window_method="でたらめ")
+    assert core.config["screen_capture_window_method"] == "desktop_crop"
+
+
+def test_start_window_capture_helper_gives_up_without_ready_line(monkeypatch):
+    """ready 行が来なければ None を返し、補助exeを残さない。
+
+    ★ここで None を返せることが fail-soft の要。配信そのものを落とすより、
+      従来の切り出し（重なりは映るが動く）へ退避する方が事故として軽い。
+    """
+    killed = []
+    proc = MagicMock()
+    proc.stderr.readline.return_value = b""      # 何も出さずに終わる補助exe
+    proc.poll.return_value = 3
+    monkeypatch.setattr(streamer_core, "get_window_capture_cmd", lambda: "dummy.exe")
+    monkeypatch.setattr(streamer_core.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(streamer_core, "kill_proc", lambda p: killed.append(p))
+
+    assert streamer_core.start_window_capture_helper(1234, ready_timeout=0.5) is None
+    assert killed == [proc]
+
+
+def test_start_window_capture_helper_parses_ready_line(monkeypatch):
+    """ready 行の書式が変わったらここで落ちる（補助exeとの契約）。"""
+    lines = [b"[wincap] start hwnd=1234 fps=30 draw_mouse=1 sink=pipe\n",
+             b"[wincap] ready size=1280x1392 format=bgra\n",
+             b""]
+    proc = MagicMock()
+    proc.stderr.readline.side_effect = lines
+    monkeypatch.setattr(streamer_core, "get_window_capture_cmd", lambda: "dummy.exe")
+    monkeypatch.setattr(streamer_core.subprocess, "Popen", lambda *a, **k: proc)
+
+    got = streamer_core.start_window_capture_helper(1234, ready_timeout=2.0)
+    assert got is not None
+    _proc, pipe_name, w, h = got
+    assert (w, h) == (1280, 1392)
+    assert pipe_name.startswith(r"\\.\pipe\vrcms_wincap_")
+
+
+def test_start_window_capture_helper_without_exe(monkeypatch):
+    monkeypatch.setattr(streamer_core, "get_window_capture_cmd", lambda: None)
+    assert streamer_core.start_window_capture_helper(1234) is None
+
+
 def test_build_screen_capture_input_window_without_plan_falls_back():
     """取り込み方が決まらないウィンドウはディスプレイ取り込みへ落とす。"""
     args, needs_hwdownload = build_screen_capture_input(
