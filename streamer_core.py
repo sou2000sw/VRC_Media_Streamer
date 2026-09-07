@@ -135,6 +135,9 @@ DEFAULT_CONFIG = {
     "overlay_clock_video": False,
     "overlay_clock_position": "top-right",
     "playback_mode": "video",
+    # 素材（動画・ラジオ）の音量。0.0〜2.0、1.0 が等倍。
+    # ★マイク等と違い、これは「元から鳴っている音」を下げる側の値。
+    "media_volume": 1.0,
     "live_audio_mic_device": "",
     "live_audio_loopback_device": "",
     "live_audio_mic_volume": 1.0,
@@ -1992,6 +1995,40 @@ def build_radio_audio_filter(crossfade_seconds, duration=0, seek_seconds=0,
     return ",".join(filters)
 
 
+MEDIA_VOLUME_MAX = 2.0
+
+
+def normalize_media_volume(value):
+    """素材音量を 0.0〜2.0 へ丸める。数値でない値・NaN は 1.0（等倍）とみなす。
+
+    0 を「未設定」と読み替えないこと。**0 は無音という有効な指定**で、
+    ミュートはこの値を 0 にすることで実現している。
+    """
+    try:
+        volume = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if volume != volume:  # NaN
+        return 1.0
+    return float(max(0.0, min(MEDIA_VOLUME_MAX, volume)))
+
+
+def build_media_audio_filter(volume, base="aresample=async=1"):
+    """素材音声（動画・ラジオ）の -af 文字列を組み立てる。
+
+    ★等倍のときは volume= を差し込まない。見た目の問題ではなく、既定のまま
+      使っている環境の FFmpeg コマンドを1文字も変えないため。こうしておけば
+      「音量を触っていないのに音が変わった」という切り分け不能な回帰を作らない。
+    """
+    vol = normalize_media_volume(volume)
+    parts = []
+    if abs(vol - 1.0) > 1e-6:
+        parts.append("volume=%g" % vol)
+    if base:
+        parts.append(base)
+    return ",".join(parts)
+
+
 # =============================================================================
 # 映像エンコーダーの選択（タスク18: NVENC / QSV / AMF 対応）
 # =============================================================================
@@ -3362,6 +3399,7 @@ class StreamerCore:
             "radio_mode": (self.get_playback_mode() == "radio"),
             "radio_bg_source": str(self.config.get("radio_bg_source", "standby")),
             "radio_crossfade_duration": self.get_radio_crossfade_duration(),
+            "media_volume": self.get_media_volume(),
             "live_audio_mic_device": str(self.config.get("live_audio_mic_device", "")),
             "live_audio_loopback_device": str(self.config.get("live_audio_loopback_device", "")),
             "live_audio_mic_volume": float(self.config.get("live_audio_mic_volume", 1.0)),
@@ -3444,6 +3482,28 @@ class StreamerCore:
     def set_radio_mode(self, enabled: bool):
         mode = "radio" if enabled else "video"
         return (self.set_playback_mode(mode) == "radio")
+
+    def get_media_volume(self):
+        """素材（動画・ラジオ）の音量。0.0〜2.0、既定 1.0（等倍）。"""
+        return normalize_media_volume(self.config.get("media_volume", 1.0))
+
+    def set_media_volume(self, volume):
+        """素材音量を設定する。FFmpeg の引数なので、変えたら張り直しが要る。
+
+        ★同じ値で呼ばれたときは張り直さない。UIのスライダーは操作のたびに
+          現在値を送ってくるので、素直に張り直すと**値が変わっていないのに
+          配信が切れる**。
+        ★止まっているときも張り直しを要求しない。次に配信を始めた時点で
+          新しい値で組み上がるので、その要求は無駄なやり直しにしかならない。
+        """
+        before = self.get_media_volume()
+        self.config["media_volume"] = normalize_media_volume(volume)
+        self.save_config()
+        after = self.get_media_volume()
+        if abs(after - before) > 1e-6:
+            self.request_stream_reload_if_sending()
+        log_print(f"[Core] Media volume set to: {after:g}")
+        return after
 
     def get_radio_crossfade_duration(self):
         """ラジオの曲頭・曲尾フェード秒数。0 なら掛けない（タスク17）。"""
@@ -4764,10 +4824,13 @@ class StreamerCore:
         # 分からないと切り分けができないため、必ず名前とビットレートを残す。
         # 曲間フェード（タスク17）。ホットリロードでの復帰(seek>0)では
         # フェードインを掛けない ＝ 設定保存のたびに音量が揺れるのを防ぐ。
+        # 素材音量は afade より前に置く。どちらも線形ゲインなので効き方は同じだが、
+        # 「元の音を絞ってからフェードを掛ける」という読み順のほうが辿りやすい。
         radio_af = build_radio_audio_filter(
             self.get_radio_crossfade_duration(),
             duration=duration,
             seek_seconds=seek_seconds,
+            base=build_media_audio_filter(self.get_media_volume()),
         )
         log_print(
             f"[Player] Encoder path=radio 1920x1080@2fps v=200k(max250k/buf200k) "
@@ -4940,6 +5003,8 @@ class StreamerCore:
                 qr_idx = 0
                 mode = "bottom-right"
 
+            media_af = build_media_audio_filter(self.get_media_volume())
+
             overlay_filter = self._build_video_filter_complex(has_qr, has_clock, qr_idx, mode, clock_filter)
 
             if overlay_filter:
@@ -4964,7 +5029,7 @@ class StreamerCore:
                     v_kbps=2500, max_kbps=3000, buf_kbps=2000,
                     h264_profile="baseline", bf_zero=False),
                 "-c:a", "aac", "-b:a", "128k",
-                "-af", "aresample=async=1",
+                "-af", media_af,
                 "-shortest",
             ])
             # セグメント境界にIDRを置く（-g のフレーム数指定では入力fps次第でずれる）
@@ -4986,9 +5051,12 @@ class StreamerCore:
             else:
                 cmd.extend(["-map", "0:a:0?"])
             log_print("[Player] Encoder path=video/copy (no re-encode, source quality preserved)")
+            # ★"copy" は映像だけ。音声はここでも元から AAC へ焼き直しているので、
+            #   素材音量を掛けても追加のデコード/エンコードは発生しない。
+            media_af = build_media_audio_filter(self.get_media_volume())
             # コピー経路ではIDR位置を制御できない（受信側がキーフレームで分割する）。
             cmd.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                        "-af", "aresample=async=1", "-shortest",
+                        "-af", media_af, "-shortest",
                         "-fflags", "+nobuffer+flush_packets", "-flush_packets", "1",
                         "-muxdelay", "0", "-muxpreload", "0", "-max_interleave_delta", "0",
                         *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"])

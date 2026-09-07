@@ -1305,6 +1305,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
             # 破壊的・全消去操作は常にローカルホスト限定
             if action in ("clear_queue", "clear_photos", "stop", "set_live_audio",
                           "set_live_audio_app", "set_live_audio_bg_source",
+                          "set_media_volume",
                           "set_screen_capture") and not is_local:
                 self.send_json_response(403, {
                     "success": False,
@@ -1322,7 +1323,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     return
 
             # 再生制御操作の権限チェック
-            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode", "set_live_audio", "set_live_audio_app", "set_live_audio_bg_source", "set_screen_capture") and not is_local:
+            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode", "set_live_audio", "set_live_audio_app", "set_live_audio_bg_source", "set_media_volume", "set_screen_capture") and not is_local:
                 if not self.streamer_core.config.get("allow_web_playback_control", True):
                     self.send_json_response(403, {
                         "success": False,
@@ -1370,6 +1371,13 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     "success": True,
                     "live_audio_app": res,
                     "message": "App audio capture settings updated."
+                })
+            elif action == "set_media_volume":
+                res = self.streamer_core.set_media_volume(body_json.get("volume"))
+                self.send_json_response(200, {
+                    "success": True,
+                    "media_volume": res,
+                    "message": f"Media volume set to {res:g}."
                 })
             elif action == "set_live_audio_bg_source":
                 source = str(body_json.get("source", "standby")).strip().lower()

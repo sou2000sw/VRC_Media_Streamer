@@ -324,7 +324,7 @@
                                 </div>
                                 <p id="obsMixerScopeHint" class="hidden px-2.5 py-1 text-[10px] text-amber-400/90 border-b border-border"></p>
 
-                                <div class="p-2.5 flex flex-col gap-1.5 border-b border-border">
+                                <div id="mixChanMic" class="p-2.5 flex flex-col gap-1.5 border-b border-border">
                                     <div class="flex items-center gap-1.5">
                                         <i class="ri-mic-line text-emerald-400 text-sm"></i>
                                         <span class="text-xs text-zinc-200">マイク</span>
@@ -345,7 +345,7 @@
                                     </div>
                                 </div>
 
-                                <div class="p-2.5 flex flex-col gap-1.5 border-b border-border">
+                                <div id="mixChanLoopback" class="p-2.5 flex flex-col gap-1.5 border-b border-border">
                                     <div class="flex items-center gap-1.5">
                                         <i class="ri-volume-up-line text-emerald-400 text-sm"></i>
                                         <span class="text-xs text-zinc-200">PC出力</span>
@@ -369,7 +369,7 @@
                                     </p>
                                 </div>
 
-                                <div class="p-2.5 flex flex-col gap-1.5 border-b border-border">
+                                <div id="mixChanApp" class="p-2.5 flex flex-col gap-1.5 border-b border-border">
                                     <div class="flex items-center gap-1.5">
                                         <input type="checkbox" id="liveAudioAppEnabled" onchange="applyLiveAudioAppSettings()" class="accent-emerald-400" title="アプリ単位の音声（選んだウィンドウの音だけ）">
                                         <span class="text-xs text-zinc-200">アプリ音声</span>
@@ -393,15 +393,23 @@
                                     </p>
                                 </div>
 
-                                <!-- 動画の音は volume フィルタを通さず素通ししているので、今は下げられない。
-                                     空のフェーダーを置いて黙って効かないより、未実装と書いて出す。 -->
-                                <div class="p-2.5 flex flex-col gap-1.5 opacity-40">
+                                <!-- 素材（動画・ラジオ）の音量。動画の音声はコピー経路でも AAC へ焼き直して
+                                     いるので、volume フィルタを挟んでも追加のデコード/エンコードは増えない。
+                                     ★他のチャンネルと違い入力レベルメーターは無い。素材の音は取り込み機材を
+                                       通らないため、測る対象（デバイス）が存在しない。 -->
+                                <div id="mixChanMedia" class="p-2.5 flex flex-col gap-1.5">
                                     <div class="flex items-center gap-1.5">
-                                        <i class="ri-movie-line text-zinc-500 text-sm"></i>
-                                        <span class="text-xs text-zinc-400">動画の音</span>
-                                        <span class="ml-auto text-[10px] text-zinc-600">未実装</span>
+                                        <i class="ri-movie-line text-primary text-sm"></i>
+                                        <span class="text-xs text-zinc-200">動画の音</span>
+                                        <span id="mediaVolumeLabel" class="ml-auto text-[11px] text-zinc-400 font-mono">1.00</span>
+                                        <button id="mediaVolumeMuteBtn" onclick="obsToggleMute('media')" class="w-6 h-6 flex items-center justify-center rounded transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800" title="ミュート">
+                                            <i class="ri-volume-up-line text-sm"></i>
+                                        </button>
                                     </div>
-                                    <div class="h-1.5 bg-zinc-800 rounded"></div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="range" id="mediaVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyMediaVolume()" class="flex-1 accent-emerald-400">
+                                        <span class="w-14 text-right text-[10px] text-zinc-600">動画/ラジオ</span>
+                                    </div>
                                 </div>
 
                                 <p class="px-2.5 py-1.5 border-t border-border text-[10px] text-zinc-600">※複数選ぶとリアルタイム合成（amix）されます。変更すると配信は自動で再起動します。入力レベルは<b class="text-zinc-500">配信していなくても</b>振れます。</p>
@@ -2059,6 +2067,12 @@
             const apiBaseInput = document.getElementById('settingApiBase');
             if (apiBaseInput) apiBaseInput.value = apiBase;
 
+            // ★デッキの初期表示はここで一度作る。setAddMode はサーバーの再生モードが
+            //   currentAddMode と食い違ったときだけ呼ばれるので、既定値のまま
+            //   起動した回（＝大半）には一度も走らない。これに任せると、選択中の
+            //   シーンが光らず、効かないチャンネルも沈まないまま出る。
+            obsSyncScene(currentAddMode);
+
             // 画面共有カード（タスク23）: 触ったら「編集中」に入れる。
             // 個々の要素に onchange を書くのではなく委譲で拾う。項目を足したときに
             // 付け忘れると、その項目だけ巻き戻る——という気付きにくい壊れ方をするため。
@@ -2584,7 +2598,45 @@
             if (hint) {
                 const mixerLive = (mode === 'live' || mode === 'screen');
                 hint.classList.toggle('hidden', mixerLive);
-                if (!mixerLive) hint.innerText = '※このシーンではここの音は配信へ乗りません。ライブ音声／画面共有のときだけ有効です。';
+                if (!mixerLive) hint.innerText = '※このシーンで効くのは「動画の音」だけです。取り込み系はライブ音声／画面共有のときだけ配信へ乗ります。';
+            }
+
+            // ★効かないチャンネルは沈める。取り込み系（マイク/PC出力/アプリ音声）は
+            //   live・screen でしか配信へ乗らず、素材音量（動画の音）はその逆で
+            //   video・radio・slideshow でしか効かない。どちらも「動かしても何も
+            //   起きないフェーダー」になり得るので、見た目で切り分けられるようにする。
+            const captureLive = (mode === 'live' || mode === 'screen');
+            [['mixChanMic', captureLive], ['mixChanLoopback', captureLive],
+             ['mixChanApp', captureLive], ['mixChanMedia', !captureLive]].forEach(function (t) {
+                const el = document.getElementById(t[0]);
+                if (!el) return;
+                el.style.opacity = t[1] ? '' : '0.4';
+                el.title = t[1] ? '' : 'このシーンでは配信に影響しません';
+            });
+        }
+
+        // 素材音量。FFmpeg の引数なので、変えるとサーバー側で配信が張り直る。
+        // だから onchange（つまみを離した時）だけで送る。oninput で送ると
+        // スライダーを動かしている間じゅう配信が切れ続ける。
+        async function applyMediaVolume() {
+            const sl = document.getElementById('mediaVolume');
+            if (!sl) return;
+            liveAudioUserChangedAt = Date.now();
+            updateLiveAudioVolumeLabels();
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'set_media_volume', volume: Number(sl.value) })
+                });
+                if (res.ok) {
+                    showToast('動画の音量を変更しました', 'success');
+                    checkServerHealth(true);
+                } else {
+                    showToast('動画の音量の変更に失敗しました', 'danger');
+                }
+            } catch (e) {
+                showToast('動画の音量の変更に失敗しました', 'danger');
             }
         }
 
@@ -2627,7 +2679,8 @@
         const OBS_MUTE_MAP = {
             mic: { slider: 'liveAudioMicVolume', btn: 'liveAudioMicMuteBtn', isApp: false },
             loopback: { slider: 'liveAudioLoopbackVolume', btn: 'liveAudioLoopbackMuteBtn', isApp: false },
-            app: { slider: 'liveAudioAppVolume', btn: 'liveAudioAppMuteBtn', isApp: true }
+            app: { slider: 'liveAudioAppVolume', btn: 'liveAudioAppMuteBtn', isApp: true },
+            media: { slider: 'mediaVolume', btn: 'mediaVolumeMuteBtn', apply: 'media' }
         };
 
         function obsToggleMute(ch) {
@@ -2642,7 +2695,9 @@
                 sl.value = (obsMuteMemo[ch] > 0) ? obsMuteMemo[ch] : 1;
             }
             updateLiveAudioVolumeLabels();
-            if (cfg.isApp) { applyLiveAudioAppSettings(); } else { applyLiveAudioSettings(); }
+            if (cfg.apply === 'media') { applyMediaVolume(); }
+            else if (cfg.isApp) { applyLiveAudioAppSettings(); }
+            else { applyLiveAudioSettings(); }
         }
 
         function obsUpdateMuteIcons() {
@@ -3559,6 +3614,9 @@
             const app = document.getElementById('liveAudioAppVolume');
             const appLabel = document.getElementById('liveAudioAppVolumeLabel');
             if (app && appLabel) appLabel.innerText = Number(app.value).toFixed(2);
+            const media = document.getElementById('mediaVolume');
+            const mediaLabel = document.getElementById('mediaVolumeLabel');
+            if (media && mediaLabel) mediaLabel.innerText = Number(media.value).toFixed(2);
             obsUpdateMuteIcons();
         }
 
@@ -3703,6 +3761,8 @@
             if (loopSel && typeof data.live_audio_loopback_device === 'string' && liveAudioDevicesLoaded) {
                 if (loopSel.value !== data.live_audio_loopback_device) loopSel.value = data.live_audio_loopback_device;
             }
+            const mediaVol = document.getElementById('mediaVolume');
+            if (mediaVol && typeof data.media_volume === 'number') mediaVol.value = data.media_volume;
             if (micVol && typeof data.live_audio_mic_volume === 'number') micVol.value = data.live_audio_mic_volume;
             if (loopVol && typeof data.live_audio_loopback_volume === 'number') loopVol.value = data.live_audio_loopback_volume;
             const bgSel = document.getElementById('liveAudioBgSource');
