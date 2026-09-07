@@ -216,6 +216,93 @@
             <!-- TAB 1: PLAYER & QUEUE -->
             <div id="tab-player" class="tab-pane flex flex-col gap-4">
 
+                <!-- 1. Live Stream Inline HLS Preview Player Card (Collapsible) -->
+                <div id="previewCard" class="hidden bg-card border border-border rounded-lg p-3 sm:p-4 flex-col gap-2.5 transition">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                            <span class="font-semibold text-xs text-zinc-200">ライブストリーム プレビュー (HLS Video & Audio)</span>
+                        </div>
+                        <div class="flex items-center gap-1.5 text-xs">
+                            <button onclick="reloadPlayer()" class="p-1 px-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-zinc-300 text-[11px] transition flex items-center gap-1">
+                                <i class="ri-refresh-line"></i>
+                                <span>再読込</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Video Element Container -->
+                    <div class="relative w-full bg-black rounded-lg overflow-hidden aspect-video max-h-[380px] flex items-center justify-center border border-zinc-800 group">
+                        <video id="liveVideo" class="w-full h-full object-contain" playsinline controls muted></video>
+                        <div id="videoOverlayMsg" class="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2 text-zinc-400 text-xs p-4 text-center pointer-events-none transition-opacity duration-300">
+                            <i class="ri-film-line text-3xl text-zinc-600"></i>
+                            <span id="videoStatusText">ストリームを読み込み中...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. Now Playing & Control Banner -->
+                <div class="bg-card border border-border rounded-lg p-3 sm:p-4 flex flex-col lg:flex-row gap-4 items-start lg:items-center justify-between">
+                    <div class="flex items-center gap-3.5 min-w-0 w-full lg:w-auto">
+                        <div id="currentThumbWrapper" class="w-20 sm:w-24 h-12 sm:h-14 bg-zinc-900 rounded border border-border flex items-center justify-center overflow-hidden shrink-0 relative">
+                            <img id="currentThumb" src="" alt="Thumbnail" class="w-full h-full object-cover hidden">
+                            <i id="currentThumbPlaceholder" class="ri-film-line text-2xl text-zinc-600"></i>
+                            <span id="currentTypeBadge" class="hidden absolute bottom-1 right-1 text-[9px] font-bold px-1 rounded bg-black/80 text-primary uppercase">VIDEO</span>
+                        </div>
+                        <div class="flex flex-col gap-1 min-w-0 flex-1">
+                            <div class="flex items-center gap-2">
+                                <span id="streamStateBadge" class="text-[10px] font-bold px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 uppercase">STANDBY</span>
+                                <span id="currentDuration" class="text-xs text-muted-foreground font-mono">00:00 / 00:00</span>
+                            </div>
+                            <h3 id="currentTitle" class="text-sm font-semibold text-zinc-100 truncate max-w-lg" title="待機中">
+                                待機中（キューが空です）
+                            </h3>
+                            <p id="currentUrl" class="text-[11px] text-zinc-500 truncate max-w-md cursor-pointer hover:text-primary transition" onclick="copyCurrentUrl()">
+                                URLなし
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- Global Stream Controls -->
+                    <div class="flex items-center gap-2 flex-wrap sm:flex-nowrap w-full lg:w-auto justify-end shrink-0">
+                        <button id="btnLoopQueue" onclick="toggleLoopQueue()" class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 hover:border-zinc-500 rounded text-xs transition" title="キュー保持ループ再生">
+                            <i class="ri-repeat-line text-sm"></i>
+                            <span>ループ</span>
+                        </button>
+                        <button id="btnShufflePlay" onclick="toggleShufflePlay()" class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 hover:border-zinc-500 rounded text-xs transition" title="シャッフル再生">
+                            <i class="ri-shuffle-line text-sm"></i>
+                            <span>シャッフル</span>
+                        </button>
+                        <button id="btnSkip" onclick="skipCurrent()" class="flex items-center gap-1.5 px-3.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 rounded text-xs font-medium transition" title="次のアイテムへスキップ">
+                            <i class="ri-skip-forward-fill text-sm text-primary"></i>
+                            <span>スキップ</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 3. VRChat Playback Link Quick-Bar -->
+                <div class="bg-card-muted border border-border rounded-lg px-3 py-2 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
+                    <div class="flex items-center gap-2 min-w-0 flex-1">
+                        <i class="ri-link text-primary text-base shrink-0"></i>
+                        <span class="text-xs text-zinc-400 shrink-0">VRChat プレイヤーURL:</span>
+                        <input id="quickStreamUrl" readonly class="bg-zinc-900 border border-zinc-700/80 rounded px-2 py-0.5 text-xs text-zinc-200 font-mono w-full truncate focus:outline-none focus:border-primary" value="取得中...">
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0 self-end sm:self-auto">
+                        <button id="btnHostRevealUrl" onclick="hostToggleRevealUrl()" class="hidden flex items-center gap-1 px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 rounded text-xs transition" title="ストリームキーを含む本物のURLを表示します（画面共有中は注意）">
+                            <i class="ri-eye-line"></i>
+                            <span id="btnHostRevealUrlLabel">表示</span>
+                        </button>
+                        <button onclick="copyStreamUrl()" class="flex items-center gap-1 px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 rounded text-xs transition">
+                            <i class="ri-file-copy-line"></i>
+                            <span>コピー</span>
+                        </button>
+                        <button id="btnGoShareQr" onclick="switchTab('info')" class="flex items-center gap-1 px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-emerald-400 border border-zinc-700 rounded text-xs transition" title="スマホ共有用QRコードを表示">
+                            <i class="ri-qr-code-line"></i>
+                            <span>QR共有</span>
+                        </button>
+                    </div>
+                </div>
+
                 <!-- OBS風3ペイン（シーン / ソース / 音声ミキサー）。
                      ★中の #liveAudioCard は設定タブから丸ごと移してきたもの。id を一つも変えていないので
                        既存の loadAudioDevices / syncLiveAudioFromStatus / applyRemoteTabVisibility はそのまま効く。
@@ -289,7 +376,7 @@
                                 <div id="srcPaneScreen" style="display:none" class="flex items-center gap-2 text-xs text-zinc-300">
                                     <i class="ri-checkbox-circle-fill text-primary text-sm"></i>
                                     <span>ホストPCの画面（モニター / ウィンドウ）</span>
-                                    <button onclick="switchTab('settings')" class="ml-auto px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[10px] text-zinc-300 transition">キャプチャ対象を選ぶ</button>
+                                    <button id="obsScreenPickBtn" onclick="switchTab('settings')" class="ml-auto px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[10px] text-zinc-300 transition">キャプチャ対象を選ぶ</button>
                                 </div>
                             </div>
 
@@ -416,93 +503,6 @@
                             </div>
                         </div>
 
-                    </div>
-                </div>
-
-                <!-- 1. Live Stream Inline HLS Preview Player Card (Collapsible) -->
-                <div id="previewCard" class="hidden bg-card border border-border rounded-lg p-3 sm:p-4 flex-col gap-2.5 transition">
-                    <div class="flex items-center justify-between">
-                        <div class="flex items-center gap-2">
-                            <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
-                            <span class="font-semibold text-xs text-zinc-200">ライブストリーム プレビュー (HLS Video & Audio)</span>
-                        </div>
-                        <div class="flex items-center gap-1.5 text-xs">
-                            <button onclick="reloadPlayer()" class="p-1 px-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-zinc-300 text-[11px] transition flex items-center gap-1">
-                                <i class="ri-refresh-line"></i>
-                                <span>再読込</span>
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- Video Element Container -->
-                    <div class="relative w-full bg-black rounded-lg overflow-hidden aspect-video max-h-[380px] flex items-center justify-center border border-zinc-800 group">
-                        <video id="liveVideo" class="w-full h-full object-contain" playsinline controls muted></video>
-                        <div id="videoOverlayMsg" class="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2 text-zinc-400 text-xs p-4 text-center pointer-events-none transition-opacity duration-300">
-                            <i class="ri-film-line text-3xl text-zinc-600"></i>
-                            <span id="videoStatusText">ストリームを読み込み中...</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 2. Now Playing & Control Banner -->
-                <div class="bg-card border border-border rounded-lg p-3 sm:p-4 flex flex-col lg:flex-row gap-4 items-start lg:items-center justify-between">
-                    <div class="flex items-center gap-3.5 min-w-0 w-full lg:w-auto">
-                        <div id="currentThumbWrapper" class="w-20 sm:w-24 h-12 sm:h-14 bg-zinc-900 rounded border border-border flex items-center justify-center overflow-hidden shrink-0 relative">
-                            <img id="currentThumb" src="" alt="Thumbnail" class="w-full h-full object-cover hidden">
-                            <i id="currentThumbPlaceholder" class="ri-film-line text-2xl text-zinc-600"></i>
-                            <span id="currentTypeBadge" class="hidden absolute bottom-1 right-1 text-[9px] font-bold px-1 rounded bg-black/80 text-primary uppercase">VIDEO</span>
-                        </div>
-                        <div class="flex flex-col gap-1 min-w-0 flex-1">
-                            <div class="flex items-center gap-2">
-                                <span id="streamStateBadge" class="text-[10px] font-bold px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 uppercase">STANDBY</span>
-                                <span id="currentDuration" class="text-xs text-muted-foreground font-mono">00:00 / 00:00</span>
-                            </div>
-                            <h3 id="currentTitle" class="text-sm font-semibold text-zinc-100 truncate max-w-lg" title="待機中">
-                                待機中（キューが空です）
-                            </h3>
-                            <p id="currentUrl" class="text-[11px] text-zinc-500 truncate max-w-md cursor-pointer hover:text-primary transition" onclick="copyCurrentUrl()">
-                                URLなし
-                            </p>
-                        </div>
-                    </div>
-
-                    <!-- Global Stream Controls -->
-                    <div class="flex items-center gap-2 flex-wrap sm:flex-nowrap w-full lg:w-auto justify-end shrink-0">
-                        <button id="btnLoopQueue" onclick="toggleLoopQueue()" class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 hover:border-zinc-500 rounded text-xs transition" title="キュー保持ループ再生">
-                            <i class="ri-repeat-line text-sm"></i>
-                            <span>ループ</span>
-                        </button>
-                        <button id="btnShufflePlay" onclick="toggleShufflePlay()" class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 hover:border-zinc-500 rounded text-xs transition" title="シャッフル再生">
-                            <i class="ri-shuffle-line text-sm"></i>
-                            <span>シャッフル</span>
-                        </button>
-                        <button id="btnSkip" onclick="skipCurrent()" class="flex items-center gap-1.5 px-3.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 rounded text-xs font-medium transition" title="次のアイテムへスキップ">
-                            <i class="ri-skip-forward-fill text-sm text-primary"></i>
-                            <span>スキップ</span>
-                        </button>
-                    </div>
-                </div>
-
-                <!-- 3. VRChat Playback Link Quick-Bar -->
-                <div class="bg-card-muted border border-border rounded-lg px-3 py-2 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
-                    <div class="flex items-center gap-2 min-w-0 flex-1">
-                        <i class="ri-link text-primary text-base shrink-0"></i>
-                        <span class="text-xs text-zinc-400 shrink-0">VRChat プレイヤーURL:</span>
-                        <input id="quickStreamUrl" readonly class="bg-zinc-900 border border-zinc-700/80 rounded px-2 py-0.5 text-xs text-zinc-200 font-mono w-full truncate focus:outline-none focus:border-primary" value="取得中...">
-                    </div>
-                    <div class="flex items-center gap-2 shrink-0 self-end sm:self-auto">
-                        <button id="btnHostRevealUrl" onclick="hostToggleRevealUrl()" class="hidden flex items-center gap-1 px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 rounded text-xs transition" title="ストリームキーを含む本物のURLを表示します（画面共有中は注意）">
-                            <i class="ri-eye-line"></i>
-                            <span id="btnHostRevealUrlLabel">表示</span>
-                        </button>
-                        <button onclick="copyStreamUrl()" class="flex items-center gap-1 px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 rounded text-xs transition">
-                            <i class="ri-file-copy-line"></i>
-                            <span>コピー</span>
-                        </button>
-                        <button id="btnGoShareQr" onclick="switchTab('info')" class="flex items-center gap-1 px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 text-emerald-400 border border-zinc-700 rounded text-xs transition" title="スマホ共有用QRコードを表示">
-                            <i class="ri-qr-code-line"></i>
-                            <span>QR共有</span>
-                        </button>
                     </div>
                 </div>
 
@@ -2647,6 +2647,11 @@
                 const b = document.getElementById(id);
                 if (b) b.style.display = isHost ? '' : 'none';
             });
+            // 「キャプチャ対象を選ぶ」は設定タブへ飛ばすだけのボタン。設定タブは
+            // ゲストには出さない（＝押しても何も起きない）ので、ホストが画面共有
+            // シーンに切り替えている間もゲスト側では完全に消す。
+            const pick = document.getElementById('obsScreenPickBtn');
+            if (pick) pick.style.display = isHost ? '' : 'none';
         }
 
         // オーバーレイの目玉。実体は設定タブのチェックボックスなので、ここでは
