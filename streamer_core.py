@@ -721,6 +721,176 @@ def build_audio_inputs_with_remote_mic(app_enabled=False, app_volume=1.0,
     return (input_args, ";".join(filters) + ";" + mix, "[aout]")
 
 
+# --------------------------------------------------------------------------
+# タスク27-A: ホストPCのマイク入力レベル（カラオケ卓のVUメーター用）
+#
+# ★なぜ専用のプロセスを立てるのか
+#   ホストのマイクは dshow のまま送出FFmpegへ直結しており、Python はサンプルを
+#   一切見ていない（見る必要が無いから、そう作った）。しかしカラオケ卓には
+#   「自分のマイクが生きているか」を示す手立てが要る。送出FFmpegの
+#   フィルタグラフに測定を挿すと、**配信の音そのものを通る道に手を入れる**ことに
+#   なり、壊したときの被害が大きい。測るだけの別プロセスに分ける。
+#
+# ★同じデバイスを二重に開いてよいのか
+#   実測（2026-09-07）: 同一の dshow マイクを 2 プロセスから同時に開き、
+#   どちらも rc=0 でストリームを取得できた。配信中でも測定できる。
+#
+# ★マイクを開きっぱなしにしない
+#   Windows は「マイク使用中」を通知領域に出す。カラオケ卓を見ていない間まで
+#   開き続けるのは筋が悪いので、**要求が来ている間だけ**動かし、
+#   途絶えたら自分で止まる。
+# --------------------------------------------------------------------------
+HOST_MIC_LEVEL_STALE_SEC = 2.0     # これより古いレベルは「来ていない」扱い
+HOST_MIC_IDLE_STOP_SEC = 6.0       # 要求が途絶えてから止まるまで
+HOST_MIC_DB_FLOOR = -100.0         # これ以下は無音とみなす
+
+
+def build_host_mic_level_cmd(device, ffmpeg=None):
+    """マイクのレベルだけを吐く ffmpeg コマンド。出力は null（音は保存しない）。
+
+    astats が 1 フレームごとに dB を出し、ametadata がその値だけを 1 行で印字する。
+    実測で 21 行/秒。key を絞らないと 1 フレームにつき数十行出て読めたものではない。
+    """
+    return [
+        (ffmpeg or get_ffmpeg_cmd()), "-hide_banner", "-v", "info",
+        "-f", "dshow", "-audio_buffer_size", "50",
+        "-i", f"audio={device}",
+        "-af", ("astats=metadata=1:reset=1,"
+                "ametadata=print:key=lavfi.astats.Overall.RMS_level,"
+                "ametadata=print:key=lavfi.astats.Overall.Peak_level"),
+        "-f", "null", "-"
+    ]
+
+
+def _db_to_linear(text):
+    """astats の dB 文字列を 0.0〜1.0 の線形値へ。'-inf' や壊れた値は 0。"""
+    try:
+        db = float(text)
+    except (TypeError, ValueError):
+        return 0.0
+    if db <= HOST_MIC_DB_FLOOR or db != db:      # db != db は NaN 判定
+        return 0.0
+    if db > 0:
+        db = 0.0
+    return 10.0 ** (db / 20.0)
+
+
+class HostMicMonitor:
+    """ホストPCのマイク入力レベルを測るだけの補助プロセスを面倒みる。
+
+    使い方は `request(device)` を呼び続けるだけ。呼ばれなくなれば自分で止まる。
+    """
+
+    _LEVEL_RE = re.compile(r"lavfi\.astats\.Overall\.(RMS|Peak)_level=(\S+)")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc = None
+        self._device = ""
+        self._deadline = 0.0
+        self._level = {"peak": 0.0, "rms": 0.0, "ts": 0.0}
+        self._watchdog = None
+
+    # ------------------------------------------------------------------
+    def request(self, device):
+        """卓が開いている間、繰り返し呼ぶ。必要なら起動し、期限を延ばす。"""
+        device = str(device or "").strip()
+        with self._lock:
+            self._deadline = time.time() + HOST_MIC_IDLE_STOP_SEC
+            if not device:
+                self._stop_locked()
+                return
+            if self._proc and self._proc.poll() is None and self._device == device:
+                return
+            # デバイスが変わった / 落ちていた -> 立て直す
+            self._stop_locked()
+            self._start_locked(device)
+
+    def level(self):
+        """UI用。古ければ 0 を返し、fresh=False で「来ていない」と伝える。"""
+        with self._lock:
+            lv = dict(self._level)
+            device = self._device
+            running = bool(self._proc and self._proc.poll() is None)
+        age = time.time() - lv["ts"] if lv["ts"] else None
+        fresh = age is not None and age < HOST_MIC_LEVEL_STALE_SEC
+        return {
+            "peak": lv["peak"] if fresh else 0.0,
+            "rms": lv["rms"] if fresh else 0.0,
+            "fresh": fresh,
+            "monitoring": running,
+            "device": device,
+        }
+
+    def stop(self):
+        with self._lock:
+            self._deadline = 0.0
+            self._stop_locked()
+
+    # ------------------------------------------------------------------
+    def _start_locked(self, device):
+        try:
+            self._proc = subprocess.Popen(
+                build_host_mic_level_cmd(device),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, bufsize=0,
+                creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            log_print(f"[HostMic] レベル監視を起動できません: {e}")
+            self._proc = None
+            return
+        self._device = device
+        self._level = {"peak": 0.0, "rms": 0.0, "ts": 0.0}
+        threading.Thread(target=self._pump, args=(self._proc,),
+                         name="hostmic-level", daemon=True).start()
+        if not (self._watchdog and self._watchdog.is_alive()):
+            self._watchdog = threading.Thread(target=self._idle_watch,
+                                              name="hostmic-idle", daemon=True)
+            self._watchdog.start()
+        log_print(f"[HostMic] レベル監視を開始: {device!r}")
+
+    def _stop_locked(self):
+        proc, self._proc = self._proc, None
+        self._device = ""
+        if proc:
+            kill_proc(proc)
+            log_print("[HostMic] レベル監視を停止")
+
+    def _pump(self, proc):
+        """★stderr は最後まで読み続けること。読まないとバッファが詰まって止まる。"""
+        peak = rms = 0.0
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                m = self._LEVEL_RE.search(raw.decode("utf-8", "replace"))
+                if not m:
+                    continue
+                if m.group(1) == "RMS":
+                    rms = _db_to_linear(m.group(2))
+                else:
+                    peak = _db_to_linear(m.group(2))
+                    with self._lock:
+                        if self._proc is proc:
+                            self._level = {"peak": peak, "rms": rms, "ts": time.time()}
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    def _idle_watch(self):
+        while True:
+            time.sleep(1.0)
+            with self._lock:
+                if not self._proc:
+                    return
+                if time.time() > self._deadline:
+                    log_print("[HostMic] 卓が閉じられたのでレベル監視を止めます")
+                    self._stop_locked()
+                    return
+
+
 def start_app_audio_helper(pid, mode="include", rate=APP_AUDIO_RATE,
                            channels=APP_AUDIO_CHANNELS, stats_sec=0,
                            level_ms=APP_AUDIO_LEVEL_INTERVAL_MS):
@@ -2306,10 +2476,55 @@ class StreamerCore:
         )
         if self.karaoke.enabled:
             self.karaoke.ensure_mixer()
+        # タスク27-A: カラオケ卓に出すホストマイクのVU。卓を見ている間だけ動く。
+        self.host_mic_monitor = HostMicMonitor()
 
     # ----------------------------------------------------------------------
     # タスク27: 参加型カラオケ
     # ----------------------------------------------------------------------
+    def get_host_mic_state(self, request_level=False):
+        """カラオケ卓に出すホストマイクの状態をまとめる。
+
+        request_level=True のときだけレベル監視プロセスを動かす（＝卓を開いている間だけ
+        マイクを掴む）。設定値そのものは既存のライブ音声設定と**同じ場所**を読む。
+        二重管理にすると、片方で変えたのに片方に出ない、という食い違いが必ず起きる。
+        """
+        device = str(self.config.get("live_audio_mic_device", "")).strip()
+        if request_level:
+            self.host_mic_monitor.request(device)
+        level = self.host_mic_monitor.level()
+        mode = self.get_playback_mode()
+        return {
+            "device": device,
+            "volume": float(self.config.get("live_audio_mic_volume", 1.0)),
+            "loopback_device": str(self.config.get("live_audio_loopback_device", "")).strip(),
+            "loopback_volume": float(self.config.get("live_audio_loopback_volume", 0.7)),
+            "level": level,
+            # 「なぜ声が乗らないのか」を卓の上で説明できるようにする。
+            # 実際、モードが live でなくマイクも未選択なのに気付けなかった事例が出た。
+            "playback_mode": mode,
+            "is_live_audio_mode": (mode == "live"),
+            "streaming": (mode == "live" and self.status == "streaming"),
+            "on_air": bool(device) and mode == "live" and self.status == "streaming",
+        }
+
+    def set_host_mic(self, device=None, volume=None,
+                     loopback_device=None, loopback_volume=None):
+        """カラオケ卓からホストマイクを設定する。
+
+        ★実体は既存の set_live_audio_devices。別の設定項目を新設しない。
+          「カラオケ卓のマイク」と「ライブ音声のマイク」が別物になると、
+          利用者はどちらが配信に乗るのか判断できなくなる。
+        """
+        result = self.set_live_audio_devices(
+            mic_device=device, loopback_device=loopback_device,
+            mic_volume=volume, loopback_volume=loopback_volume)
+        if device is not None:
+            # 選び直した直後は、古いデバイスのレベルを出したままにしない。
+            self.host_mic_monitor.request(str(device).strip())
+        return result
+
+
     def set_karaoke_settings(self, enabled=None, approval_required=None,
                              latency_mode=None, master_volume=None,
                              reverb=None, offset_ms=None):
@@ -6483,6 +6698,10 @@ class StreamerCore:
             self.karaoke.stop()
         except Exception as e:
             log_print(f"[Karaoke] shutdown error: {e}")
+        try:
+            self.host_mic_monitor.stop()
+        except Exception as e:
+            log_print(f"[HostMic] shutdown error: {e}")
         with self.process_lock:
             if self.current_stdin:
                 try:

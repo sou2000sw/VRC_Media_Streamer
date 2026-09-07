@@ -753,3 +753,181 @@ def test_mixer_survives_sink_replacement(session):
     session.open_sink()
     assert session.running, "出口の付け替えでミキサが止まっている"
     assert session.get("id1") is not None, "参加者まで消えている"
+
+
+# ---------------------------------------------------------------------------
+# 12. ホストPCのマイク（タスク27-A）
+#
+# ★きっかけ: カラオケ受付をONにしただけで「PCマイクも乗る」と読めてしまい、
+#   実際にはライブ音声モードでもマイク未選択でもないまま「声が入らない」と
+#   詰まる事故が起きた。卓の上で設定でき、生きているか見え、乗らない理由が
+#   分かることを固定する。
+# ---------------------------------------------------------------------------
+import streamer_core
+
+
+def test_host_mic_level_cmd_measures_without_saving_audio():
+    """レベル測定は null 出力であること。録音してはいけない。"""
+    cmd = streamer_core.build_host_mic_level_cmd("Mic A", ffmpeg="ffmpeg")
+    assert cmd[-2:] == ["-f", "null"] or cmd[-3:-1] == ["-f", "null"], cmd[-4:]
+    assert "audio=Mic A" in cmd
+    # key を絞らないと1フレームにつき数十行出て読めない（実測: 2秒で2995行）
+    assert any("key=lavfi.astats.Overall.RMS_level" in a for a in cmd)
+    assert not any(a.endswith((".wav", ".mp3", ".ts")) for a in cmd), "音を保存してはいけない"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("0", 1.0),
+    ("-6.02", 0.5),
+    ("-20", 0.1),
+    ("-inf", 0.0),
+    ("-999", 0.0),
+    ("こわれた値", 0.0),
+    ("", 0.0),
+])
+def test_db_to_linear(text, expected):
+    assert streamer_core._db_to_linear(text) == pytest.approx(expected, abs=0.005)
+
+
+def test_db_to_linear_clamps_above_full_scale():
+    """0dBFS を超える値が来ても 1.0 で頭打ちにする（メーターが振り切れて壊れない）。"""
+    assert streamer_core._db_to_linear("6.0") == pytest.approx(1.0)
+
+
+def test_host_mic_monitor_reports_nothing_before_it_runs():
+    mon = streamer_core.HostMicMonitor()
+    lv = mon.level()
+    assert lv["fresh"] is False and lv["monitoring"] is False
+    assert lv["peak"] == 0.0 and lv["rms"] == 0.0
+
+
+def test_host_mic_monitor_ignores_empty_device():
+    """デバイス未選択で ffmpeg を起こさないこと（無駄にマイクを掴まない）。"""
+    mon = streamer_core.HostMicMonitor()
+    mon.request("")
+    mon.request("   ")
+    assert mon.level()["monitoring"] is False
+
+
+def test_host_mic_level_goes_stale():
+    """レベルが古くなったら 0 を返し fresh=False にすること。
+
+    これが無いと、マイクが死んだ後も最後の値が出続けて「生きている」と誤認する。
+    """
+    mon = streamer_core.HostMicMonitor()
+    mon._level = {"peak": 0.5, "rms": 0.4,
+                  "ts": time.time() - streamer_core.HOST_MIC_LEVEL_STALE_SEC - 1}
+    lv = mon.level()
+    assert lv["fresh"] is False and lv["rms"] == 0.0
+
+    mon._level = {"peak": 0.5, "rms": 0.4, "ts": time.time()}
+    lv = mon.level()
+    assert lv["fresh"] is True and lv["rms"] == pytest.approx(0.4)
+
+
+def test_host_mic_pump_parses_astats_lines():
+    """astats の行から peak/rms を拾えること（実際に出る書式で確かめる）。"""
+    class _FakeProc:
+        def __init__(self, lines):
+            import io as _io
+            self.stderr = _io.BytesIO(lines)
+
+        def poll(self):
+            return None
+
+    lines = (b"[Parsed_ametadata_1 @ 0x1] lavfi.astats.Overall.RMS_level=-20.000000\n"
+             b"[Parsed_ametadata_2 @ 0x1] lavfi.astats.Overall.Peak_level=-6.020600\n")
+    mon = streamer_core.HostMicMonitor()
+    proc = _FakeProc(lines)
+    mon._proc = proc
+    mon._pump(proc)
+    assert mon._level["rms"] == pytest.approx(0.1, abs=0.005)
+    assert mon._level["peak"] == pytest.approx(0.5, abs=0.005)
+    assert mon._level["ts"] > 0
+
+
+def test_host_mic_pump_survives_inf_and_garbage():
+    """'-inf' や欠けた行でメーターが壊れないこと。"""
+    class _FakeProc:
+        def __init__(self, lines):
+            import io as _io
+            self.stderr = _io.BytesIO(lines)
+
+        def poll(self):
+            return None
+
+    lines = (b"garbage line\n"
+             b"[x] lavfi.astats.Overall.RMS_level=-inf\n"
+             b"[x] lavfi.astats.Overall.Peak_level=-inf\n")
+    mon = streamer_core.HostMicMonitor()
+    proc = _FakeProc(lines)
+    mon._proc = proc
+    mon._pump(proc)
+    assert mon._level["rms"] == 0.0 and mon._level["peak"] == 0.0
+
+
+def test_host_mic_state_explains_why_voice_is_not_on_air():
+    """乗らない理由を state から判断できること（卓に出す文言の材料）。"""
+    class _Core:
+        config = {"live_audio_mic_device": "", "live_audio_mic_volume": 1.0,
+                  "live_audio_loopback_device": "", "live_audio_loopback_volume": 0.7}
+        status = "offline"
+        host_mic_monitor = streamer_core.HostMicMonitor()
+
+        def get_playback_mode(self):
+            return self._mode
+
+    c = _Core()
+    get_state = streamer_core.StreamerCore.get_host_mic_state
+
+    # 1) マイク未選択
+    c._mode = "live"
+    assert get_state(c)["on_air"] is False
+
+    # 2) マイクはあるがライブ音声モードでない（今回の事故そのもの）
+    c.config["live_audio_mic_device"] = "Mic A"
+    c._mode = "video"
+    st = get_state(c)
+    assert st["is_live_audio_mode"] is False and st["on_air"] is False
+
+    # 3) ライブ音声モードだが配信していない
+    c._mode = "live"
+    st = get_state(c)
+    assert st["is_live_audio_mode"] is True and st["streaming"] is False and st["on_air"] is False
+
+    # 4) 全部そろって初めて on_air
+    c.status = "streaming"
+    assert get_state(c)["on_air"] is True
+
+
+def test_host_mic_uses_the_same_config_as_live_audio():
+    """卓のマイク設定が、ライブ音声設定と**同じ場所**を読むこと。
+
+    別項目にすると「どちらが配信に乗るのか」を利用者が判断できなくなる。
+    """
+    import inspect
+    src = inspect.getsource(streamer_core.StreamerCore.get_host_mic_state)
+    assert "live_audio_mic_device" in src and "live_audio_mic_volume" in src
+    setter = inspect.getsource(streamer_core.StreamerCore.set_host_mic)
+    assert "set_live_audio_devices" in setter, "設定の実体を分けてはいけない"
+
+
+def test_host_mic_action_is_localhost_only():
+    """卓のマイク設定はホスト限定。ゲストに触らせない。"""
+    with io.open(os.path.join(BASE_DIR, "api_server.py"), encoding="utf-8") as f:
+        src = f.read()
+    i = src.index('elif path == "/api/karaoke":', src.index("def do_POST"))
+    block = src[i:i + 4000]
+    assert "is_local_request()" in block
+    assert 'action == "host_mic"' in block
+
+
+def test_ui_has_host_mic_controls_and_reason():
+    """卓にマイクの欄・VU・理由の表示があること。"""
+    html = _ui_html()
+    for needle in ('id="kaHostMicDevice"', 'id="kaHostMicVol"', 'id="kaHostMicVu"',
+                   'id="kaHostMicHint"', 'id="kaHostMicState"',
+                   'karaokeRenderHostMic(data.host_mic)'):
+        assert needle in html, needle
+    # 今回詰まった原因そのものを、画面で名指しできていること
+    assert "ライブ音声" in html and "モードではありません" in html

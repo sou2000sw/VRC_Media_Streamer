@@ -902,10 +902,13 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     "approval_required": bool(self.streamer_core.karaoke.approval_required),
                 })
                 return
+            # ★この GET が来ている間だけホストマイクのレベル監視が動く。
+            #   卓を閉じればマイクは自然に解放される（開きっぱなしにしない）。
             self.send_json_response(200, {
                 "success": True,
                 "host_view": True,
                 "karaoke": self.streamer_core.karaoke.status_snapshot(),
+                "host_mic": self.streamer_core.get_host_mic_state(request_level=True),
             })
             return
 
@@ -1522,6 +1525,24 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                                     host_muted=body_json.get("host_muted"))
                 self.send_json_response(200, {"success": True,
                                               "karaoke": session.status_snapshot()})
+                return
+
+            if action == "host_mic":
+                # ★実体は既存のライブ音声設定。カラオケ卓から触れるようにしただけで、
+                #   保存先は同じ（別項目にすると、どちらが配信に乗るのか分からなくなる）。
+                #   デバイスを変えると set_live_audio_devices が配信の張り直しを要求する。
+                #   dshow は起動時にデバイスを掴むので、これは避けられない。
+                self.streamer_core.set_host_mic(
+                    device=body_json.get("device"),
+                    volume=body_json.get("volume"),
+                    loopback_device=body_json.get("loopback_device"),
+                    loopback_volume=body_json.get("loopback_volume"),
+                )
+                self.send_json_response(200, {
+                    "success": True,
+                    "host_mic": self.streamer_core.get_host_mic_state(request_level=True),
+                    "karaoke": session.status_snapshot(),
+                })
                 return
 
             if action in ("record_start", "record_stop"):

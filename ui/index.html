@@ -1306,6 +1306,50 @@
                         </label>
                     </div>
 
+
+                    <!-- ホストのマイク（タスク27-A）
+                         ★設定の実体は「ライブ音声取り込み」と同じ。ここは窓口を増やしただけ。
+                           別項目にすると、どちらが配信に乗るのか利用者が判断できなくなる。 -->
+                    <div class="border-t border-border pt-3 flex flex-col gap-3">
+                        <div class="flex items-center justify-between gap-2 flex-wrap">
+                            <span class="text-xs font-semibold text-zinc-200 flex items-center gap-2">
+                                <i class="ri-mic-line text-primary"></i> ホストのマイク（このPC）
+                            </span>
+                            <span id="kaHostMicState" class="text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500">未選択</span>
+                        </div>
+
+                        <!-- 「なぜ声が乗らないのか」をここで説明する。
+                             実際、ライブ音声モードでないこととマイク未選択に気付けなかった。 -->
+                        <div id="kaHostMicHint" class="hidden text-[11px] leading-relaxed rounded p-2.5 border"></div>
+
+                        <label class="flex flex-col gap-1">
+                            <span class="text-[11px] text-zinc-400">マイクデバイス</span>
+                            <select id="kaHostMicDevice" onchange="karaokeSaveHostMic('device')"
+                                    class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-100 outline-none focus:border-primary">
+                                <option value="">（使わない）</option>
+                            </select>
+                        </label>
+
+                        <div class="flex flex-col gap-1.5">
+                            <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                <span>マイク音量</span><span id="kaHostMicVolVal" class="font-mono text-zinc-300">1.00</span>
+                            </div>
+                            <input id="kaHostMicVol" type="range" min="0" max="2" step="0.05" value="1"
+                                   oninput="karaokeOnHostMicVolInput(this.value)" onchange="karaokeSaveHostMic('volume')"
+                                   class="w-full accent-emerald-500">
+                            <div class="flex items-center gap-2">
+                                <div class="h-2.5 flex-1 bg-zinc-950 border border-zinc-700 rounded overflow-hidden">
+                                    <div id="kaHostMicVu" class="h-full w-0" style="background-color:#52525b"></div>
+                                </div>
+                                <span id="kaHostMicVuText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">停止中</span>
+                            </div>
+                            <p class="text-[10px] text-zinc-500 leading-relaxed">
+                                このメーターは<b>実際のマイク入力</b>を測っています。配信していなくても動くので、
+                                本番前にここで声が振れるか確かめてください。
+                            </p>
+                        </div>
+                    </div>
+
                     <!-- 参加者スロット -->
                     <div class="border-t border-border pt-3 flex flex-col gap-2">
                         <div class="flex items-center justify-between">
@@ -5370,6 +5414,7 @@ registerProcessor('mic-sender', MicSender);
                     ka.hostView = true;
                     karaokeApplyGuestView({ enabled: data.karaoke.enabled });
                     karaokeRenderHost(data.karaoke);
+                    karaokeRenderHostMic(data.host_mic);
                 } else {
                     karaokeApplyGuestView(data);
                 }
@@ -5391,6 +5436,150 @@ registerProcessor('mic-sender', MicSender);
         window.addEventListener('beforeunload', () => {
             if (ka.state !== 'idle') karaokeDisconnect(null);
         });
+
+
+        // ===================================================================
+        // タスク27-A: カラオケ卓のホストマイク欄
+        //
+        // ★設定の実体は「ライブ音声取り込み」と同じ config を読み書きする。
+        //   カラオケ卓とライブ音声設定のどちらで変えても、もう片方に出る。
+        // ===================================================================
+        let karaokeHostMicDevicesLoaded = false;
+        let karaokeHostMicTouchedAt = 0;   // 操作直後はポーリングで値を戻さない
+
+        async function karaokeLoadHostMicDevices() {
+            if (karaokeHostMicDevicesLoaded) return;
+            karaokeHostMicDevicesLoaded = true;
+            try {
+                const res = await fetch(`${apiBase}/api/audio_devices`);
+                const data = await res.json();
+                const sel = document.getElementById('kaHostMicDevice');
+                if (!sel || !data || !Array.isArray(data.devices)) return;
+                const current = sel.value;
+                sel.innerHTML = '<option value="">（使わない）</option>' +
+                    data.devices.map(d => {
+                        const name = (typeof d === 'string') ? d : (d.name || '');
+                        return `<option value="${karaokeEscape(name)}">${karaokeEscape(name)}</option>`;
+                    }).join('');
+                if (current) sel.value = current;
+            } catch (e) {
+                karaokeHostMicDevicesLoaded = false;   // 次に開いたとき再挑戦する
+            }
+        }
+
+        function karaokeOnHostMicVolInput(v) {
+            karaokeHostMicTouchedAt = Date.now();
+            document.getElementById('kaHostMicVolVal').innerText = parseFloat(v).toFixed(2);
+        }
+
+        async function karaokeSaveHostMic(what) {
+            karaokeHostMicTouchedAt = Date.now();
+            const body = { action: 'host_mic' };
+            if (what === 'device') {
+                body.device = document.getElementById('kaHostMicDevice').value;
+            } else {
+                body.volume = parseFloat(document.getElementById('kaHostMicVol').value);
+            }
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json();
+                if (!data.success) { showToast(data.message || 'マイクを設定できません', 'danger'); return; }
+                if (what === 'device') {
+                    showToast(body.device ? `マイクを「${body.device}」にしました`
+                                          : 'ホストのマイクを使わない設定にしました', 'success');
+                }
+                karaokeRenderHostMic(data.host_mic);
+            } catch (e) {
+                showToast(`マイクを設定できません: ${e.message || e}`, 'danger');
+            }
+        }
+
+        // 入力レベルのゲージ。
+        // ★リニアで描くとバーがほとんど動かない。-60〜0dBFS を 0〜100% に写す
+        //   （アプリ音声のメーターと同じ考え方）。
+        function karaokeRenderHostMicMeter(level) {
+            const bar = document.getElementById('kaHostMicVu');
+            const txt = document.getElementById('kaHostMicVuText');
+            if (!bar || !txt) return;
+            if (!level || !level.fresh) {
+                bar.style.width = '0%';
+                bar.style.backgroundColor = '#52525b';
+                txt.textContent = level && level.monitoring ? '無入力' : '停止中';
+                txt.className = 'w-16 text-right text-[11px] text-zinc-500 font-mono';
+                return;
+            }
+            const rms = Number(level.rms) || 0;
+            const db = rms > 0 ? 20 * Math.log10(rms) : -100;
+            const pct = Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+            const silent = db < -55;
+            bar.style.width = pct.toFixed(1) + '%';
+            bar.style.backgroundColor = silent ? '#52525b' : (db > -6 ? '#f59e0b' : '#34d399');
+            txt.textContent = silent ? '無音' : Math.round(db) + ' dB';
+            txt.className = 'w-16 text-right text-[11px] font-mono ' +
+                (silent ? 'text-zinc-500' : (db > -6 ? 'text-amber-400' : 'text-emerald-400'));
+        }
+
+        function karaokeRenderHostMic(hm) {
+            if (!hm) return;
+            karaokeLoadHostMicDevices();
+
+            // 操作直後は書き戻さない（選んだ端から戻ると設定できない）。
+            if (Date.now() - karaokeHostMicTouchedAt > 3000) {
+                const sel = document.getElementById('kaHostMicDevice');
+                if (sel && sel.value !== hm.device) {
+                    // 一覧に載っていないデバイス（抜かれた等）でも選択を表現できるようにする。
+                    if (hm.device && !Array.from(sel.options).some(o => o.value === hm.device)) {
+                        sel.insertAdjacentHTML('beforeend',
+                            `<option value="${karaokeEscape(hm.device)}">${karaokeEscape(hm.device)}</option>`);
+                    }
+                    sel.value = hm.device;
+                }
+                const vol = document.getElementById('kaHostMicVol');
+                if (vol && parseFloat(vol.value) !== hm.volume) {
+                    vol.value = hm.volume;
+                    document.getElementById('kaHostMicVolVal').innerText = Number(hm.volume).toFixed(2);
+                }
+            }
+
+            karaokeRenderHostMicMeter(hm.level);
+
+            // 状態バッジ
+            const badge = document.getElementById('kaHostMicState');
+            if (badge) {
+                let text, cls;
+                if (!hm.device) {
+                    text = '未選択'; cls = 'text-zinc-500';
+                } else if (hm.on_air) {
+                    text = '配信に乗っています'; cls = 'text-emerald-300';
+                } else {
+                    text = '配信に乗っていません'; cls = 'text-amber-300';
+                }
+                badge.innerText = text;
+                badge.className = 'text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 ' + cls;
+            }
+
+            // 乗らない理由を具体的に出す。「なぜ声が入らないのか」で詰まるのを防ぐ。
+            const hint = document.getElementById('kaHostMicHint');
+            if (!hint) return;
+            let msg = '';
+            if (!hm.device) {
+                msg = '<i class="ri-information-line"></i> マイクデバイスを選ぶと、ホストの声も配信に乗ります。';
+            } else if (!hm.is_live_audio_mode) {
+                msg = '<i class="ri-error-warning-line"></i> <b>いまは「ライブ音声」モードではありません。</b>'
+                    + 'ホストのマイクとスマホの歌を配信へ流すには、'
+                    + '「プレイヤー & キュー」タブで追加モードを <b>ライブ音声</b> にして配信を始めてください。';
+            } else if (!hm.streaming) {
+                msg = '<i class="ri-information-line"></i> ライブ音声モードですが、まだ配信が動いていません。配信を開始すると声が乗ります。';
+            }
+            hint.innerHTML = msg;
+            hint.className = msg
+                ? 'text-[11px] leading-relaxed rounded p-2.5 border text-amber-300 bg-amber-500/10 border-amber-500/30'
+                : 'hidden text-[11px] leading-relaxed rounded p-2.5 border';
+        }
 
     </script>
 </body>
