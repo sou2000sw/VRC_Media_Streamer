@@ -216,6 +216,201 @@
             <!-- TAB 1: PLAYER & QUEUE -->
             <div id="tab-player" class="tab-pane flex flex-col gap-4">
 
+                <!-- OBS風3ペイン（シーン / ソース / 音声ミキサー）。
+                     ★中の #liveAudioCard は設定タブから丸ごと移してきたもの。id を一つも変えていないので
+                       既存の loadAudioDevices / syncLiveAudioFromStatus / applyRemoteTabVisibility はそのまま効く。
+                     ★シーンは OBS と違って「押すと ffmpeg が張り直る」。無料ではないので帯で先に告げる。 -->
+                <div id="obsDeck" class="flex flex-col gap-2">
+
+                    <div class="flex items-center gap-2 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-1.5">
+                        <i class="ri-alert-line text-amber-400 text-sm shrink-0"></i>
+                        <span class="text-[11px] text-amber-200/90">シーンを切り替えると配信が張り直され、視聴者側に数秒の切れ目が出ます。</span>
+                    </div>
+
+                    <div class="grid grid-cols-1 lg:grid-cols-12 gap-2 items-start">
+
+                        <div class="lg:col-span-3 bg-card border border-border rounded-lg overflow-hidden">
+                            <div class="px-2.5 py-1.5 border-b border-border text-[11px] text-zinc-400">シーン</div>
+                            <div class="p-1 flex flex-col gap-0.5">
+                                <button id="sceneVideoBtn" onclick="selectAddMode('video')" class="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800">
+                                    <i class="ri-movie-line text-sm"></i><span>動画</span>
+                                </button>
+                                <button id="sceneRadioBtn" onclick="selectAddMode('radio')" class="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800">
+                                    <i class="ri-radio-line text-sm"></i><span>ラジオ</span>
+                                </button>
+                                <button id="sceneSlideshowBtn" onclick="selectAddMode('slideshow')" class="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800">
+                                    <i class="ri-slideshow-line text-sm"></i><span>スライド</span>
+                                </button>
+                                <button id="sceneLiveBtn" onclick="selectAddMode('live')" style="display:none" class="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800">
+                                    <i class="ri-mic-line text-sm"></i><span>ライブ音声</span>
+                                </button>
+                                <button id="sceneScreenBtn" onclick="selectAddMode('screen')" style="display:none" class="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800">
+                                    <i class="ri-tv-line text-sm"></i><span>画面共有</span>
+                                </button>
+                            </div>
+                            <div class="px-2.5 py-1.5 border-t border-border text-[10px] text-zinc-600">排他。同時に1つだけ</div>
+                        </div>
+
+                        <div class="lg:col-span-5 bg-card border border-border rounded-lg overflow-hidden">
+                            <div class="px-2.5 py-1.5 border-b border-border text-[11px] text-zinc-400 flex items-center gap-1.5">
+                                <span>ソース</span>
+                                <span class="text-zinc-600">—</span>
+                                <span id="obsSourceScene" class="text-zinc-500">動画</span>
+                            </div>
+
+                            <div class="px-2.5 pt-2 pb-1 text-[10px] text-zinc-600">メイン入力（1つだけ選べます）</div>
+                            <div class="px-2.5 pb-2">
+                                <div id="srcPaneVideo" class="flex items-center gap-2 text-xs text-zinc-300">
+                                    <i class="ri-checkbox-circle-fill text-primary text-sm"></i>
+                                    <span>キューの動画を順に再生</span>
+                                    <span class="ml-auto text-[10px] text-zinc-600">下のキューから追加</span>
+                                </div>
+                                <div id="srcPaneRadio" style="display:none" class="flex items-center gap-2 text-xs text-zinc-300">
+                                    <i class="ri-checkbox-circle-fill text-primary text-sm"></i>
+                                    <span>キューの音声＋背景画像</span>
+                                    <span class="ml-auto text-[10px] text-zinc-600">背景は下の「ラジオ背景」</span>
+                                </div>
+                                <div id="srcPaneSlideshow" style="display:none" class="flex items-center gap-2 text-xs text-zinc-300">
+                                    <i class="ri-checkbox-circle-fill text-primary text-sm"></i>
+                                    <span>写真プールを自動巡回</span>
+                                    <span class="ml-auto text-[10px] text-zinc-600">動画キューとは別</span>
+                                </div>
+                                <div id="srcPaneLive" style="display:none" class="flex flex-col gap-1.5">
+                                    <div class="flex items-center gap-2 text-xs text-zinc-300">
+                                        <i class="ri-checkbox-circle-fill text-primary text-sm"></i>
+                                        <span>配信画面（音声だけなので、映像はこの静止画）</span>
+                                    </div>
+                                    <select id="liveAudioBgSource" onchange="changeLiveAudioBg(this.value)" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
+                                        <option value="standby">待機画面 (Standby)</option>
+                                        <option value="slideshow">スライドショー (Slideshow)</option>
+                                    </select>
+                                    <p class="text-[10px] text-zinc-600">※スライドショーは写真プールを巡回します。表示秒数・自動送りは設定タブの写真設定（ラジオと共通）に従います。</p>
+                                </div>
+                                <div id="srcPaneScreen" style="display:none" class="flex items-center gap-2 text-xs text-zinc-300">
+                                    <i class="ri-checkbox-circle-fill text-primary text-sm"></i>
+                                    <span>ホストPCの画面（モニター / ウィンドウ）</span>
+                                    <button onclick="switchTab('settings')" class="ml-auto px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[10px] text-zinc-300 transition">キャプチャ対象を選ぶ</button>
+                                </div>
+                            </div>
+
+                            <div class="px-2.5 pt-2 pb-1 text-[10px] text-zinc-600 border-t border-border">オーバーレイ（重ねられます）</div>
+                            <div class="p-1 pt-0 flex flex-col gap-0.5">
+                                <button id="obsOverlayClockRow" onclick="obsToggleOverlay('clock')" class="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-500 hover:bg-zinc-800">
+                                    <span id="obsOverlayClockBtn" class="text-sm"><i class="ri-eye-off-line"></i></span>
+                                    <span>時計</span>
+                                    <span class="ml-auto text-[10px] text-zinc-600">右上にJST</span>
+                                </button>
+                                <button id="obsOverlayQrRow" onclick="obsToggleOverlay('qr')" class="w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-500 hover:bg-zinc-800">
+                                    <span id="obsOverlayQrBtn" class="text-sm"><i class="ri-eye-off-line"></i></span>
+                                    <span>QRコード</span>
+                                    <span class="ml-auto text-[10px] text-zinc-600">Webリクエスト</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div id="obsMixerCol" class="lg:col-span-4" style="display:none">
+                            <!-- ライブ音声取り込み（タスク22）。デバイス列挙も設定変更も localhost 限定なので、
+                                 ゲストには 403 になる。押せるのに保存できないUIを出さないため、カードごと隠す。
+                                 ★mic/loopback/app が実際に配信へ乗るのは live と screen シーンのときだけ。
+                                   他のシーンでは ffmpeg に amix 分岐が無いので、フェーダーを動かしても何も起きない。
+                                   当てもののスライダーに見せないため、その旨をヘッダで常に出しておく。 -->
+                            <div id="liveAudioCard" class="hidden bg-card border border-border rounded-lg flex-col overflow-hidden">
+                                <div class="px-2.5 py-1.5 border-b border-border flex items-center gap-1.5">
+                                    <i class="ri-equalizer-line text-emerald-400 text-sm"></i>
+                                    <span class="text-[11px] text-zinc-300">音声ミキサー</span>
+                                    <button onclick="loadAudioDevices(true)" class="ml-auto flex items-center gap-1 px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 rounded text-[10px] transition" title="接続機器を再スキャンします">
+                                        <i class="ri-refresh-line"></i><span>再スキャン</span>
+                                    </button>
+                                </div>
+                                <p id="obsMixerScopeHint" class="hidden px-2.5 py-1 text-[10px] text-amber-400/90 border-b border-border"></p>
+
+                                <div class="p-2.5 flex flex-col gap-1.5 border-b border-border">
+                                    <div class="flex items-center gap-1.5">
+                                        <i class="ri-mic-line text-emerald-400 text-sm"></i>
+                                        <span class="text-xs text-zinc-200">マイク</span>
+                                        <span id="liveAudioMicVolumeLabel" class="ml-auto text-[11px] text-zinc-400 font-mono">1.00</span>
+                                        <button id="liveAudioMicMuteBtn" onclick="obsToggleMute('mic')" class="w-6 h-6 flex items-center justify-center rounded transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800" title="ミュート">
+                                            <i class="ri-volume-up-line text-sm"></i>
+                                        </button>
+                                    </div>
+                                    <select id="liveAudioMicDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
+                                        <option value="">（使用しない）</option>
+                                    </select>
+                                    <div class="h-1.5 bg-zinc-800 rounded overflow-hidden">
+                                        <div id="liveAudioMicMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="range" id="liveAudioMicVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                                        <span id="liveAudioMicMeterText" class="w-14 text-right text-[10px] text-zinc-500 font-mono">未選択</span>
+                                    </div>
+                                </div>
+
+                                <div class="p-2.5 flex flex-col gap-1.5 border-b border-border">
+                                    <div class="flex items-center gap-1.5">
+                                        <i class="ri-volume-up-line text-emerald-400 text-sm"></i>
+                                        <span class="text-xs text-zinc-200">PC出力</span>
+                                        <span id="liveAudioLoopbackVolumeLabel" class="ml-auto text-[11px] text-zinc-400 font-mono">0.70</span>
+                                        <button id="liveAudioLoopbackMuteBtn" onclick="obsToggleMute('loopback')" class="w-6 h-6 flex items-center justify-center rounded transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800" title="ミュート">
+                                            <i class="ri-volume-up-line text-sm"></i>
+                                        </button>
+                                    </div>
+                                    <select id="liveAudioLoopbackDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
+                                        <option value="">（使用しない）</option>
+                                    </select>
+                                    <div class="h-1.5 bg-zinc-800 rounded overflow-hidden">
+                                        <div id="liveAudioLoopbackMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="range" id="liveAudioLoopbackVolume" min="0" max="2" step="0.05" value="0.7" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                                        <span id="liveAudioLoopbackMeterText" class="w-14 text-right text-[10px] text-zinc-500 font-mono">未選択</span>
+                                    </div>
+                                    <p id="liveAudioLoopbackHint" class="hidden text-[10px] text-amber-400/90">
+                                        ⚠️ このPCにはループバック録音に使えるデバイスが見つかりませんでした。「ステレオ ミキサー」を有効にするか、VB-CABLE などの仮想オーディオデバイスの導入が必要です。マイク入力だけなら追加導入なしで使えます。
+                                    </p>
+                                </div>
+
+                                <div class="p-2.5 flex flex-col gap-1.5 border-b border-border">
+                                    <div class="flex items-center gap-1.5">
+                                        <input type="checkbox" id="liveAudioAppEnabled" onchange="applyLiveAudioAppSettings()" class="accent-emerald-400" title="アプリ単位の音声（選んだウィンドウの音だけ）">
+                                        <span class="text-xs text-zinc-200">アプリ音声</span>
+                                        <span id="liveAudioAppVolumeLabel" class="ml-auto text-[11px] text-zinc-400 font-mono">1.00</span>
+                                        <button id="liveAudioAppMuteBtn" onclick="obsToggleMute('app')" class="w-6 h-6 flex items-center justify-center rounded transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800" title="ミュート">
+                                            <i class="ri-volume-up-line text-sm"></i>
+                                        </button>
+                                    </div>
+                                    <select id="liveAudioAppWindow" onchange="applyLiveAudioAppSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
+                                        <option value="">（選択してください）</option>
+                                    </select>
+                                    <div class="h-1.5 bg-zinc-800 rounded overflow-hidden">
+                                        <div id="liveAudioAppMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="range" id="liveAudioAppVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioAppSettings()" class="flex-1 accent-emerald-400">
+                                        <span id="liveAudioAppMeterText" class="w-14 text-right text-[10px] text-zinc-500 font-mono">停止中</span>
+                                    </div>
+                                    <p id="liveAudioAppUnavailable" class="hidden text-[10px] text-amber-400/90">
+                                        ⚠️ アプリ単位の音声取り込みに必要な補助プログラム（app_audio_capture.exe）が見つかりません。有効にしても、従来のPC出力音声／マイクだけで配信されます。
+                                    </p>
+                                </div>
+
+                                <!-- 動画の音は volume フィルタを通さず素通ししているので、今は下げられない。
+                                     空のフェーダーを置いて黙って効かないより、未実装と書いて出す。 -->
+                                <div class="p-2.5 flex flex-col gap-1.5 opacity-40">
+                                    <div class="flex items-center gap-1.5">
+                                        <i class="ri-movie-line text-zinc-500 text-sm"></i>
+                                        <span class="text-xs text-zinc-400">動画の音</span>
+                                        <span class="ml-auto text-[10px] text-zinc-600">未実装</span>
+                                    </div>
+                                    <div class="h-1.5 bg-zinc-800 rounded"></div>
+                                </div>
+
+                                <p class="px-2.5 py-1.5 border-t border-border text-[10px] text-zinc-600">※複数選ぶとリアルタイム合成（amix）されます。変更すると配信は自動で再起動します。入力レベルは<b class="text-zinc-500">配信していなくても</b>振れます。</p>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+
                 <!-- 1. Live Stream Inline HLS Preview Player Card (Collapsible) -->
                 <div id="previewCard" class="hidden bg-card border border-border rounded-lg p-3 sm:p-4 flex-col gap-2.5 transition">
                     <div class="flex items-center justify-between">
@@ -312,31 +507,6 @@
                             <div class="flex items-center gap-2">
                                 <i class="ri-video-add-line text-primary text-base"></i>
                                 <span class="font-semibold text-xs text-zinc-200">YouTube 動画 / プレイリスト追加</span>
-                            </div>
-                            <!-- Mode Toggle Pill (3 Playback Modes) -->
-                            <div class="flex items-center bg-zinc-900 p-0.5 rounded border border-border text-[11px]">
-                                <button id="modeVideoBtn" onclick="selectAddMode('video')" class="px-2 py-0.5 rounded bg-zinc-800 text-primary font-medium transition flex items-center gap-1">
-                                    <i class="ri-movie-line text-xs"></i>
-                                    <span>動画</span>
-                                </button>
-                                <button id="modeRadioBtn" onclick="selectAddMode('radio')" class="px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition flex items-center gap-1">
-                                    <i class="ri-radio-line text-xs"></i>
-                                    <span>ラジオ</span>
-                                </button>
-                                <button id="modeSlideshowBtn" onclick="selectAddMode('slideshow')" class="px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition flex items-center gap-1">
-                                    <i class="ri-slideshow-line text-xs"></i>
-                                    <span>スライドショー</span>
-                                </button>
-                                <!-- ライブ音声取り込み（タスク22）。取り込みデバイスはホストPCにしか無く、
-                                     設定もlocalhost限定なので、ゲストにはボタンごと出さない。 -->
-                                <button id="modeLiveBtn" onclick="selectAddMode('live')" class="hidden px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition items-center gap-1">
-                                    <i class="ri-mic-line text-xs"></i>
-                                    <span>ライブ音声</span>
-                                </button>
-                                <button id="modeScreenBtn" onclick="selectAddMode('screen')" class="hidden px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition items-center gap-1">
-                                    <i class="ri-tv-line text-xs"></i>
-                                    <span>画面共有</span>
-                                </button>
                             </div>
                         </div>
 
@@ -731,109 +901,6 @@
                         </div>
                         <p class="text-[11px] text-zinc-500">※ラジオモードで曲の頭をフェードイン、終わりをフェードアウトさせ、変わり目のブツ切りをなくします。前後の曲を重ねる方式ではありません。</p>
                     </div>
-                </div>
-
-                <!-- ライブ音声取り込み（タスク22）。デバイス列挙も設定変更も localhost 限定なので、
-                     ゲストには 403 になる。押せるのに保存できないUIを出さないため、カードごと隠す。 -->
-                <div id="liveAudioCard" class="hidden bg-card border border-border rounded-lg p-4 flex-col gap-4">
-                    <div class="flex items-center gap-2 pb-2 border-b border-border">
-                        <i class="ri-mic-line text-emerald-400 text-base"></i>
-                        <h3 class="font-semibold text-xs text-zinc-200">ライブ音声取り込み（このPCからのみ）</h3>
-                        <button onclick="loadAudioDevices(true)" class="ml-auto flex items-center gap-1 px-2 py-0.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 rounded text-[11px] transition" title="接続機器を再スキャンします">
-                            <i class="ri-refresh-line"></i>
-                            <span>デバイス再スキャン</span>
-                        </button>
-                    </div>
-
-                    <!-- 配信画面（背景）。ラジオ背景と同じ仕組み（ffconcat + -stream_loop -1）を使うので、
-                         写真送りのために配信を張り直す必要がない。
-                         ★ラジオにある「サムネイルカード」は入れない。YouTubeのメタデータから作るもので、
-                         ライブ音声には元データが無い。 -->
-                    <div class="flex flex-col gap-2">
-                        <label class="text-xs text-zinc-400">配信画面（音声だけなので、映像はこの静止画になります）</label>
-                        <select id="liveAudioBgSource" onchange="changeLiveAudioBg(this.value)" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
-                            <option value="standby">⏹ 待機画面 (Standby)</option>
-                            <option value="slideshow">🖼️ スライドショー (Slideshow)</option>
-                        </select>
-                        <p class="text-[11px] text-zinc-500">※スライドショーは「写真プール」の画像を巡回します。1枚あたりの表示秒数と自動送りは、上の写真スライドショー設定（ラジオと共通）に従います。自動送りがOFF、または写真が無いときは待機画面になります。</p>
-                    </div>
-
-                    <div class="flex flex-col gap-2">
-                        <label class="text-xs text-zinc-400">マイク入力（実況・MC）</label>
-                        <select id="liveAudioMicDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
-                            <option value="">（使用しない）</option>
-                        </select>
-                        <div class="flex items-center gap-2">
-                            <input type="range" id="liveAudioMicVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
-                            <span id="liveAudioMicVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
-                        </div>
-                        <!-- 入力ゲージ。★このカードを開いている間だけ測定プロセスが動く。
-                             音量スライダーの後ろ（＝配信に乗る音量）ではなく、
-                             デバイスから入ってきた素の音を測っている。 -->
-                        <div class="flex items-center gap-2">
-                            <span class="text-[11px] text-zinc-400 w-16 shrink-0">入力レベル</span>
-                            <div class="flex-1 h-2 bg-zinc-800 rounded overflow-hidden">
-                                <div id="liveAudioMicMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
-                            </div>
-                            <span id="liveAudioMicMeterText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">未選択</span>
-                        </div>
-                    </div>
-
-                    <div class="flex flex-col gap-2">
-                        <label class="text-xs text-zinc-400">PC出力音声（ループバック / BGM・ゲーム音）</label>
-                        <select id="liveAudioLoopbackDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
-                            <option value="">（使用しない）</option>
-                        </select>
-                        <div class="flex items-center gap-2">
-                            <input type="range" id="liveAudioLoopbackVolume" min="0" max="2" step="0.05" value="0.7" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
-                            <span id="liveAudioLoopbackVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">0.70</span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <span class="text-[11px] text-zinc-400 w-16 shrink-0">入力レベル</span>
-                            <div class="flex-1 h-2 bg-zinc-800 rounded overflow-hidden">
-                                <div id="liveAudioLoopbackMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
-                            </div>
-                            <span id="liveAudioLoopbackMeterText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">未選択</span>
-                        </div>
-                        <p class="text-[11px] text-zinc-500">※入力レベルは<b>配信していなくても</b>振れます。本番前にここで、声とBGMが実際に取り込めているか確かめてください。振れないときはWindowsの「サウンドの設定」でそのデバイスの入力音量とアプリの許可を確認してください。</p>
-                    </div>
-
-                    <!-- アプリ単位の音声（タスク25）。Discordと同じく、選んだウィンドウの
-                         プロセスが鳴らしている音だけをWASAPIプロセスループバックで取り込む。 -->
-                    <div class="flex flex-col gap-2 pt-3 border-t border-border">
-                        <label class="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
-                            <input type="checkbox" id="liveAudioAppEnabled" onchange="applyLiveAudioAppSettings()" class="accent-emerald-400">
-                            <span>アプリ単位の音声（選んだウィンドウの音だけ）</span>
-                        </label>
-                        <select id="liveAudioAppWindow" onchange="applyLiveAudioAppSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-primary">
-                            <option value="">（選択してください）</option>
-                        </select>
-                        <div class="flex items-center gap-2">
-                            <input type="range" id="liveAudioAppVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioAppSettings()" class="flex-1 accent-emerald-400">
-                            <span id="liveAudioAppVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
-                        </div>
-                        <!-- 入力レベルのゲージ。「取り込めているのか」を配信中に目で確かめるためのもの。
-                             補助exeが 200ms ごとに報告する peak/rms を /api/status 経由で受け取る。 -->
-                        <div class="flex items-center gap-2">
-                            <span class="text-[11px] text-zinc-400 w-16 shrink-0">入力レベル</span>
-                            <div class="flex-1 h-2 bg-zinc-800 rounded overflow-hidden">
-                                <div id="liveAudioAppMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
-                            </div>
-                            <span id="liveAudioAppMeterText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">停止中</span>
-                        </div>
-
-                        <p id="liveAudioAppUnavailable" class="hidden text-[11px] text-amber-400/90">
-                            &#9888; アプリ単位の音声取り込みに必要な補助プログラム（app_audio_capture.exe）が見つかりません。この項目を有効にしても、従来のPC出力音声／マイクだけで配信されます。
-                        </p>
-                        <p class="text-[11px] text-zinc-500">
-                            ※選んだウィンドウのプロセス（とその子プロセス）が鳴らしている音だけを取り込みます。ブラウザやDiscordのように音を別プロセスが出すアプリでも取り込めますが、ストアアプリなど一部は取り込めないことがあります。対象が見つからないときは自動で従来の経路に切り替わり、配信は止まりません。
-                        </p>
-                    </div>
-
-                    <p id="liveAudioLoopbackHint" class="hidden text-[11px] text-amber-400/90">
-                        ⚠️ このPCにはループバック録音に使えるデバイスが見つかりませんでした。PC出力音声を配信するには、サウンドカードの「ステレオ ミキサー / What U Hear」を有効にするか、VB-CABLE / VB-Audio Voicemeeter などの仮想オーディオデバイスの導入が必要です。マイク入力だけなら追加導入なしで使えます。
-                    </p>
-                    <p class="text-[11px] text-zinc-500">※両方選ぶとリアルタイム合成（amix）されます。設定を変えると配信は自動で再起動します。音声のみの生配信はHLSだと9〜12秒遅れるため、会話用途では配信先をTopazChatにしてください。</p>
                 </div>
 
                 <!-- 画面共有（タスク23）。キャプチャ対象列挙・設定変更は localhost 限定。 -->
@@ -2104,12 +2171,8 @@
             karaokeApplyHostVisibility(isHost);
 
             // ライブ音声（タスク22）: 取り込みデバイスはホストPCにしか存在せず、
-            // 列挙も設定変更も localhost 限定。ゲストにはモードボタンごと見せない。
-            const btnModeLive = document.getElementById('modeLiveBtn');
-            if (btnModeLive) {
-                btnModeLive.classList.toggle('hidden', !isHost);
-                btnModeLive.classList.toggle('flex', isHost);
-            }
+            // 列挙も設定変更も localhost 限定。ゲストにはシーンごと見せない
+            // （シーンボタンと音声ミキサーの出し分けは obsApplyHostVisibility）。
             if (isHost && !liveAudioDevicesLoaded) {
                 loadAudioDevices(false);
             } else if (!isHost) {
@@ -2121,11 +2184,6 @@
             }
 
             // 画面共有（タスク23）: キャプチャ対象列挙・設定変更は localhost 限定。
-            const btnModeScreen = document.getElementById('modeScreenBtn');
-            if (btnModeScreen) {
-                btnModeScreen.classList.toggle('hidden', !isHost);
-                btnModeScreen.classList.toggle('flex', isHost);
-            }
             if (isHost && !screenCaptureSourcesLoaded) {
                 loadScreenCaptureSources(false);
             } else if (!isHost) {
@@ -2135,6 +2193,8 @@
                     screenCard.classList.remove('flex');
                 }
             }
+
+            obsApplyHostVisibility(isHost);
 
             // 表示中のタブが隠れた場合はプレイヤーへ戻す（空白の画面が残らないように）
             if ((!showSettings && activeTabId === 'settings') || (!showInfo && activeTabId === 'info')) {
@@ -2475,32 +2535,10 @@
         // 見た目の更新のみ（サーバー状態の反映にも使う）
         function setAddMode(mode) {
             currentAddMode = mode;
-            const vBtn = document.getElementById('modeVideoBtn');
-            const rBtn = document.getElementById('modeRadioBtn');
-            const sBtn = document.getElementById('modeSlideshowBtn');
             const desc = document.getElementById('modeDescription');
 
-            const inactiveCls = "px-2 py-0.5 rounded text-zinc-400 hover:text-zinc-200 transition flex items-center gap-1";
-            const activeCls = "px-2 py-0.5 rounded bg-zinc-800 text-primary font-medium transition flex items-center gap-1";
-
-            const lBtn = document.getElementById('modeLiveBtn');
-            const scBtn = document.getElementById('modeScreenBtn');
-
-            if (vBtn) vBtn.className = (mode === 'video') ? activeCls : inactiveCls;
-            if (rBtn) rBtn.className = (mode === 'radio') ? activeCls : inactiveCls;
-            if (sBtn) sBtn.className = (mode === 'slideshow') ? activeCls : inactiveCls;
-            // ライブボタン・画面共有ボタンは表示制御が別（ホスト限定）なので、hidden を落とさないように
-            // className を丸ごと差し替えず、状態クラスだけを付け替える。
-            if (lBtn) {
-                const wasHidden = lBtn.classList.contains('hidden');
-                lBtn.className = (mode === 'live') ? activeCls : inactiveCls;
-                if (wasHidden) lBtn.classList.add('hidden');
-            }
-            if (scBtn) {
-                const wasHidden = scBtn.classList.contains('hidden');
-                scBtn.className = (mode === 'screen') ? activeCls : inactiveCls;
-                if (wasHidden) scBtn.classList.add('hidden');
-            }
+            // シーン列（左ペイン）の選択表示は obsSyncScene が持つ。
+            obsSyncScene(mode);
 
             if (desc) {
                 if (mode === 'video') {
@@ -2515,6 +2553,109 @@
                     desc.innerText = "🖥️ 画面共有: ホストPCの画面（モニター/ウィンドウ）をリアルタイム配信（キューは消費しません）";
                 }
             }
+        }
+
+        // ===== OBS風3ペインの配線（シーン / ソース / 音声ミキサー） =====
+        // ★状態の持ち主は増やしていない。既存の setAddMode / applyRemoteTabVisibility /
+        //   updateLiveAudioVolumeLabels から呼ばれて、見た目を合わせるだけ。
+        const OBS_SCENE_NAMES = { video: '動画', radio: 'ラジオ', slideshow: 'スライドショー', live: 'ライブ音声', screen: '画面共有' };
+        const OBS_SCENE_BTNS = { video: 'sceneVideoBtn', radio: 'sceneRadioBtn', slideshow: 'sceneSlideshowBtn', live: 'sceneLiveBtn', screen: 'sceneScreenBtn' };
+        const OBS_SRC_PANES = { video: 'srcPaneVideo', radio: 'srcPaneRadio', slideshow: 'srcPaneSlideshow', live: 'srcPaneLive', screen: 'srcPaneScreen' };
+        const OBS_SCENE_ACTIVE = 'w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition bg-primary/15 text-primary font-medium';
+        const OBS_SCENE_IDLE = 'w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800';
+
+        function obsSyncScene(mode) {
+            Object.keys(OBS_SCENE_BTNS).forEach(function (m) {
+                const b = document.getElementById(OBS_SCENE_BTNS[m]);
+                if (!b) return;
+                // 表示・非表示は style 側で持っているので、className を差し替えても消えない。
+                b.className = (m === mode) ? OBS_SCENE_ACTIVE : OBS_SCENE_IDLE;
+            });
+            Object.keys(OBS_SRC_PANES).forEach(function (m) {
+                const p = document.getElementById(OBS_SRC_PANES[m]);
+                if (p) p.style.display = (m === mode) ? '' : 'none';
+            });
+            const label = document.getElementById('obsSourceScene');
+            if (label) label.innerText = OBS_SCENE_NAMES[mode] || '';
+
+            // ★ミキサーの射程を正直に出す。mic/loopback/app が配信へ乗るのは live / screen だけ
+            //   （streamer_core の他モードの ffmpeg グラフに amix 分岐が無い）。
+            const hint = document.getElementById('obsMixerScopeHint');
+            if (hint) {
+                const mixerLive = (mode === 'live' || mode === 'screen');
+                hint.classList.toggle('hidden', mixerLive);
+                if (!mixerLive) hint.innerText = '※このシーンではここの音は配信へ乗りません。ライブ音声／画面共有のときだけ有効です。';
+            }
+        }
+
+        function obsApplyHostVisibility(isHost) {
+            const col = document.getElementById('obsMixerCol');
+            if (col) col.style.display = isHost ? '' : 'none';
+            ['sceneLiveBtn', 'sceneScreenBtn'].forEach(function (id) {
+                const b = document.getElementById(id);
+                if (b) b.style.display = isHost ? '' : 'none';
+            });
+        }
+
+        // オーバーレイの目玉。実体は設定タブのチェックボックスなので、ここでは
+        // それを反転させて updateSettings() に乗せるだけにする（保存経路を二重化しない）。
+        function obsToggleOverlay(kind) {
+            const el = document.getElementById(kind === 'clock' ? 'settingClockOverlay' : 'settingQrEnabled');
+            if (!el) return;
+            el.checked = !el.checked;
+            obsSyncOverlays();
+            if (typeof updateSettings === 'function') updateSettings();
+        }
+
+        function obsSyncOverlays() {
+            [['settingClockOverlay', 'obsOverlayClockBtn', 'obsOverlayClockRow'],
+             ['settingQrEnabled', 'obsOverlayQrBtn', 'obsOverlayQrRow']].forEach(function (t) {
+                const src = document.getElementById(t[0]);
+                const icon = document.getElementById(t[1]);
+                const row = document.getElementById(t[2]);
+                if (!src || !icon || !row) return;
+                const on = !!src.checked;
+                icon.innerHTML = on ? '<i class="ri-eye-line"></i>' : '<i class="ri-eye-off-line"></i>';
+                row.className = 'w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition '
+                    + (on ? 'text-zinc-100 hover:bg-zinc-800' : 'text-zinc-500 hover:bg-zinc-800');
+            });
+        }
+
+        // ミュート。バックエンドにミュートフラグは無いので、音量0へ落として
+        // 元の値を覚えておく（ページを離れると忘れる）。
+        const obsMuteMemo = { mic: null, loopback: null, app: null };
+        const OBS_MUTE_MAP = {
+            mic: { slider: 'liveAudioMicVolume', btn: 'liveAudioMicMuteBtn', isApp: false },
+            loopback: { slider: 'liveAudioLoopbackVolume', btn: 'liveAudioLoopbackMuteBtn', isApp: false },
+            app: { slider: 'liveAudioAppVolume', btn: 'liveAudioAppMuteBtn', isApp: true }
+        };
+
+        function obsToggleMute(ch) {
+            const cfg = OBS_MUTE_MAP[ch];
+            if (!cfg) return;
+            const sl = document.getElementById(cfg.slider);
+            if (!sl) return;
+            if (Number(sl.value) > 0) {
+                obsMuteMemo[ch] = Number(sl.value);
+                sl.value = 0;
+            } else {
+                sl.value = (obsMuteMemo[ch] > 0) ? obsMuteMemo[ch] : 1;
+            }
+            updateLiveAudioVolumeLabels();
+            if (cfg.isApp) { applyLiveAudioAppSettings(); } else { applyLiveAudioSettings(); }
+        }
+
+        function obsUpdateMuteIcons() {
+            Object.keys(OBS_MUTE_MAP).forEach(function (ch) {
+                const cfg = OBS_MUTE_MAP[ch];
+                const sl = document.getElementById(cfg.slider);
+                const btn = document.getElementById(cfg.btn);
+                if (!sl || !btn) return;
+                const muted = Number(sl.value) <= 0;
+                btn.innerHTML = muted ? '<i class="ri-volume-mute-line text-sm"></i>' : '<i class="ri-volume-up-line text-sm"></i>';
+                btn.className = 'w-6 h-6 flex items-center justify-center rounded transition '
+                    + (muted ? 'text-red-400 hover:bg-zinc-800' : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800');
+            });
         }
 
         // Server Health & Status Polling
@@ -2801,6 +2942,7 @@
                 const clockEl = document.getElementById('settingClockOverlay');
                 if (clockEl) clockEl.checked = Boolean(data.overlay_clock_enabled || data.overlay_clock_video);
             }
+            obsSyncOverlays();
             if (data.image_display_duration) {
                 const durEl = document.getElementById('settingImageDuration');
                 if (durEl) durEl.value = data.image_display_duration;
@@ -3417,6 +3559,7 @@
             const app = document.getElementById('liveAudioAppVolume');
             const appLabel = document.getElementById('liveAudioAppVolumeLabel');
             if (app && appLabel) appLabel.innerText = Number(app.value).toFixed(2);
+            obsUpdateMuteIcons();
         }
 
         async function loadAudioDevices(force = false) {
