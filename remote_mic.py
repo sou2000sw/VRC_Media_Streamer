@@ -239,42 +239,31 @@ class JitterBuffer:
 
 
 # --------------------------------------------------------------------------
-# 参加者
+# 下り送信の共通土台（参加者・ホスト監聴のどちらも使う）
 # --------------------------------------------------------------------------
-class Participant:
-    def __init__(self, client_id, name, is_host=False):
-        self.id = client_id
-        self.name = name
-        self.is_host = is_host
-        self.state = STATE_WAITING
-        self.self_muted = False       # 本人がミュートした
-        self.host_muted = False       # ホストがミュートした
-        self.volume = 1.0             # 0.0〜2.0
-        self.pan = 0.0                # -1.0〜1.0
-        self.buffer = JitterBuffer()
-        self.level = 0.0              # 0.0〜1.0（ホストUIのVU用）
-        self.rtt_ms = 0
-        self.jitter_ms = 0
-        self.joined_at = time.time()
-        self.conn = None              # WebSocketConnection（送信用）
+class DownstreamSender:
+    """ミキサが作った音を、この相手へ送り出すための控えと専用スレッド。
 
-        # ---- 下り（伴奏を歌い手へ配る）----
-        # ★ミキサのスレッドから直接 send してはいけない。相手の回線が詰まると
-        #   ソケット書き込みがブロックし、**ミキサごと止まって全員の音が壊れる**。
-        #   上限付きの控えに積み、この参加者専用のスレッドが送り出す。
+    ★ミキサのスレッドから直接 send してはいけない。相手の回線が詰まると
+      ソケット書き込みがブロックし、**ミキサごと止まって全員の音が壊れる**。
+      上限付きの控えに積み、相手ごとのスレッドが送り出す。
+    """
+
+    def __init__(self, label="down"):
+        self.conn = None              # WebSocketConnection（送信用）
         self._down_q = collections.deque()
         self._down_cv = threading.Condition()
         self._down_stop = False
         self._down_thread = None
+        self._down_label = label
         self.downstream_dropped = 0
 
-    # ------------------------------------------------------------------
     def start_downstream(self):
         if self._down_thread:
             return
         self._down_stop = False
         self._down_thread = threading.Thread(
-            target=self._downstream_loop, name=f"karaoke-down-{self.id[:6]}",
+            target=self._downstream_loop, name=f"karaoke-{self._down_label}",
             daemon=True)
         self._down_thread.start()
 
@@ -286,7 +275,7 @@ class Participant:
         self._down_thread = None
 
     def push_downstream(self, data):
-        """伴奏フレームを控えに積む。溜まりすぎたら**古い方を捨てる**。
+        """フレームを控えに積む。溜まりすぎたら**古い方を捨てる**。
 
         捨てないと、詰まった相手のために遅延が伸び続け、しかも意味のない
         過去の音を後生大事に送ることになる。
@@ -316,6 +305,48 @@ class Participant:
             except Exception:
                 # 相手が消えた。受信側のループが後始末をするので、ここは黙って降りる。
                 return
+
+
+class MonitorClient(DownstreamSender):
+    """ホストの監聴（タスク27-C-②）。参加者ではないので一覧にも出ないし、
+    音も送ってこない。**参加者の声を聴くためだけ**に繋がる相手。
+
+    ★ホストPCからの接続に限る。ここを開けると、参加者どうしが互いの声を
+      盗み聴きできてしまう。
+    """
+
+    def __init__(self, client_id):
+        super().__init__(label=f"mon-{client_id[:6]}")
+        self.id = client_id
+        self.rtt_ms = 0
+        self.jitter_ms = 0
+        self.lead_ms = 0          # クライアントが報告する再生バッファの実測値
+        self.joined_at = time.time()
+
+    def snapshot(self):
+        return {"id": self.id, "rtt_ms": int(self.rtt_ms),
+                "jitter_ms": int(self.jitter_ms), "lead_ms": int(self.lead_ms)}
+
+
+# --------------------------------------------------------------------------
+# 参加者
+# --------------------------------------------------------------------------
+class Participant(DownstreamSender):
+    def __init__(self, client_id, name, is_host=False):
+        super().__init__(label=f"down-{client_id[:6]}")
+        self.id = client_id
+        self.name = name
+        self.is_host = is_host
+        self.state = STATE_WAITING
+        self.self_muted = False       # 本人がミュートした
+        self.host_muted = False       # ホストがミュートした
+        self.volume = 1.0             # 0.0〜2.0
+        self.pan = 0.0                # -1.0〜1.0
+        self.buffer = JitterBuffer()
+        self.level = 0.0              # 0.0〜1.0（ホストUIのVU用）
+        self.rtt_ms = 0
+        self.jitter_ms = 0
+        self.joined_at = time.time()
 
     @property
     def audible(self):
@@ -544,9 +575,25 @@ BGM_STATE_ERROR = "error"
 # 伴奏デコーダから先読みしておく量。これ以上は溜めない（＝デコーダが自然に待つ）。
 BGM_QUEUE_TICKS = 25          # 20ms × 25 = 0.5 秒
 
-# 下りで歌い手へ配る音声フレームの種別（1バイト目）
+# 下りで配る音声フレームの種別（1バイト目）
+# 1 = ホスト側の参照ミックス（伴奏＋ホストのマイク）… 歌い手が合わせるための音
+# 2 = 参加者ミックス（参加者の声＋伴奏）… ホストが合わせるための音（監聴）
+# ★どちらも「自分の音」は含めない。含めると自分の声が遅れて返り、歌えなくなる。
 DOWNSTREAM_TYPE_BGM = 1
+DOWNSTREAM_TYPE_MONITOR = 2
 DOWNSTREAM_HEADER = 4         # [0]=種別, [1..3]=予約。4バイトにして16bit境界を保つ
+
+# 同期の基準（どちらの演奏に、もう一方が合わせるか）
+# ★これで遅延補正の**符号が逆になる**。
+#   host        … ホストの伴奏/演奏に参加者が合わせる → 歌声を早める（offset 負）
+#   participant … 参加者の演奏にホストが合わせる     → 参加者を遅らせる（offset 正）
+SYNC_REFERENCE_HOST = "host"
+SYNC_REFERENCE_PARTICIPANT = "participant"
+SYNC_REFERENCES = (SYNC_REFERENCE_HOST, SYNC_REFERENCE_PARTICIPANT)
+
+# ホストのマイクを Python 経由にしたときに増える取り込み遅延の見積り[ms]。
+# dshow のバッファ(50ms)＋ffmpeg の処理ぶん。実測で詰める前提の初期値。
+HOST_MIC_CAPTURE_LATENCY_MS = 80
 
 
 class AccompanimentPlayer:
@@ -953,9 +1000,21 @@ class KaraokeSession:
         self.bgm = AccompanimentPlayer(ffmpeg_cmd=ffmpeg_cmd)
         self._bgm_delay = DelayLine(KARAOKE_BASE_DELAY_MS)
         self._bgm_delay.set_delay_ms(KARAOKE_BASE_DELAY_MS)
+        # タスク27-C-①: ホストのマイクを Python 経由にしたときのバス。
+        # StreamerCore が take(n) を持つ取り込み器を差し込む。
+        self.host_mic_source = None
+        self.host_mic_volume = 1.0
+        self.host_mic_level = 0.0
+        self._host_mic_delay = DelayLine(KARAOKE_BASE_DELAY_MS)
+        self._host_mic_delay.set_delay_ms(KARAOKE_BASE_DELAY_MS)
+        # タスク27-C-②: ホストの監聴（参加者の声を聴く相手）
+        self.monitors = {}
+        # 同期の基準。遅延補正の符号がこれで変わる。
+        self.sync_reference = SYNC_REFERENCE_HOST
         # 伴奏が止まった後、遅延ラインに残った尾を吐き切るまでの刻み数。
         self._bgm_flush_ticks = ms_to_frames(KARAOKE_BASE_DELAY_MS) // FRAMES_PER_TICK + 2
         self._bgm_flush = 0
+        self._host_mic_flush = 0
         self.master_level = 0.0
         self.ticks = 0
 
@@ -963,6 +1022,7 @@ class KaraokeSession:
         self.recordings_dir = recordings_dir or os.path.join(APP_DIR, "recordings")
         self._wave = None
         self._wave_path = None
+        self._wave_lock = threading.Lock()
         self._record_started_at = 0.0
 
         self._apply_delay()
@@ -975,7 +1035,8 @@ class KaraokeSession:
             clamp(KARAOKE_BASE_DELAY_MS + self.offset_ms, 0, KARAOKE_BASE_DELAY_MS * 2))
 
     def configure(self, enabled=None, approval_required=None, latency_mode=None,
-                  master_volume=None, reverb=None, offset_ms=None):
+                  master_volume=None, reverb=None, offset_ms=None,
+                  sync_reference=None, host_mic_volume=None):
         with self._lock:
             if enabled is not None:
                 self.enabled = bool(enabled)
@@ -995,6 +1056,10 @@ class KaraokeSession:
                 self.offset_ms = int(clamp(int(offset_ms),
                                            KARAOKE_OFFSET_MIN_MS, KARAOKE_OFFSET_MAX_MS))
                 self._apply_delay()
+            if sync_reference in SYNC_REFERENCES:
+                self.sync_reference = sync_reference
+            if host_mic_volume is not None:
+                self.host_mic_volume = clamp(float(host_mic_volume), 0.0, 2.0)
         return self.settings_snapshot()
 
     def settings_snapshot(self):
@@ -1011,6 +1076,9 @@ class KaraokeSession:
             "max_participants": MAX_PARTICIPANTS,
             "sample_rate": SAMPLE_RATE,
             "frame_ms": FRAME_MS,
+            "sync_reference": self.sync_reference,
+            "host_mic_volume": round(self.host_mic_volume, 2),
+            "host_mic_routed": self.host_mic_source is not None,
         }
 
     def status_snapshot(self):
@@ -1031,6 +1099,8 @@ class KaraokeSession:
             "recording_seconds": (int(time.time() - self._record_started_at)
                                   if self.is_recording else 0),
             "bgm": self.bgm.snapshot(),
+            "host_mic_level": round(self.host_mic_level, 3),
+            "monitors": [m.snapshot() for m in list(self.monitors.values())],
         })
         return data
 
@@ -1063,6 +1133,42 @@ class KaraokeSession:
     def get(self, client_id):
         with self._lock:
             return self.participants.get(client_id)
+
+    # ---------------- ホストの監聴（タスク27-C-②） ----------------
+    def add_monitor(self, client_id, conn=None):
+        """ホストの監聴クライアントを登録する。
+
+        ★参加者ではない。一覧にも出ないし、音も受け取らない（送るだけ）。
+          呼び出し側でホストPCからの接続であることを確かめてから呼ぶこと。
+        """
+        m = MonitorClient(client_id)
+        m.conn = conn
+        with self._lock:
+            self.monitors[client_id] = m
+        m.start_downstream()
+        log_print(f"[Karaoke] 監聴を開始 id={client_id[:8]}")
+        return m
+
+    def remove_monitor(self, client_id):
+        with self._lock:
+            m = self.monitors.pop(client_id, None)
+        if m:
+            m.stop_downstream()
+            log_print(f"[Karaoke] 監聴を終了 id={client_id[:8]}")
+        return m
+
+    def monitor_latency_ms(self):
+        """監聴の実測遅延（片道の目安）。参加者基準のときの補正に使う。
+
+        クライアントが報告する再生バッファの先読み量に、片道ぶんの RTT を足す。
+        報告が無ければ None。
+        """
+        vals = [m.lead_ms + m.rtt_ms // 2 for m in list(self.monitors.values())
+                if m.lead_ms > 0]
+        if not vals:
+            return None
+        vals.sort()
+        return int(vals[len(vals) // 2])
 
     def set_state(self, client_id, state):
         with self._lock:
@@ -1159,6 +1265,8 @@ class KaraokeSession:
             t.join(timeout=2.0)
         self._mixer_thread = None
         self.bgm.stop()
+        for mid in list(self.monitors.keys()):
+            self.remove_monitor(mid)
         self.close_sink()
         self.stop_recording()
         self.master_level = 0.0
@@ -1217,9 +1325,33 @@ class KaraokeSession:
             sources.append((mono, gl * v, gr * v))
 
         samples = mix_participants(sources, n)
+
+        # ★遅延を掛ける**前**の歌声を控えておく。ホストは「今この瞬間の演奏」に
+        #   合わせて歌うので、1msでも早い方がよい。監聴を使っていないときは
+        #   コピーの費用も払わない。
+        monitor_src = list(samples) if self.monitors else None
+
         if self.reverb != "off":
             self._reverb_line.process(samples)
         self._delay_line.process(samples)
+
+        # ---- ホストのマイク（タスク27-C-①）----
+        # 伴奏と同じ「伴奏側」なので固定 500ms。遅延補正では動かさない。
+        host_mic = self.host_mic_source.take(n) if self.host_mic_source else None
+        if host_mic is not None:
+            lvl = 0.0
+            for i in range(0, n * OUTPUT_CHANNELS, 2):
+                v = host_mic[i]
+                if v < 0:
+                    v = -v
+                if v > lvl:
+                    lvl = v
+            lvl /= 32768.0
+            self.host_mic_level = (lvl if lvl > self.host_mic_level
+                                   else self.host_mic_level * LEVEL_DECAY_PER_TICK)
+            self._host_mic_flush = self._bgm_flush_ticks
+        else:
+            self.host_mic_level *= LEVEL_DECAY_PER_TICK
 
         # ---- 伴奏（タスク27-B）----
         # ★歌い手へは「遅延を掛ける前・音量を掛ける前」の音を配る。
@@ -1228,7 +1360,30 @@ class KaraokeSession:
         bgm = self.bgm.take(n)
         if bgm is not None:
             self._bgm_flush = self._bgm_flush_ticks
-            self._broadcast_bgm(bgm, n)
+
+        # 歌い手が合わせる音＝伴奏＋ホストのマイク。これを1本にまとめて配る。
+        if bgm is not None or host_mic is not None:
+            self._broadcast_reference(bgm, host_mic, n)
+
+        # ホストが合わせる音＝参加者の声＋伴奏。ホスト自身のマイクは入れない。
+        if monitor_src is not None:
+            self._broadcast_monitor(monitor_src, bgm, n)
+
+        # ホストのマイクを配信バスへ
+        if host_mic is not None or self._host_mic_flush > 0:
+            hv = self.host_mic_volume
+            if host_mic is None:
+                self._host_mic_flush -= 1
+                hm_f = [0.0] * (n * OUTPUT_CHANNELS)
+            else:
+                hm_f = [host_mic[i] * hv for i in range(n * OUTPUT_CHANNELS)]
+            self._host_mic_delay.process(hm_f)
+            for i in range(n * OUTPUT_CHANNELS):
+                samples[i] += hm_f[i]
+            has_host_mic = True
+        else:
+            has_host_mic = False
+
         if bgm is not None or self._bgm_flush > 0:
             vol = self.bgm.volume
             if bgm is None:
@@ -1244,6 +1399,7 @@ class KaraokeSession:
             has_bgm = True
         else:
             has_bgm = False
+        has_bgm = has_bgm or has_host_mic
 
         # マスタのピーク（ホストUIの「配信に乗っている音」の目安）
         peak = 0.0
@@ -1263,32 +1419,70 @@ class KaraokeSession:
         self._write_recording(pcm)
         self.ticks += 1
 
-    def _broadcast_bgm(self, stereo, n):
-        """伴奏を ON AIR の参加者へ配る（歌い手の手元モニター用）。
+    @staticmethod
+    def _pack_mono(frame_type, sources, n):
+        """複数のステレオ源を足してモノラルへ落とし、下りフレームに包む。
+
+        ★モノラルへ落とす理由
+          左右差は「合わせて演奏する」ために要らない。帯域が半分になる方が実利がある。
+        ★クリップは飽和させる。折り返すと轟音のノイズになる。
+        """
+        mono = array.array("h", bytes(n * BYTES_PER_SAMPLE))
+        for i in range(n):
+            j = i * 2
+            acc = 0.0
+            for src in sources:
+                acc += src[j] + src[j + 1]
+            acc *= 0.5
+            iv = int(acc)
+            if iv > 32767:
+                iv = 32767
+            elif iv < -32768:
+                iv = -32768
+            mono[i] = iv
+        if sys.byteorder != "little":
+            mono.byteswap()
+        return bytes((frame_type, 0, 0, 0)) + mono.tobytes()
+
+    def _broadcast_reference(self, bgm, host_mic, n):
+        """歌い手が合わせる音（伴奏＋ホストのマイク）を ON AIR の参加者へ配る。
 
         ★ON AIR の人にだけ送る
           48kHz モノラルで 1 人あたり約 768kbps。待機中の全員へ配ると
           ホストの上り帯域がその人数倍になる。歌っている人が聴ければ足りる。
 
-        ★モノラルへ落とす
-          伴奏の左右差は歌うために要らない。帯域を半分にする方が実利がある。
+        ★参加者自身の声は入れない
+          自分の声が往復ぶん遅れて返ってくると、まず歌えない。
         """
         with self._lock:
             targets = [p for p in self.participants.values()
                        if p.state == STATE_ACTIVE and p.conn is not None]
         if not targets:
             return
-        mono = array.array("h", bytes(n * BYTES_PER_SAMPLE))
-        j = 0
-        for i in range(n):
-            v = (stereo[j] + stereo[j + 1]) >> 1
-            mono[i] = v
-            j += 2
-        if sys.byteorder != "little":
-            mono.byteswap()
-        payload = bytes((DOWNSTREAM_TYPE_BGM, 0, 0, 0)) + mono.tobytes()
+        sources = [x for x in (bgm, host_mic) if x is not None]
+        if not sources:
+            return
+        payload = self._pack_mono(DOWNSTREAM_TYPE_BGM, sources, n)
         for p in targets:
             p.push_downstream(payload)
+
+    def _broadcast_monitor(self, participant_mix, bgm, n):
+        """ホストが合わせる音（参加者の声＋伴奏）を監聴クライアントへ配る。
+
+        ★ホスト自身のマイクは入れない
+          自分の声が遅れて返ると歌えない。ここが②の肝。
+        ★遅延を掛ける前を配る
+          ホストは「今この瞬間の演奏」に合わせるので、1msでも早い方がよい。
+        """
+        monitors = list(self.monitors.values())
+        if not monitors:
+            return
+        sources = [participant_mix]
+        if bgm is not None:
+            sources.append(bgm)
+        payload = self._pack_mono(DOWNSTREAM_TYPE_MONITOR, sources, n)
+        for m in monitors:
+            m.push_downstream(payload)
 
     # ---------------- 録音（設計書 5.3） ----------------
     @property
@@ -1322,25 +1516,40 @@ class KaraokeSession:
         return path
 
     def stop_recording(self):
-        wf, path = self._wave, self._wave_path
-        self._wave = None
-        if wf:
-            try:
-                wf.close()
-            except Exception:
-                pass
-            log_print(f"[Karaoke] recording saved: {path}")
-        return path
+        """★ミキサの書き込みと排他にすること。
+
+        wave.close() は最後にヘッダ（サイズ）を書き直す。閉じている最中に
+        ミキサ側が writeframes すると、**録音ファイルが壊れる**。
+        実際、テストが不定期に「not a WAV file」で落ちて表面化した。
+        """
+        with self._wave_lock:
+            wf, path = self._wave, self._wave_path
+            self._wave = None
+            if wf:
+                try:
+                    wf.close()
+                except Exception:
+                    pass
+                log_print(f"[Karaoke] recording saved: {path}")
+            return path
 
     def _write_recording(self, pcm):
-        wf = self._wave
-        if not wf:
-            return
-        try:
-            wf.writeframes(pcm)
-        except Exception as e:
-            log_print(f"[Karaoke] 録音書き込みに失敗: {e}")
-            self.stop_recording()
+        with self._wave_lock:
+            wf = self._wave
+            if not wf:
+                return
+            try:
+                wf.writeframes(pcm)
+                return
+            except Exception as e:
+                log_print(f"[Karaoke] 録音書き込みに失敗: {e}")
+                # ★ここで stop_recording() を呼ぶと同じロックを取りに行く。
+                #   RLock ではないので、その場で畳む。
+                self._wave = None
+                try:
+                    wf.close()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------

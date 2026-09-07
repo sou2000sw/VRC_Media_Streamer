@@ -1308,6 +1308,62 @@
 
 
 
+
+                    <!-- 同期の基準とホスト監聴（タスク27-C） -->
+                    <div class="border-t border-border pt-3 flex flex-col gap-3">
+                        <div class="flex items-center justify-between gap-2 flex-wrap">
+                            <span class="text-xs font-semibold text-zinc-200 flex items-center gap-2">
+                                <i class="ri-scales-3-line text-primary"></i> 合わせ方（同期の基準）
+                            </span>
+                            <span id="kaMonitorState" class="text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500">監聴 OFF</span>
+                        </div>
+
+                        <label class="flex flex-col gap-1">
+                            <span class="text-[11px] text-zinc-400">誰の演奏に、もう一方が合わせますか</span>
+                            <select id="kaSyncRef" onchange="karaokeSaveSettings()"
+                                    class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-xs text-zinc-100 outline-none focus:border-primary">
+                                <option value="host">ホストが基準（伴奏・ホストの演奏に参加者が合わせる）</option>
+                                <option value="participant">参加者が基準（参加者の演奏にホストが合わせる）</option>
+                            </select>
+                        </label>
+                        <p id="kaSyncHint" class="text-[10px] text-zinc-500 leading-relaxed"></p>
+
+                        <!-- ① ホストの演奏を参加者へ届ける -->
+                        <label class="flex items-start gap-2 cursor-pointer bg-zinc-900/60 border border-zinc-700 rounded p-2.5">
+                            <input id="kaHostMicRoute" type="checkbox" onchange="karaokeSaveSettings()" class="accent-emerald-500 w-4 h-4 mt-0.5">
+                            <span class="text-[11px] text-zinc-300 leading-relaxed">
+                                <b>ホストのマイクを参加者へ届ける</b><br>
+                                <span class="text-zinc-500">
+                                    ホストのギターや歌を、参加者の手元モニターへ配ります。
+                                    <b>ONにすると配信を張り直します</b>（マイクの取り込み方が変わるため）。
+                                    取り込みのぶん、ホストの声が少し遅れます。
+                                </span>
+                            </span>
+                        </label>
+
+                        <!-- ② ホストが参加者の音を聴く -->
+                        <div class="flex flex-col gap-2 bg-zinc-900/60 border border-zinc-700 rounded p-2.5">
+                            <label class="flex items-start gap-2 cursor-pointer">
+                                <input id="kaMonitorOn" type="checkbox" onchange="karaokeToggleMonitor()" class="accent-sky-500 w-4 h-4 mt-0.5">
+                                <span class="text-[11px] text-zinc-300 leading-relaxed">
+                                    <b>参加者の音を聴く（監聴）</b><br>
+                                    <span class="text-zinc-500">
+                                        参加者の演奏・歌をこの画面で再生します。参加者の演奏に合わせて歌うときに必要です。
+                                        <b class="text-amber-300">ヘッドホンを使ってください。</b>
+                                        スピーカーだとホストのマイクに回り込みます。
+                                    </span>
+                                </span>
+                            </label>
+                            <div class="flex flex-col gap-1">
+                                <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                    <span>監聴の音量</span><span id="kaMonitorVolVal" class="font-mono text-zinc-300">80%</span>
+                                </div>
+                                <input id="kaMonitorVol" type="range" min="0" max="1.5" step="0.05" value="0.8"
+                                       oninput="karaokeSetMonitorVolume(this.value)" class="w-full accent-sky-500">
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- 伴奏（タスク27-B）: YouTube等をカラオケの伴奏に使う -->
                     <div class="border-t border-border pt-3 flex flex-col gap-3">
                         <div class="flex items-center justify-between gap-2 flex-wrap">
@@ -5255,6 +5311,7 @@ registerProcessor('mic-sender', MicSender);
             set('kaReverb', k.reverb);
             set('kaMaster', k.master_volume);
             set('kaOffset', k.offset_ms);
+            set('kaSyncRef', k.sync_reference);
             document.getElementById('kaMasterVal').innerText = Number(k.master_volume).toFixed(2);
             document.getElementById('kaOffsetVal').innerText = `${k.offset_ms} ms`;
         }
@@ -5279,6 +5336,8 @@ registerProcessor('mic-sender', MicSender);
                 reverb: document.getElementById('kaReverb').value,
                 master_volume: parseFloat(document.getElementById('kaMaster').value),
                 offset_ms: parseInt(document.getElementById('kaOffset').value, 10),
+                sync_reference: document.getElementById('kaSyncRef').value,
+                host_mic_route: document.getElementById('kaHostMicRoute').checked,
             };
             try {
                 const res = await fetch(`${apiBase}/api/karaoke`, {
@@ -5339,6 +5398,7 @@ registerProcessor('mic-sender', MicSender);
         function karaokeRenderHost(k) {
             if (!k) return;
             karaokeApplyHostSettings(k);
+            karaokeRenderSync(k);
 
             const pipe = document.getElementById('kaPipeState');
             if (pipe) {
@@ -5478,6 +5538,7 @@ registerProcessor('mic-sender', MicSender);
                     ka.hostView = true;
                     karaokeApplyGuestView({ enabled: data.karaoke.enabled });
                     karaokeRenderHost(data.karaoke);
+                    ka.hostMicRoute = !!data.host_mic_route;
                     karaokeRenderHostMic(data.host_mic);
                     if (data.karaoke.bgm) karaokeRenderBgm(data.karaoke.bgm);
                 } else {
@@ -5603,6 +5664,8 @@ registerProcessor('mic-sender', MicSender);
                     }
                     sel.value = hm.device;
                 }
+                const route = document.getElementById('kaHostMicRoute');
+                if (route && route.checked !== !!ka.hostMicRoute) route.checked = !!ka.hostMicRoute;
                 const vol = document.getElementById('kaHostMicVol');
                 if (vol && parseFloat(vol.value) !== hm.volume) {
                     vol.value = hm.volume;
@@ -5868,6 +5931,171 @@ registerProcessor('mic-sender', MicSender);
                 if (t) t.innerText = `${karaokeFmtTime(b.position)} / ${karaokeFmtTime(b.duration)}`;
             }
         }
+
+
+        // ===================================================================
+        // タスク27-C-②: ホストの監聴（参加者の音をこの画面で聴く）
+        //
+        // ★参加者としてではなく role:"monitor" で繋ぐ。
+        //   参加者一覧には出ないし、こちらから音は送らない。
+        // ★ホストPCからの接続だけがサーバに受理される。
+        // ===================================================================
+        const KARAOKE_DOWNSTREAM_MONITOR = 2;
+
+        const kaMon = {
+            ws: null, ac: null, gain: null, next: 0, activeAt: 0,
+            pingTimer: null, lastRtt: 0, jitter: 0, prevRtt: null, netAt: 0,
+        };
+
+        function karaokeSetMonitorVolume(v) {
+            document.getElementById('kaMonitorVolVal').innerText =
+                `${Math.round(parseFloat(v) * 100)}%`;
+            if (kaMon.gain) kaMon.gain.gain.value = parseFloat(v);
+        }
+
+        async function karaokeToggleMonitor() {
+            const on = document.getElementById('kaMonitorOn').checked;
+            if (!on) { karaokeStopMonitor(); return; }
+            try {
+                const Ctx = window.AudioContext || window.webkitAudioContext;
+                kaMon.ac = new Ctx({ sampleRate: KARAOKE_SAMPLE_RATE, latencyHint: 'interactive' });
+                if (kaMon.ac.state === 'suspended') await kaMon.ac.resume();
+                kaMon.gain = kaMon.ac.createGain();
+                kaMon.gain.gain.value = parseFloat(document.getElementById('kaMonitorVol').value || '0.8');
+                kaMon.gain.connect(kaMon.ac.destination);
+                kaMon.next = 0;
+                await karaokeOpenMonitorSocket();
+                showToast('監聴を開始しました（ヘッドホンを使ってください）', 'success');
+            } catch (e) {
+                document.getElementById('kaMonitorOn').checked = false;
+                karaokeStopMonitor();
+                showToast(`監聴を開始できません: ${e.message || e}`, 'danger');
+            }
+        }
+
+        function karaokeOpenMonitorSocket() {
+            return new Promise((resolve, reject) => {
+                let ws;
+                try { ws = new WebSocket(karaokeWsUrl()); } catch (e) { reject(e); return; }
+                ws.binaryType = 'arraybuffer';
+                let settled = false;
+                ws.onopen = () => ws.send(JSON.stringify({
+                    type: 'hello', role: 'monitor', password: getStoredWebPassword() || '',
+                }));
+                ws.onmessage = (ev) => {
+                    if (typeof ev.data !== 'string') { karaokeOnMonitorAudio(ev.data); return; }
+                    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+                    if (m.type === 'pong') karaokeOnMonitorPong(m);
+                    if (!settled && (m.type === 'welcome' || m.type === 'error')) {
+                        settled = true;
+                        if (m.type === 'welcome') { karaokeStartMonitorPing(); resolve(); }
+                        else reject(new Error(m.message || m.code));
+                    }
+                };
+                ws.onerror = () => { if (!settled) { settled = true; reject(new Error('監聴に接続できません')); } };
+                ws.onclose = () => {
+                    kaMon.ws = null;
+                    const chk = document.getElementById('kaMonitorOn');
+                    if (chk && chk.checked) { chk.checked = false; karaokeStopMonitor(); }
+                };
+                kaMon.ws = ws;
+            });
+        }
+
+        function karaokeOnMonitorAudio(buffer) {
+            const view = new Uint8Array(buffer);
+            if (view.length <= KARAOKE_DOWNSTREAM_HEADER) return;
+            if (view[0] !== KARAOKE_DOWNSTREAM_MONITOR) return;
+            if (!kaMon.ac || !kaMon.gain) return;
+            const pcm = new Int16Array(buffer, KARAOKE_DOWNSTREAM_HEADER,
+                                       (view.length - KARAOKE_DOWNSTREAM_HEADER) >> 1);
+            const ac = kaMon.ac;
+            const buf = ac.createBuffer(1, pcm.length, KARAOKE_SAMPLE_RATE);
+            const ch = buf.getChannelData(0);
+            for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+            const now = ac.currentTime;
+            if (kaMon.next < now + 0.01) {
+                kaMon.next = now + KARAOKE_BGM_PREROLL_SEC;
+            } else if (kaMon.next > now + KARAOKE_BGM_MAX_LEAD_SEC) {
+                // 溜まりすぎ。放っておくと監聴だけどんどん遅れて合わせられなくなる。
+                kaMon.next = now + KARAOKE_BGM_PREROLL_SEC;
+            }
+            const src = ac.createBufferSource();
+            src.buffer = buf;
+            src.connect(kaMon.gain);
+            src.start(kaMon.next);
+            kaMon.next += buf.duration;
+            kaMon.activeAt = performance.now();
+        }
+
+        function karaokeStartMonitorPing() {
+            if (kaMon.pingTimer) clearInterval(kaMon.pingTimer);
+            kaMon.pingTimer = setInterval(() => {
+                if (!kaMon.ws || kaMon.ws.readyState !== WebSocket.OPEN) return;
+                kaMon.ws.send(JSON.stringify({ type: 'ping', t: Math.round(performance.now()) }));
+            }, 1000);
+        }
+
+        function karaokeOnMonitorPong(msg) {
+            const rtt = Math.max(0, Math.round(performance.now() - (msg.t || 0)));
+            kaMon.lastRtt = rtt;
+            if (kaMon.prevRtt !== null) {
+                kaMon.jitter = Math.round(kaMon.jitter + (Math.abs(rtt - kaMon.prevRtt) - kaMon.jitter) / 16);
+            }
+            kaMon.prevRtt = rtt;
+            const now = performance.now();
+            if (now - kaMon.netAt > 2000 && kaMon.ws && kaMon.ws.readyState === WebSocket.OPEN) {
+                kaMon.netAt = now;
+                // ★lead は再生バッファの実測先読み量。参加者基準のとき、
+                //   遅延補正をどれだけ正方向へ振ればよいかの 材料 になる。
+                const lead = kaMon.ac
+                    ? Math.max(0, Math.round((kaMon.next - kaMon.ac.currentTime) * 1000)) : 0;
+                kaMon.ws.send(JSON.stringify({
+                    type: 'net', rtt: rtt, jitter: kaMon.jitter, lead: lead }));
+            }
+        }
+
+        function karaokeStopMonitor() {
+            if (kaMon.pingTimer) { clearInterval(kaMon.pingTimer); kaMon.pingTimer = null; }
+            if (kaMon.ws) {
+                try { kaMon.ws.send(JSON.stringify({ type: 'leave' })); } catch (e) {}
+                try { kaMon.ws.close(); } catch (e) {}
+                kaMon.ws = null;
+            }
+            try { if (kaMon.gain) kaMon.gain.disconnect(); } catch (e) {}
+            try { if (kaMon.ac) kaMon.ac.close(); } catch (e) {}
+            kaMon.gain = null; kaMon.ac = null; kaMon.next = 0; kaMon.activeAt = 0;
+        }
+
+        function karaokeMonitorIsLive() {
+            return !!kaMon.activeAt && (performance.now() - kaMon.activeAt) < 1000;
+        }
+
+        // 基準に応じて説明と補正の向きを出し分ける
+        function karaokeRenderSync(k) {
+            if (!k) return;
+            const sel = document.getElementById('kaSyncRef');
+            if (sel && !ka.hostDragging && sel.value !== k.sync_reference) sel.value = k.sync_reference;
+
+            const hint = document.getElementById('kaSyncHint');
+            if (hint) {
+                hint.innerHTML = (k.sync_reference === 'participant')
+                    ? 'ホストが監聴で聴いてから歌うので、<b>ホストの声の方が遅れます</b>。'
+                      + '補正は<b>＋方向</b>（参加者を遅らせる）になります。<b>監聴をONにしてください。</b>'
+                    : '参加者が伴奏やホストの演奏を聴いてから歌うので、<b>歌声が往復ぶん遅れます</b>。'
+                      + '補正は<b>−方向</b>（歌声を早める）になります。';
+            }
+
+            const badge = document.getElementById('kaMonitorState');
+            if (badge) {
+                const live = karaokeMonitorIsLive();
+                badge.innerText = kaMon.ws ? (live ? `監聴中 ${kaMon.lastRtt}ms` : '監聴 待機') : '監聴 OFF';
+                badge.className = 'text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 '
+                    + (live ? 'text-sky-300' : 'text-zinc-500');
+            }
+        }
+
+        window.addEventListener('beforeunload', () => karaokeStopMonitor());
 
     </script>
 </body>

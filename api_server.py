@@ -909,6 +909,8 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 "host_view": True,
                 "karaoke": self.streamer_core.karaoke.status_snapshot(),
                 "host_mic": self.streamer_core.get_host_mic_state(request_level=True),
+                "host_mic_route": bool(self.streamer_core.config.get(
+                    "karaoke_host_mic_route", False)),
             })
             return
 
@@ -1498,6 +1500,8 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     master_volume=body_json.get("master_volume"),
                     reverb=body_json.get("reverb"),
                     offset_ms=body_json.get("offset_ms"),
+                    sync_reference=body_json.get("sync_reference"),
+                    host_mic_route=body_json.get("host_mic_route"),
                 )
                 self.send_json_response(200, {"success": True, "settings": settings,
                                               "karaoke": session.status_snapshot()})
@@ -1584,16 +1588,17 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             if action == "offset_auto":
-                # 歌い手は伴奏を下りで受け取ってから歌うので、往復ぶん戻すのが理論値。
-                suggested = self.streamer_core.suggest_karaoke_offset()
+                # ★基準によって符号が逆になる（remote_mic の設計メモ参照）。
+                #   ホスト基準   … 歌声を早める（負）
+                #   参加者基準   … 参加者を遅らせる（正）
+                suggested, why = self.streamer_core.suggest_karaoke_offset()
                 if suggested is None:
-                    self.send_json_response(400, {
-                        "success": False,
-                        "message": "ON AIR の参加者の回線品質がまだ測れていません"})
+                    self.send_json_response(400, {"success": False, "message": why})
                     return
                 settings = self.streamer_core.set_karaoke_settings(offset_ms=suggested)
                 self.send_json_response(200, {
-                    "success": True, "settings": settings, "applied_offset_ms": suggested,
+                    "success": True, "settings": settings,
+                    "applied_offset_ms": suggested, "reason": why,
                     "karaoke": session.status_snapshot(),
                 })
                 return

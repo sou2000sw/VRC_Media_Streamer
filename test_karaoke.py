@@ -1186,14 +1186,16 @@ def test_offset_suggestion_is_negative_rtt():
 
     class _Core:
         karaoke = KaraokeSession()
+        config = {"karaoke_host_mic_route": False}
 
     c = _Core()
     for i, rtt in enumerate((40, 60, 80)):
         p, _ = c.karaoke.add_participant(f"id{i}", f"P{i}")
         p.state = STATE_ACTIVE
         p.rtt_ms = rtt
-    got = streamer_core.StreamerCore.suggest_karaoke_offset(c)
+    got, why = streamer_core.StreamerCore.suggest_karaoke_offset(c)
     assert got == -60, got          # 中央値 60ms の符号反転
+    assert "60" in why
     c.karaoke.stop()
 
 
@@ -1202,12 +1204,13 @@ def test_offset_suggestion_needs_active_participants():
 
     class _Core:
         karaoke = KaraokeSession()
+        config = {"karaoke_host_mic_route": False}
 
     c = _Core()
-    assert streamer_core.StreamerCore.suggest_karaoke_offset(c) is None
+    assert streamer_core.StreamerCore.suggest_karaoke_offset(c)[0] is None
     p, _ = c.karaoke.add_participant("id", "P")   # 挙手中のまま
     p.rtt_ms = 50
-    assert streamer_core.StreamerCore.suggest_karaoke_offset(c) is None
+    assert streamer_core.StreamerCore.suggest_karaoke_offset(c)[0] is None
     c.karaoke.stop()
 
 
@@ -1250,3 +1253,346 @@ def test_recording_names_do_not_collide(session):
     session.stop()
     assert first != second, "同じ秒に録り直すと前のテイクが消える"
     assert os.path.exists(first) and os.path.exists(second)
+
+
+# ---------------------------------------------------------------------------
+# 14. 生演奏の合わせ（タスク27-C）
+#
+# ★成立の条件は「相手の演奏が聴けること」。片方向でも欠けると合奏にならない。
+#   ①ホストの演奏 → 参加者へ    ②参加者の演奏 → ホストへ（監聴）
+#   そして **どちらも「自分の音」は返さない**（返ると山びこで演奏できない）。
+# ---------------------------------------------------------------------------
+import math as _math
+from remote_mic import (MonitorClient, DownstreamSender, DOWNSTREAM_TYPE_MONITOR,
+                        SYNC_REFERENCE_HOST, SYNC_REFERENCE_PARTICIPANT,
+                        HOST_MIC_CAPTURE_LATENCY_MS)
+
+
+class _Tone:
+    """取り込み器のふり。指定周波数のステレオを実時間ぶん返す。"""
+
+    def __init__(self, freq=880, amp=9000):
+        self.phase = 0.0
+        self.step = 2 * _math.pi * freq / SAMPLE_RATE
+        self.amp = amp
+
+    def take(self, n):
+        a = array.array("h")
+        for _ in range(n):
+            v = int(self.amp * _math.sin(self.phase))
+            a.extend((v, v))
+            self.phase += self.step
+        return a
+
+
+class _Collector:
+    def __init__(self):
+        self.frames = []
+
+    def send_binary(self, data):
+        self.frames.append(data)
+
+
+def _goertzel(pcm, freq, rate=SAMPLE_RATE):
+    """特定周波数の強さ。混ざっていないことを「聞かずに」確かめるために使う。"""
+    n = min(len(pcm), rate)
+    if n < 1000:
+        return 0.0
+    k = int(0.5 + n * freq / rate)
+    w = 2 * _math.pi * k / n
+    coeff = 2 * _math.cos(w)
+    s1 = s2 = 0.0
+    for i in range(n):
+        s0 = pcm[i] + coeff * s1 - s2
+        s2, s1 = s1, s0
+    return _math.sqrt(abs(s1 * s1 + s2 * s2 - coeff * s1 * s2)) / n
+
+
+def _collect(frames, want_type):
+    out = array.array("h")
+    for f in frames:
+        if f[0] == want_type:
+            out.frombytes(f[DOWNSTREAM_HEADER:])
+    return out
+
+
+def test_host_performance_reaches_participants(session):
+    """① ホストの演奏が ON AIR の参加者へ届くこと。"""
+    session.configure(approval_required=False)
+    session.host_mic_source = _Tone(freq=880)
+    sink = _Collector()
+    session.add_participant("p", "歌い手", conn=sink)
+    session.set_state("p", STATE_ACTIVE)
+    session.ensure_mixer()
+    time.sleep(1.2)
+    session.stop()
+
+    pcm = _collect(sink.frames, DOWNSTREAM_TYPE_BGM)
+    assert pcm, "参加者へ何も届いていない"
+    assert _goertzel(pcm, 880) > 100, "ホストの演奏が入っていない"
+
+
+def test_participants_do_not_hear_themselves(session):
+    """参加者へ返す音に、その参加者自身の声を混ぜないこと。
+
+    自分の声が往復ぶん遅れて返ってくると、まず歌えない。
+    """
+    session.configure(approval_required=False)
+    session.host_mic_source = _Tone(freq=880)
+    sink = _Collector()
+    session.add_participant("p", "歌い手", conn=sink)
+    session.set_state("p", STATE_ACTIVE)
+    session.ensure_mixer()
+
+    ph, st = 0.0, 2 * _math.pi * 440 / SAMPLE_RATE
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 1.4:
+        a = array.array("h")
+        for _ in range(FRAMES_PER_TICK):
+            a.append(int(8000 * _math.sin(ph)))
+            ph += st
+        session.push_audio("p", a.tobytes())
+        time.sleep(0.02)
+    session.stop()
+
+    pcm = _collect(sink.frames, DOWNSTREAM_TYPE_BGM)
+    host = _goertzel(pcm, 880)
+    own = _goertzel(pcm, 440)
+    assert host > 100, "ホストの演奏が入っていない"
+    assert own < host * 0.1, f"自分の声が返っている（山びこ）: own={own} host={host}"
+
+
+def test_monitor_receives_participants(session):
+    """② 参加者の演奏がホストの監聴へ届くこと。"""
+    session.configure(approval_required=False)
+    sink = _Collector()
+    session.add_participant("p", "演奏者")
+    session.set_state("p", STATE_ACTIVE)
+    session.add_monitor("m", conn=sink)
+    session.ensure_mixer()
+
+    ph, st = 0.0, 2 * _math.pi * 440 / SAMPLE_RATE
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 1.4:
+        a = array.array("h")
+        for _ in range(FRAMES_PER_TICK):
+            a.append(int(8000 * _math.sin(ph)))
+            ph += st
+        session.push_audio("p", a.tobytes())
+        time.sleep(0.02)
+    session.stop()
+
+    pcm = _collect(sink.frames, DOWNSTREAM_TYPE_MONITOR)
+    assert pcm, "監聴へ何も届いていない"
+    assert _goertzel(pcm, 440) > 100, "参加者の演奏が入っていない"
+
+
+def test_monitor_does_not_hear_the_host_own_mic(session):
+    """監聴にホスト自身のマイクを混ぜないこと。
+
+    自分の声が遅れて返ると、参加者の演奏に合わせて歌えない。ここが②の肝。
+    """
+    session.configure(approval_required=False)
+    session.host_mic_source = _Tone(freq=880)
+    sink = _Collector()
+    session.add_participant("p", "演奏者")
+    session.set_state("p", STATE_ACTIVE)
+    session.add_monitor("m", conn=sink)
+    session.ensure_mixer()
+
+    ph, st = 0.0, 2 * _math.pi * 440 / SAMPLE_RATE
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 1.4:
+        a = array.array("h")
+        for _ in range(FRAMES_PER_TICK):
+            a.append(int(8000 * _math.sin(ph)))
+            ph += st
+        session.push_audio("p", a.tobytes())
+        time.sleep(0.02)
+    session.stop()
+
+    pcm = _collect(sink.frames, DOWNSTREAM_TYPE_MONITOR)
+    part = _goertzel(pcm, 440)
+    own = _goertzel(pcm, 880)
+    assert part > 100, "参加者の演奏が入っていない"
+    assert own < part * 0.1, f"ホスト自身のマイクが返っている: own={own} part={part}"
+
+
+def test_downstream_types_are_not_mixed_up(session):
+    """参加者向けと監聴向けが取り違えられないこと。"""
+    session.configure(approval_required=False)
+    session.host_mic_source = _Tone(freq=880)
+    to_part, to_mon = _Collector(), _Collector()
+    session.add_participant("p", "歌い手", conn=to_part)
+    session.set_state("p", STATE_ACTIVE)
+    session.add_monitor("m", conn=to_mon)
+    session.ensure_mixer()
+    session.push_audio("p", array.array("h", [1000] * FRAMES_PER_TICK).tobytes())
+    time.sleep(1.0)
+    session.stop()
+
+    assert to_part.frames and to_mon.frames
+    assert all(f[0] == DOWNSTREAM_TYPE_BGM for f in to_part.frames)
+    assert all(f[0] == DOWNSTREAM_TYPE_MONITOR for f in to_mon.frames)
+
+
+def test_monitor_is_not_a_participant(session):
+    """監聴は参加者一覧に出ないこと（人数にも数えない）。"""
+    session.add_monitor("m")
+    snap = session.status_snapshot()
+    assert snap["participants"] == []
+    assert len(snap["monitors"]) == 1
+    session.remove_monitor("m")
+    assert session.status_snapshot()["monitors"] == []
+
+
+def test_host_mic_bus_uses_the_bgm_side_delay(session):
+    """ホストのマイクは伴奏側と同じ固定 500ms。遅延補正では動かないこと。"""
+    base = ms_to_frames(KARAOKE_BASE_DELAY_MS)
+    assert session._host_mic_delay._delay_frames == base
+    session.configure(offset_ms=-400)
+    assert session._delay_line._delay_frames == ms_to_frames(KARAOKE_BASE_DELAY_MS - 400)
+    assert session._host_mic_delay._delay_frames == base, "ホストマイクまで動いている"
+
+
+# ---------------------------------------------------------------------------
+# 遅延補正の符号（基準で逆になる）
+# ---------------------------------------------------------------------------
+def _core_with(session, reference, host_mic_route=False):
+    import streamer_core
+
+    class _Core:
+        pass
+
+    c = _Core()
+    c.karaoke = session
+    c.config = {"karaoke_host_mic_route": host_mic_route}
+    session.configure(sync_reference=reference)
+    return c, streamer_core.StreamerCore.suggest_karaoke_offset
+
+
+def test_offset_sign_flips_with_the_reference(session):
+    """★基準で符号が逆になること。ここを取り違えるとズレが倍になる。
+
+    ・ホスト基準   … 参加者が往復ぶん遅れる → 歌声を早める（負）
+    ・参加者基準   … ホストが監聴ぶん遅れる → 参加者を遅らせる（正）
+    """
+    session.configure(approval_required=False)
+    p, _ = session.add_participant("p", "歌い手")
+    p.state = STATE_ACTIVE
+    p.rtt_ms = 60
+
+    c, suggest = _core_with(session, SYNC_REFERENCE_HOST)
+    host_val, host_why = suggest(c)
+    assert host_val == -60, host_val
+
+    m = session.add_monitor("m")
+    m.lead_ms = 180
+    m.rtt_ms = 4
+    c, suggest = _core_with(session, SYNC_REFERENCE_PARTICIPANT)
+    part_val, part_why = suggest(c)
+    assert part_val == 182, part_val        # lead 180 + 片道RTT 2
+    assert host_val < 0 < part_val, "符号が逆になっていない"
+
+
+def test_offset_participant_reference_adds_capture_latency(session):
+    """ホストのマイクを Python 経由にしたぶんの遅れも足すこと。"""
+    m = session.add_monitor("m")
+    m.lead_ms = 100
+    m.rtt_ms = 0
+    c, suggest = _core_with(session, SYNC_REFERENCE_PARTICIPANT, host_mic_route=True)
+    val, why = suggest(c)
+    assert val == 100 + HOST_MIC_CAPTURE_LATENCY_MS, val
+
+
+def test_offset_participant_reference_needs_the_monitor(session):
+    """監聴が動いていなければ測れない、と正直に言うこと。"""
+    c, suggest = _core_with(session, SYNC_REFERENCE_PARTICIPANT)
+    val, why = suggest(c)
+    assert val is None
+    assert "監聴" in why
+
+
+def test_sync_reference_is_clamped_to_known_values(session):
+    assert session.configure(sync_reference="でたらめ")["sync_reference"] == SYNC_REFERENCE_HOST
+    assert session.configure(sync_reference="participant")["sync_reference"] == \
+        SYNC_REFERENCE_PARTICIPANT
+
+
+# ---------------------------------------------------------------------------
+# ホストマイクの経路切り替え
+# ---------------------------------------------------------------------------
+def test_host_mic_capture_command_emits_pcm():
+    """取り込みモードでは生PCMを stdout へ流すこと。"""
+    cmd = streamer_core.build_host_mic_level_cmd("Mic A", ffmpeg="ffmpeg", capture=True)
+    assert cmd[-1] == "-", "stdout へ出していない"
+    assert "s16le" in cmd
+    assert cmd[cmd.index("-ar") + 1] == str(SAMPLE_RATE)
+    assert cmd[cmd.index("-ac") + 1] == str(OUTPUT_CHANNELS)
+    # レベルも同時に取れること（卓のVUを止めない）
+    assert any("astats" in a for a in cmd)
+
+
+def test_host_mic_level_only_command_saves_nothing():
+    cmd = streamer_core.build_host_mic_level_cmd("Mic A", ffmpeg="ffmpeg", capture=False)
+    assert cmd[-2:] == ["-f", "null"] or cmd[-3:-1] == ["-f", "null"]
+    assert "s16le" not in cmd
+
+
+def test_host_mic_take_is_none_without_capture():
+    mon = streamer_core.HostMicMonitor()
+    assert mon.take(FRAMES_PER_TICK) is None
+
+
+def test_host_mic_routing_needs_all_three_conditions():
+    """カラオケ有効・経路ON・デバイス選択、の3つが揃ったときだけ経由すること。"""
+    import streamer_core as sc
+
+    class _Core:
+        pass
+
+    c = _Core()
+    c.karaoke = KaraokeSession()
+    check = sc.StreamerCore.karaoke_host_mic_is_routed
+
+    c.config = {"karaoke_host_mic_route": True, "live_audio_mic_device": "Mic A"}
+    c.karaoke.enabled = False
+    assert check(c) is False, "カラオケが無効なのに経由している"
+
+    c.karaoke.enabled = True
+    c.config["karaoke_host_mic_route"] = False
+    assert check(c) is False
+
+    c.config["karaoke_host_mic_route"] = True
+    c.config["live_audio_mic_device"] = ""
+    assert check(c) is False
+
+    c.config["live_audio_mic_device"] = "Mic A"
+    assert check(c) is True
+    c.karaoke.stop()
+
+
+def test_ui_has_reference_and_monitor_controls():
+    html = _ui_html()
+    for needle in ('id="kaSyncRef"', 'id="kaHostMicRoute"', 'id="kaMonitorOn"',
+                   'id="kaMonitorVol"', 'karaokeToggleMonitor()',
+                   'karaokeOnMonitorAudio', "role: 'monitor'"):
+        assert needle in html, needle
+
+
+def test_ui_explains_that_the_sign_flips():
+    """符号が逆になることを画面で説明していること。ここは必ず混乱する。"""
+    html = _ui_html()
+    i = html.index("function karaokeRenderSync")
+    block = html[i:i + 1200]
+    assert "＋方向" in block and "−方向" in block
+
+
+def test_monitor_role_is_localhost_only():
+    """監聴はホストPCからのみ。開けると参加者どうしが盗み聴きできる。"""
+    with io.open(os.path.join(BASE_DIR, "karaoke_ws.py"), encoding="utf-8") as f:
+        src = f.read()
+    i = src.index('== "monitor"')
+    block = src[i:i + 400]
+    assert "is_local_request()" in block
+    assert "forbidden" in block

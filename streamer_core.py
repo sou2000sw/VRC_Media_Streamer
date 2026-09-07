@@ -157,6 +157,13 @@ DEFAULT_CONFIG = {
     "karaoke_master_volume": 1.0,        # 歌声バス全体（0.0〜2.0）
     "karaoke_reverb": "off",             # "off" | "weak" | "mid" | "strong"
     "karaoke_offset_ms": 0,              # 遅延補正（-500〜+500）
+    # タスク27-C: 誰の演奏に、もう一方が合わせるか。**補正の符号がこれで変わる。**
+    #   "host"        … ホストの伴奏/演奏に参加者が合わせる（既定）
+    #   "participant" … 参加者の演奏にホストが合わせる
+    "karaoke_sync_reference": "host",
+    # ホストのマイクを Python 経由にするか。ON にすると参加者がホストの演奏を
+    # 聴けるようになる代わりに、取り込みの分だけホストの声が遅れる。
+    "karaoke_host_mic_route": False,
     "screen_capture_source_type": "display",   # "display" | "window"
     "screen_capture_display_index": 0,
     "screen_capture_window_title": "",
@@ -744,23 +751,42 @@ def build_audio_inputs_with_remote_mic(app_enabled=False, app_volume=1.0,
 HOST_MIC_LEVEL_STALE_SEC = 2.0     # これより古いレベルは「来ていない」扱い
 HOST_MIC_IDLE_STOP_SEC = 6.0       # 要求が途絶えてから止まるまで
 HOST_MIC_DB_FLOOR = -100.0         # これ以下は無音とみなす
+# 取り込みモードの控え（20ms×10 = 0.2秒）。ライブ入力なので深くしても意味はなく、
+# 深いぶんだけホストの声が遅れて配信に乗るだけ。
+HOST_MIC_QUEUE_TICKS = 10
 
 
-def build_host_mic_level_cmd(device, ffmpeg=None):
-    """マイクのレベルだけを吐く ffmpeg コマンド。出力は null（音は保存しない）。
+def clamp_offset(v):
+    """遅延補正をスライダの可動域へ丸める。"""
+    return max(KARAOKE_OFFSET_MIN_MS, min(KARAOKE_OFFSET_MAX_MS, int(v)))
 
-    astats が 1 フレームごとに dB を出し、ametadata がその値だけを 1 行で印字する。
-    実測で 21 行/秒。key を絞らないと 1 フレームにつき数十行出て読めたものではない。
+
+def build_host_mic_level_cmd(device, ffmpeg=None, capture=False):
+    """マイクを読む ffmpeg コマンド。
+
+    capture=False … レベルだけを測る。出力は null（音はどこにも保存しない）
+    capture=True  … レベルに加え、**生PCMを stdout へ**流す（タスク27-C-①）。
+                    ホストの演奏を参加者へ配るには、Python が音を持つ必要がある。
+
+    astats が 1 フレームごとに dB を出し、ametadata がその値だけを 1 行で印字する
+    （実測 21 行/秒）。key を絞らないと 1 フレームにつき数十行出て読めたものではない。
+    どちらのモードでもフィルタは同じで、**変わるのは出口だけ**。
     """
-    return [
+    cmd = [
         (ffmpeg or get_ffmpeg_cmd()), "-hide_banner", "-v", "info",
         "-f", "dshow", "-audio_buffer_size", "50",
         "-i", f"audio={device}",
         "-af", ("astats=metadata=1:reset=1,"
                 "ametadata=print:key=lavfi.astats.Overall.RMS_level,"
                 "ametadata=print:key=lavfi.astats.Overall.Peak_level"),
-        "-f", "null", "-"
     ]
+    if capture:
+        cmd += ["-f", "s16le",
+                "-ar", str(remote_mic.SAMPLE_RATE),
+                "-ac", str(remote_mic.OUTPUT_CHANNELS), "-"]
+    else:
+        cmd += ["-f", "null", "-"]
+    return cmd
 
 
 def _db_to_linear(text):
@@ -788,24 +814,52 @@ class HostMicMonitor:
         self._lock = threading.Lock()
         self._proc = None
         self._device = ""
+        self._capture = False
         self._deadline = 0.0
         self._level = {"peak": 0.0, "rms": 0.0, "ts": 0.0}
         self._watchdog = None
+        # 取り込みモードのときの音の控え。溜まりすぎたら古い方を捨てる
+        # （ライブ入力なので、遅れた音を後生大事に持っていても意味がない）。
+        self._pcm = collections.deque(maxlen=HOST_MIC_QUEUE_TICKS)
 
     # ------------------------------------------------------------------
-    def request(self, device):
-        """卓が開いている間、繰り返し呼ぶ。必要なら起動し、期限を延ばす。"""
+    def request(self, device, capture=False):
+        """卓が開いている間、繰り返し呼ぶ。必要なら起動し、期限を延ばす。
+
+        capture=True のときは、レベルに加えて音そのものも取り込む
+        （＝参加者へ配れるようになる）。モードが変わったら立て直す。
+        """
         device = str(device or "").strip()
+        capture = bool(capture)
         with self._lock:
-            self._deadline = time.time() + HOST_MIC_IDLE_STOP_SEC
+            # ★取り込みモードのときは期限で止めない。卓を閉じても配信は続くので、
+            #   勝手に止まるとホストの演奏が配信から消える。
+            self._deadline = (float("inf") if capture
+                              else time.time() + HOST_MIC_IDLE_STOP_SEC)
             if not device:
                 self._stop_locked()
                 return
-            if self._proc and self._proc.poll() is None and self._device == device:
+            if (self._proc and self._proc.poll() is None
+                    and self._device == device and self._capture == capture):
                 return
-            # デバイスが変わった / 落ちていた -> 立て直す
+            # デバイスかモードが変わった / 落ちていた -> 立て直す
             self._stop_locked()
-            self._start_locked(device)
+            self._start_locked(device, capture)
+
+    def take(self, n_frames):
+        """ミキサ用。ステレオ interleaved の array('h')。無ければ None。"""
+        with self._lock:
+            if not self._capture or not self._pcm:
+                return None
+            chunk = self._pcm.popleft()
+        out = array.array("h")
+        out.frombytes(chunk)
+        need = n_frames * remote_mic.OUTPUT_CHANNELS
+        if len(out) < need:
+            out.extend([0] * (need - len(out)))
+        if sys.byteorder != "little":
+            out.byteswap()
+        return out
 
     def level(self):
         """UI用。古ければ 0 を返し、fresh=False で「来ていない」と伝える。"""
@@ -829,33 +883,63 @@ class HostMicMonitor:
             self._stop_locked()
 
     # ------------------------------------------------------------------
-    def _start_locked(self, device):
+    def _start_locked(self, device, capture=False):
         try:
             self._proc = subprocess.Popen(
-                build_host_mic_level_cmd(device),
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                build_host_mic_level_cmd(device, capture=capture),
+                stdin=subprocess.DEVNULL,
+                stdout=(subprocess.PIPE if capture else subprocess.DEVNULL),
                 stderr=subprocess.PIPE, bufsize=0,
                 creationflags=CREATE_NO_WINDOW)
         except Exception as e:
-            log_print(f"[HostMic] レベル監視を起動できません: {e}")
+            log_print(f"[HostMic] 取り込みを起動できません: {e}")
             self._proc = None
             return
         self._device = device
+        self._capture = capture
+        self._pcm.clear()
         self._level = {"peak": 0.0, "rms": 0.0, "ts": 0.0}
         threading.Thread(target=self._pump, args=(self._proc,),
                          name="hostmic-level", daemon=True).start()
+        if capture:
+            threading.Thread(target=self._pump_pcm, args=(self._proc,),
+                             name="hostmic-pcm", daemon=True).start()
         if not (self._watchdog and self._watchdog.is_alive()):
             self._watchdog = threading.Thread(target=self._idle_watch,
                                               name="hostmic-idle", daemon=True)
             self._watchdog.start()
-        log_print(f"[HostMic] レベル監視を開始: {device!r}")
+        log_print(f"[HostMic] {'取り込み' if capture else 'レベル監視'}を開始: {device!r}")
+
+    def _pump_pcm(self, proc):
+        """生PCMを 20ms 単位で控えへ。★読み続けないと ffmpeg が詰まって止まる。"""
+        chunk_bytes = (remote_mic.FRAMES_PER_TICK * remote_mic.OUTPUT_CHANNELS
+                       * remote_mic.BYTES_PER_SAMPLE)
+        try:
+            while True:
+                data = proc.stdout.read(chunk_bytes)
+                if not data:
+                    break
+                with self._lock:
+                    if self._proc is not proc:
+                        return
+                    self._pcm.append(data)      # maxlen で古い方が自然に落ちる
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
     def _stop_locked(self):
         proc, self._proc = self._proc, None
+        was = self._capture
         self._device = ""
+        self._capture = False
+        self._pcm.clear()
         if proc:
             kill_proc(proc)
-            log_print("[HostMic] レベル監視を停止")
+            log_print(f"[HostMic] {'取り込み' if was else 'レベル監視'}を停止")
 
     def _pump(self, proc):
         """★stderr は最後まで読み続けること。読まないとバッファが詰まって止まる。"""
@@ -2475,6 +2559,8 @@ class StreamerCore:
             master_volume=self.config.get("karaoke_master_volume", 1.0),
             reverb=str(self.config.get("karaoke_reverb", "off")),
             offset_ms=self.config.get("karaoke_offset_ms", 0),
+            sync_reference=str(self.config.get("karaoke_sync_reference", "host")),
+            host_mic_volume=self.config.get("live_audio_mic_volume", 1.0),
         )
         if self.karaoke.enabled:
             self.karaoke.ensure_mixer()
@@ -2529,23 +2615,34 @@ class StreamerCore:
 
     def set_karaoke_settings(self, enabled=None, approval_required=None,
                              latency_mode=None, master_volume=None,
-                             reverb=None, offset_ms=None):
+                             reverb=None, offset_ms=None,
+                             sync_reference=None, host_mic_route=None):
         """カラオケ設定を更新して config へ焼く。戻り値は現在の設定。
 
         ★音量・PAN・リバーブ・遅延補正は **配信中に変えても配信は途切れない**。
           ミックスを Python 側で行っているので、FFmpeg のフィルタグラフを
           作り直す必要がないため。
         """
+        if host_mic_route is not None:
+            # ★経路を変えると FFmpeg の入力構成が変わるので、配信を張り直す。
+            #   dshow はプロセス起動時にデバイスを掴むため、これは避けられない。
+            changed = bool(host_mic_route) != bool(
+                self.config.get("karaoke_host_mic_route", False))
+            self.config["karaoke_host_mic_route"] = bool(host_mic_route)
+            if changed:
+                self.request_stream_reload()
         settings = self.karaoke.configure(
             enabled=enabled, approval_required=approval_required,
             latency_mode=latency_mode, master_volume=master_volume,
-            reverb=reverb, offset_ms=offset_ms)
+            reverb=reverb, offset_ms=offset_ms,
+            sync_reference=sync_reference)
         self.config["karaoke_enabled"] = settings["enabled"]
         self.config["karaoke_approval_required"] = settings["approval_required"]
         self.config["karaoke_latency_mode"] = settings["latency_mode"]
         self.config["karaoke_master_volume"] = settings["master_volume"]
         self.config["karaoke_reverb"] = settings["reverb"]
         self.config["karaoke_offset_ms"] = settings["offset_ms"]
+        self.config["karaoke_sync_reference"] = settings["sync_reference"]
         self.save_config()
 
         if settings["enabled"]:
@@ -2605,20 +2702,48 @@ class StreamerCore:
         return {"success": True, "bgm": snap}
 
     def suggest_karaoke_offset(self):
-        """遅延補正の推奨値を返す。
+        """遅延補正の推奨値を返す。**基準によって符号が逆になる。**
 
-        歌い手は伴奏を**下り**で受け取ってから歌い、その声が**上り**で戻る。
-        つまり往復（RTT）ぶんだけ歌声が遅れて届くので、理論値は offset ≒ −RTT。
-        RTT は参加者が毎秒報告しているので、ON AIR の人の中央値を使う。
+        ★ホスト基準（伴奏やホストの演奏に参加者が合わせる）
+          歌い手は基準音を下りで受け取ってから歌い、その声が上りで戻る。
+          往復ぶん歌声が遅れて届くので **offset ≒ −RTT**（歌声を早める）。
+
+        ★参加者基準（参加者の演奏にホストが合わせる）
+          ホストは監聴で聴いてから歌うので、**ホストの声の方が遅れる**。
+          釣り合わせるには参加者側を遅らせる必要があり **offset ≒ ＋監聴遅延**。
+          監聴遅延はクライアントが報告する再生バッファ＋片道RTTの実測値を使い、
+          ホストマイクの取り込み分を足す。
+
+        戻り値は (推奨値, 根拠の文字列)。測れなければ (None, 理由)。
         """
+        ref = self.karaoke.sync_reference
+        if ref == remote_mic.SYNC_REFERENCE_PARTICIPANT:
+            mon = self.karaoke.monitor_latency_ms()
+            if mon is None:
+                return (None, "ホストの監聴が動いていないため測れません（監聴をONにしてください）")
+            cap = (remote_mic.HOST_MIC_CAPTURE_LATENCY_MS
+                   if self.config.get("karaoke_host_mic_route", False) else 0)
+            value = int(clamp_offset(mon + cap))
+            return (value, f"監聴 {mon}ms + マイク取り込み {cap}ms")
+
         with self.karaoke._lock:
             rtts = [p.rtt_ms for p in self.karaoke.participants.values()
                     if p.state == "active" and p.rtt_ms > 0]
         if not rtts:
-            return None
+            return (None, "ON AIR の参加者の回線品質がまだ測れていません")
         rtts.sort()
         median = rtts[len(rtts) // 2]
-        return int(max(KARAOKE_OFFSET_MIN_MS, min(KARAOKE_OFFSET_MAX_MS, -median)))
+        return (int(clamp_offset(-median)), f"参加者の往復 {median}ms ぶんを戻す")
+
+    def karaoke_host_mic_is_routed(self):
+        """ホストのマイクを Python 経由にするか。
+
+        カラオケが有効で、経路がONで、デバイスが選ばれているときだけ。
+        3つ揃わなければ従来どおり dshow から FFmpeg へ直行する。
+        """
+        return bool(self.karaoke.enabled
+                    and self.config.get("karaoke_host_mic_route", False)
+                    and str(self.config.get("live_audio_mic_device", "")).strip())
 
     def start_karaoke_pipe(self):
         """配信を起こす直前に呼ぶ。(パイプ名, sink) を返す。カラオケ無効なら (None, None)。
@@ -5263,6 +5388,20 @@ class StreamerCore:
 
         # タスク27: 歌声の名前付きパイプ。★FFmpeg を起こす前に開くこと。
         #   こちらがパイプのサーバなので、先に FFmpeg を向けると即死する。
+        # タスク27-C-①: ホストのマイクをカラオケ卓経由にするか。
+        # ★経由するときは FFmpeg の dshow 入力から**外す**。両方に入れると
+        #   同じマイクが二重に配信へ乗り、しかも片方だけ遅れて山びこになる。
+        host_mic_via_python = self.karaoke_host_mic_is_routed()
+        if host_mic_via_python:
+            self.host_mic_monitor.request(mic_dev, capture=True)
+            self.karaoke.host_mic_source = self.host_mic_monitor
+            self.karaoke.configure(
+                host_mic_volume=self.config.get("live_audio_mic_volume", 1.0))
+            mic_dev = ""      # FFmpeg 側からは外す
+            log_print("[Player] ホストのマイクはカラオケ卓経由（参加者へも配ります）")
+        else:
+            self.karaoke.host_mic_source = None
+
         karaoke_pipe, karaoke_sink = self.start_karaoke_pipe()
         # 伴奏側の下駄は、歌声が実際に乗るときだけ履かせる。カラオケを使わない
         # 配信にまで 500ms の遅れを持ち込む理由はない。

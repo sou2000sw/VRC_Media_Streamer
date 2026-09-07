@@ -110,14 +110,20 @@ def handle_audio_session(handler):
         if participant is None:
             return
         set_timeout(IDLE_TIMEOUT_SEC)
-        _serve(handler, conn, session, participant)
+        if getattr(participant, "state", None) is None:
+            _serve_monitor(conn, session, participant)
+        else:
+            _serve(handler, conn, session, participant)
     except WebSocketError as e:
         log_print(f"[Karaoke] ws closed: {e}")
     except (OSError, ValueError) as e:
         log_print(f"[Karaoke] ws socket error: {e}")
     finally:
         if participant is not None:
-            session.remove_participant(participant.id)
+            if getattr(participant, "state", None) is None:
+                session.remove_monitor(participant.id)   # 監聴クライアント
+            else:
+                session.remove_participant(participant.id)
         try:
             conn.close()
         except Exception:
@@ -151,6 +157,20 @@ def _do_hello(handler, conn, session, client_id):
             log_print(f"[Karaoke] 認証失敗 from {conn.peer}")
             _send_error(conn, "auth", "合言葉（PIN）が違います")
             return None
+
+        # ★監聴（ホストが参加者の声を聴く）はホストPCからの接続に限る。
+        #   ここを開けると、参加者どうしが互いの声を盗み聴きできてしまう。
+        if str(payload.get("role") or "") == "monitor":
+            if not handler.is_local_request():
+                _send_error(conn, "forbidden", "監聴はホストPCからのみです")
+                return None
+            monitor = session.add_monitor(client_id, conn=conn)
+            conn.send_json({
+                "type": "welcome", "role": "monitor", "id": monitor.id,
+                "settings": session.settings_snapshot(),
+                "server_ms": int(time.time() * 1000),
+            })
+            return monitor
 
         name = str(payload.get("name") or "")[:MAX_NAME_LEN]
         participant, err = session.add_participant(
@@ -193,6 +213,40 @@ def _check_password(handler, supplied):
         else:
             handler.register_auth_failure()
     return ok
+
+
+def _serve_monitor(conn, session, monitor):
+    """監聴クライアントの受信ループ。音は受け取らず、ping と報告だけ。
+
+    ★lead は「クライアント側の再生バッファの実測先読み量」。
+      参加者基準のとき、遅延補正をどれだけ正方向へ振ればよいかの材料になる。
+    """
+    while True:
+        msg = conn.recv()
+        if msg is None:
+            return
+        kind, data = msg
+        if kind != "text":
+            continue          # 監聴は送ってこない。来ても捨てる。
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        mtype = payload.get("type")
+        if mtype == "ping":
+            conn.send_json({"type": "pong", "t": payload.get("t"),
+                            "server_ms": int(time.time() * 1000)})
+        elif mtype == "net":
+            try:
+                monitor.rtt_ms = max(0, min(5000, int(payload.get("rtt", 0))))
+                monitor.jitter_ms = max(0, min(5000, int(payload.get("jitter", 0))))
+                monitor.lead_ms = max(0, min(2000, int(payload.get("lead", 0))))
+            except (TypeError, ValueError):
+                pass
+        elif mtype == "leave":
+            return
 
 
 def _serve(handler, conn, session, participant):
