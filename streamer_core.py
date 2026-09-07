@@ -877,6 +877,7 @@ def build_audio_inputs_with_remote_mic(app_enabled=False, app_volume=1.0,
 # --------------------------------------------------------------------------
 HOST_MIC_LEVEL_STALE_SEC = 2.0     # これより古いレベルは「来ていない」扱い
 HOST_MIC_IDLE_STOP_SEC = 6.0       # 要求が途絶えてから止まるまで
+HOST_MIC_RESTART_MIN_SEC = 2.0     # 落ちたデバイスで ffmpeg を連射しない間隔
 HOST_MIC_DB_FLOOR = -100.0         # これ以下は無音とみなす
 # 取り込みモードの控え（20ms×10 = 0.2秒）。ライブ入力なので深くしても意味はなく、
 # 深いぶんだけホストの声が遅れて配信に乗るだけ。
@@ -937,12 +938,20 @@ class HostMicMonitor:
 
     _LEVEL_RE = re.compile(r"lavfi\.astats\.Overall\.(RMS|Peak)_level=(\S+)")
 
-    def __init__(self):
+    def __init__(self, label="HostMic"):
+        # label はログの見出しだけ。マイクとPC出力音声を同じ仕組みで測るので、
+        # どちらのプロセスの話なのかがログで分からないと追えなくなる。
+        self._label = label
         self._lock = threading.Lock()
         self._proc = None
         self._device = ""
         self._capture = False
         self._deadline = 0.0
+        # 起動しては即死ぬデバイス（他アプリが専有している等）で、要求のたびに
+        # ffmpeg を起こし続けないための間引き。★実測 0.25 秒周期のポーリングから
+        # 呼ばれるので、間引かないと 1 秒に 4 回プロセスを起こすことになる。
+        self._last_start_key = None
+        self._last_start_ts = 0.0
         self._level = {"peak": 0.0, "rms": 0.0, "ts": 0.0}
         self._watchdog = None
         # 取り込みモードのときの音の控え。溜まりすぎたら古い方を捨てる
@@ -950,28 +959,41 @@ class HostMicMonitor:
         self._pcm = collections.deque(maxlen=HOST_MIC_QUEUE_TICKS)
 
     # ------------------------------------------------------------------
-    def request(self, device, capture=False):
-        """卓が開いている間、繰り返し呼ぶ。必要なら起動し、期限を延ばす。
+    def request(self, device, capture=None):
+        """卓やカードが開いている間、繰り返し呼ぶ。必要なら起動し、期限を延ばす。
 
-        capture=True のときは、レベルに加えて音そのものも取り込む
-        （＝参加者へ配れるようになる）。モードが変わったら立て直す。
+        capture=True  … レベルに加えて音そのものも取り込む（＝参加者へ配れる）
+        capture=False … レベルだけ測る
+        capture=None  … **今の取り込み方を変えない**。
+
+        ★None が要る理由: VUを見たいだけの定期呼び出し（卓・ライブ音声カード）が
+          capture=False で来ると、参加者へ配っている音（capture=True）を
+          プロセスごと立て直して切ってしまう。見るだけの呼び出しに、
+          配信を止める力を持たせない。
         """
         device = str(device or "").strip()
-        capture = bool(capture)
         with self._lock:
+            running = bool(self._proc and self._proc.poll() is None)
+            want_capture = bool(self._capture if (capture is None and running)
+                                else capture)
             # ★取り込みモードのときは期限で止めない。卓を閉じても配信は続くので、
             #   勝手に止まるとホストの演奏が配信から消える。
-            self._deadline = (float("inf") if capture
+            self._deadline = (float("inf") if want_capture
                               else time.time() + HOST_MIC_IDLE_STOP_SEC)
             if not device:
                 self._stop_locked()
                 return
-            if (self._proc and self._proc.poll() is None
-                    and self._device == device and self._capture == capture):
+            if running and self._device == device and self._capture == want_capture:
                 return
             # デバイスかモードが変わった / 落ちていた -> 立て直す
+            key = (device, want_capture)
+            if (key == self._last_start_key
+                    and time.time() - self._last_start_ts < HOST_MIC_RESTART_MIN_SEC):
+                # 直前に同じ条件で起こしたばかりなのに死んでいる。掴めない
+                # デバイスの可能性が高いので、少し置いてから試す。
+                return
             self._stop_locked()
-            self._start_locked(device, capture)
+            self._start_locked(device, want_capture)
 
     def take(self, n_frames):
         """ミキサ用。ステレオ interleaved の array('h')。無ければ None。"""
@@ -1004,6 +1026,19 @@ class HostMicMonitor:
             "device": device,
         }
 
+    def release_capture(self):
+        """取り込み（参加者へ配る）をやめ、レベル監視へ落とす。
+
+        止めきらないのは、卓やライブ音声カードがまだVUを見ているかもしれない
+        ため。見る人が居なくなれば期限切れで自分で止まる。
+        取り込んでいなければ何もしない（無用にプロセスを起こさない）。
+        """
+        with self._lock:
+            if not self._capture:
+                return
+            device = self._device
+        self.request(device, capture=False)
+
     def stop(self):
         with self._lock:
             self._deadline = 0.0
@@ -1011,6 +1046,9 @@ class HostMicMonitor:
 
     # ------------------------------------------------------------------
     def _start_locked(self, device, capture=False):
+        # 失敗しても記録する。起動できないデバイスこそ連射を止めたい。
+        self._last_start_key = (device, bool(capture))
+        self._last_start_ts = time.time()
         try:
             self._proc = subprocess.Popen(
                 build_host_mic_level_cmd(device, capture=capture),
@@ -1019,7 +1057,7 @@ class HostMicMonitor:
                 stderr=subprocess.PIPE, bufsize=0,
                 creationflags=CREATE_NO_WINDOW)
         except Exception as e:
-            log_print(f"[HostMic] 取り込みを起動できません: {e}")
+            log_print(f"[{self._label}] 取り込みを起動できません: {e}")
             self._proc = None
             return
         self._device = device
@@ -1035,7 +1073,7 @@ class HostMicMonitor:
             self._watchdog = threading.Thread(target=self._idle_watch,
                                               name="hostmic-idle", daemon=True)
             self._watchdog.start()
-        log_print(f"[HostMic] {'取り込み' if capture else 'レベル監視'}を開始: {device!r}")
+        log_print(f"[{self._label}] {'取り込み' if capture else 'レベル監視'}を開始: {device!r}")
 
     def _pump_pcm(self, proc):
         """生PCMを 20ms 単位で控えへ。★読み続けないと ffmpeg が詰まって止まる。"""
@@ -1066,7 +1104,7 @@ class HostMicMonitor:
         self._pcm.clear()
         if proc:
             kill_proc(proc)
-            log_print(f"[HostMic] {'取り込み' if was else 'レベル監視'}を停止")
+            log_print(f"[{self._label}] {'取り込み' if was else 'レベル監視'}を停止")
 
     def _pump(self, proc):
         """★stderr は最後まで読み続けること。読まないとバッファが詰まって止まる。"""
@@ -2692,7 +2730,11 @@ class StreamerCore:
         if self.karaoke.enabled:
             self.karaoke.ensure_mixer()
         # タスク27-A: カラオケ卓に出すホストマイクのVU。卓を見ている間だけ動く。
-        self.host_mic_monitor = HostMicMonitor()
+        self.host_mic_monitor = HostMicMonitor(label="HostMic")
+        # ライブ音声カードの入力ゲージ用。マイク側は上の監視を**使い回す**
+        # （同じデバイスを二重に掴むと、どちらの数字が本物か分からなくなる）。
+        # PC出力音声だけは別デバイスなので、専用の監視が要る。
+        self.loopback_monitor = HostMicMonitor(label="Loopback")
 
     # ----------------------------------------------------------------------
     # タスク27: 参加型カラオケ
@@ -2706,7 +2748,10 @@ class StreamerCore:
         """
         device = str(self.config.get("live_audio_mic_device", "")).strip()
         if request_level:
-            self.host_mic_monitor.request(device)
+            # capture=None: 見るだけの呼び出しで取り込みモードを変えない。
+            # ここで capture=False にすると、参加者へ配っているホストの演奏が
+            # 卓を開いた瞬間に切れる。
+            self.host_mic_monitor.request(device, capture=None)
         level = self.host_mic_monitor.level()
         mode = self.get_playback_mode()
         return {
@@ -2723,6 +2768,34 @@ class StreamerCore:
             "on_air": bool(device) and mode == "live" and self.status == "streaming",
         }
 
+    def get_live_audio_levels(self, request_level=False):
+        """ライブ音声取り込みの入力レベル（マイク／PC出力音声）をまとめる。
+
+        ★なぜ「配信していなくても」測れる必要があるのか
+          取り込めているかどうかは、配信を始める**前**に分からないと意味がない。
+          本番で無音に気付いても手遅れなので、送出FFmpegとは別のプロセスで測る
+          （設計の理由は HostMicMonitor の頭の注記に書いた）。
+
+        request_level=True の間だけ測定プロセスが動く。カードを閉じれば
+        （＝この呼び出しが途絶えれば）デバイスは自分で解放される。
+        """
+        mic_device = str(self.config.get("live_audio_mic_device", "")).strip()
+        loop_device = str(self.config.get("live_audio_loopback_device", "")).strip()
+        if request_level:
+            # マイクは卓と共用。capture=None で取り込みモードには触らない。
+            self.host_mic_monitor.request(mic_device, capture=None)
+            self.loopback_monitor.request(loop_device)
+        mic = dict(self.host_mic_monitor.level())
+        loop = dict(self.loopback_monitor.level())
+        # 「未選択」と「選んだのに取れていない」は、直すべきことが違う。
+        # ゲージ側で言い分けられるよう、設定の有無を一緒に返す。
+        mic["configured"] = bool(mic_device)
+        loop["configured"] = bool(loop_device)
+        # ★ホストの演奏をカラオケ卓経由で配っているときは、送出FFmpegは
+        #   マイクを開いていない。それでもゲージは動く（測定側が掴んでいる）。
+        mic["routed_to_karaoke"] = self.karaoke_host_mic_is_routed()
+        return {"mic": mic, "loopback": loop}
+
     def set_host_mic(self, device=None, volume=None,
                      loopback_device=None, loopback_volume=None):
         """カラオケ卓からホストマイクを設定する。
@@ -2736,7 +2809,7 @@ class StreamerCore:
             mic_volume=volume, loopback_volume=loopback_volume)
         if device is not None:
             # 選び直した直後は、古いデバイスのレベルを出したままにしない。
-            self.host_mic_monitor.request(str(device).strip())
+            self.host_mic_monitor.request(str(device).strip(), capture=None)
         return result
 
 
@@ -5528,6 +5601,10 @@ class StreamerCore:
             log_print("[Player] ホストのマイクはカラオケ卓経由（参加者へも配ります）")
         else:
             self.karaoke.host_mic_source = None
+            # ★取り込みモードのまま放置しない。経路をやめた後も capture=True の
+            #   プロセスが残ると、期限が無期限のままマイクを掴み続ける。
+            #   レベル監視へ落とせば、見る人が居なくなった時点で自分で止まる。
+            self.host_mic_monitor.release_capture()
 
         karaoke_pipe, karaoke_sink = self.start_karaoke_pipe()
         # 伴奏側の下駄は、歌声が実際に乗るときだけ履かせる。カラオケを使わない
@@ -7028,10 +7105,12 @@ class StreamerCore:
             self.karaoke.stop()
         except Exception as e:
             log_print(f"[Karaoke] shutdown error: {e}")
-        try:
-            self.host_mic_monitor.stop()
-        except Exception as e:
-            log_print(f"[HostMic] shutdown error: {e}")
+        for _mon, _name in ((self.host_mic_monitor, "HostMic"),
+                            (self.loopback_monitor, "Loopback")):
+            try:
+                _mon.stop()
+            except Exception as e:
+                log_print(f"[{_name}] shutdown error: {e}")
         with self.process_lock:
             if self.current_stdin:
                 try:

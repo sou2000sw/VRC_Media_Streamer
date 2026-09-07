@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import io
 import json
 import os
 import subprocess
@@ -417,3 +418,179 @@ def test_live_audio_stops_cleanly_when_no_audio_source(monkeypatch):
         assert core.status_detail, "理由が利用者に伝わらない"
     finally:
         core.shutdown()
+
+
+
+# ---------------------------------------------------------------------------
+# 入力ゲージ（マイク／PC出力音声）
+#
+# ★きっかけ: 「取り込めているのか」を配信を始める前に確かめる手立てが、
+#   アプリ単位の音声にしか無かった。マイクとPC出力音声は、無音のまま
+#   本番に入って初めて気付く作りだった。
+# ---------------------------------------------------------------------------
+def _ui_html():
+    with io.open(os.path.join(BASE_DIR, "ui", "index.html"), encoding="utf-8") as f:
+        return f.read()
+
+
+class _LevelCore:
+    """get_live_audio_levels だけを取り出して試すための最小の器。"""
+
+    def __init__(self, mic="", loopback=""):
+        self.config = {"live_audio_mic_device": mic,
+                       "live_audio_loopback_device": loopback}
+        self.host_mic_monitor = streamer_core.HostMicMonitor(label="HostMic")
+        self.loopback_monitor = streamer_core.HostMicMonitor(label="Loopback")
+        self.routed = False
+
+    def karaoke_host_mic_is_routed(self):
+        return self.routed
+
+    def levels(self, request_level=False):
+        return streamer_core.StreamerCore.get_live_audio_levels(
+            self, request_level=request_level)
+
+
+def test_live_audio_levels_tell_unselected_from_silent():
+    """未選択と「選んだのに取れていない」を言い分けられること。
+
+    直すべきことが違う（デバイスを選ぶ／Windowsの入力設定を見る）ので、
+    ゲージ側で同じ「0」に潰してはいけない。
+    """
+    lv = _LevelCore().levels(request_level=False)
+    assert lv["mic"]["configured"] is False
+    assert lv["loopback"]["configured"] is False
+    assert lv["mic"]["fresh"] is False and lv["mic"]["rms"] == 0.0
+
+    lv = _LevelCore(mic="Mic A", loopback="Stereo Mix").levels(request_level=False)
+    assert lv["mic"]["configured"] is True and lv["loopback"]["configured"] is True
+
+
+def test_live_audio_levels_do_not_touch_devices_until_asked():
+    """request_level=False では ffmpeg を起こさないこと。
+
+    /api/status のような常時ポーリングから呼ばれても、ホストPCのマイクを
+    掴みっぱなしにしないための境界。
+    """
+    c = _LevelCore(mic="Mic A", loopback="Stereo Mix")
+    lv = c.levels(request_level=False)
+    assert lv["mic"]["monitoring"] is False
+    assert lv["loopback"]["monitoring"] is False
+
+
+def test_level_polling_does_not_cut_karaoke_host_mic():
+    """ゲージを見ているだけの呼び出しが、参加者へ配っている音を切らないこと。
+
+    capture=True で回っている取り込みを capture=False で立て直すと、
+    ホストの演奏が参加者の手元モニターから消える。
+    """
+    class _FakeProc:
+        def poll(self):
+            return None
+
+    mon = streamer_core.HostMicMonitor()
+    proc = _FakeProc()
+    mon._proc = proc
+    mon._device = "Mic A"
+    mon._capture = True
+    mon._deadline = float("inf")
+
+    mon.request("Mic A", capture=None)          # 卓・カードのVUポーリング相当
+
+    assert mon._proc is proc, "取り込みプロセスを立て直してしまっている"
+    assert mon._capture is True, "取り込みモードが落ちている"
+    assert mon._deadline == float("inf"), "配信中の取り込みに期限を付けてはいけない"
+
+
+def test_level_monitor_backs_off_when_device_cannot_be_opened():
+    """掴めないデバイスで ffmpeg を連射しないこと。
+
+    ゲージは 0.25 秒ごとに呼ぶので、毎回起こすと 1 秒に 4 プロセスになる。
+    """
+    starts = []
+
+    class _DeadProc:
+        def poll(self):
+            return 1        # 起動直後に死ぬデバイス
+
+    mon = streamer_core.HostMicMonitor()
+    orig = mon._start_locked
+
+    def _counting(device, capture=False):
+        starts.append(device)
+        orig(device, capture)
+
+    with patch.object(streamer_core.subprocess, "Popen",
+                      side_effect=lambda *a, **k: _DeadProc()):
+        mon._start_locked = _counting
+        for _ in range(20):
+            mon.request("Mic A")
+    assert len(starts) == 1, f"死んだデバイスへ {len(starts)} 回も起動をかけている"
+
+
+def test_level_monitor_restarts_at_once_when_device_changes():
+    """間引きが、デバイスを選び直したときの反応まで殺さないこと。"""
+    class _DeadProc:
+        def poll(self):
+            return 1
+
+    starts = []
+    mon = streamer_core.HostMicMonitor()
+    orig = mon._start_locked
+
+    def _counting(device, capture=False):
+        starts.append(device)
+        orig(device, capture)
+
+    with patch.object(streamer_core.subprocess, "Popen",
+                      side_effect=lambda *a, **k: _DeadProc()):
+        mon._start_locked = _counting
+        mon.request("Mic A")
+        mon.request("Mic B")
+    assert starts == ["Mic A", "Mic B"]
+
+
+def test_release_capture_does_not_start_anything():
+    """取り込んでいないときの release_capture は何もしないこと。"""
+    mon = streamer_core.HostMicMonitor()
+    mon.release_capture()
+    assert mon.level()["monitoring"] is False
+
+
+def test_live_audio_levels_endpoint_is_localhost_only():
+    """入力レベルの取得はホスト限定。ゲストにホストのマイクを掴ませない。"""
+    with io.open(os.path.join(BASE_DIR, "api_server.py"), encoding="utf-8") as f:
+        src = f.read()
+    i = src.index('elif path == "/api/live_audio_levels":')
+    block = src[i:i + 1800]
+    assert "is_local_request()" in block
+    assert "check_web_password_auth()" in block
+    assert "request_level=True" in block
+
+
+def test_status_does_not_carry_input_levels():
+    """マイク／PC出力音声のレベルを /api/status に混ぜないこと。
+
+    ステータスは全クライアントが叩く。そこへ載せると、ゲストのポーリングで
+    ホストPCのマイクが開きっぱなしになる。
+    """
+    import inspect
+    src = inspect.getsource(streamer_core.StreamerCore.get_status_data)
+    assert "get_live_audio_levels" not in src
+
+
+def test_ui_has_input_meters_for_mic_and_loopback():
+    html = _ui_html()
+    for needle in ('id="liveAudioMicMeterBar"', 'id="liveAudioMicMeterText"',
+                   'id="liveAudioLoopbackMeterBar"', 'id="liveAudioLoopbackMeterText"',
+                   'function pollLiveAudioLevels', '/api/live_audio_levels'):
+        assert needle in html, needle
+
+
+def test_ui_stops_metering_when_the_card_is_not_shown():
+    """カードを見ていない間はポーリングしないこと（マイクを開きっぱなしにしない）。"""
+    html = _ui_html()
+    i = html.index("async function pollLiveAudioLevels")
+    block = html[i:i + 1200]
+    assert "liveAudioCardIsVisible()" in block
+    assert "isLocalEnvironment()" in block

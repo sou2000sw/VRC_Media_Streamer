@@ -860,6 +860,33 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
             })
             return
 
+        elif path == "/api/live_audio_levels":
+            # ライブ音声取り込みの入力ゲージ。
+            # ★このGETが来ている間だけ測定プロセスが動く（カラオケ卓のVUと同じ作法）。
+            #   カードを閉じれば要求が途絶え、デバイスは自分で解放される。
+            if not self.check_web_password_auth():
+                self.send_json_response(401, {
+                    "success": False,
+                    "error": "Unauthorized: Web password required or invalid.",
+                    "has_web_password": True
+                })
+                return
+            if not self.is_local_request():
+                # 取り込みデバイスはホストPCにしか無い。ゲストに測らせない
+                # （＝ゲストのポーリングでホストのマイクを掴ませない）。
+                self.send_json_response(403, {
+                    "error": "Forbidden: Input level metering is restricted to localhost."
+                })
+                return
+            if not self.streamer_core:
+                self.send_json_response(503, {"success": False, "error": "core not ready"})
+                return
+            self.send_json_response(200, {
+                "success": True,
+                "levels": self.streamer_core.get_live_audio_levels(request_level=True),
+            })
+            return
+
         elif path == "/api/capture_sources":
             if not self.check_web_password_auth():
                 self.send_json_response(401, {

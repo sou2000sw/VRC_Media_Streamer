@@ -767,6 +767,16 @@
                             <input type="range" id="liveAudioMicVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
                             <span id="liveAudioMicVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">1.00</span>
                         </div>
+                        <!-- 入力ゲージ。★このカードを開いている間だけ測定プロセスが動く。
+                             音量スライダーの後ろ（＝配信に乗る音量）ではなく、
+                             デバイスから入ってきた素の音を測っている。 -->
+                        <div class="flex items-center gap-2">
+                            <span class="text-[11px] text-zinc-400 w-16 shrink-0">入力レベル</span>
+                            <div class="flex-1 h-2 bg-zinc-800 rounded overflow-hidden">
+                                <div id="liveAudioMicMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
+                            </div>
+                            <span id="liveAudioMicMeterText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">未選択</span>
+                        </div>
                     </div>
 
                     <div class="flex flex-col gap-2">
@@ -778,6 +788,14 @@
                             <input type="range" id="liveAudioLoopbackVolume" min="0" max="2" step="0.05" value="0.7" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
                             <span id="liveAudioLoopbackVolumeLabel" class="w-12 text-right text-xs text-zinc-400 font-mono">0.70</span>
                         </div>
+                        <div class="flex items-center gap-2">
+                            <span class="text-[11px] text-zinc-400 w-16 shrink-0">入力レベル</span>
+                            <div class="flex-1 h-2 bg-zinc-800 rounded overflow-hidden">
+                                <div id="liveAudioLoopbackMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
+                            </div>
+                            <span id="liveAudioLoopbackMeterText" class="w-16 text-right text-[11px] text-zinc-500 font-mono">未選択</span>
+                        </div>
+                        <p class="text-[11px] text-zinc-500">※入力レベルは<b>配信していなくても</b>振れます。本番前にここで、声とBGMが実際に取り込めているか確かめてください。振れないときはWindowsの「サウンドの設定」でそのデバイスの入力音量とアプリの許可を確認してください。</p>
                     </div>
 
                     <!-- アプリ単位の音声（タスク25）。Discordと同じく、選んだウィンドウの
@@ -2002,6 +2020,9 @@
             setInterval(updateClock, 1000);
             checkServerHealth(true);
             setInterval(() => checkServerHealth(false), 2000);
+            // 入力ゲージ。ステータス（2秒）では遅すぎて声の振れが見えないので別周期。
+            // カードが見えていないときは通信しない（pollLiveAudioLevels 内で判定）。
+            setInterval(pollLiveAudioLevels, 250);
             setupDragAndDrop();
             // プレビューは既定で閉じているので、ここでは HLS を掴まない。
             // 開いた時点で toggleLivePreview() が initHlsPlayer() を呼ぶ。
@@ -3604,19 +3625,19 @@
             }
         }
 
-        // 入力レベルのゲージ。
+        // 入力レベルのゲージ（アプリ音声・マイク・PC出力音声で共通）。
         // ★リニアで描くとバーがほとんど動かない。実測では rms 0.009（= -40dBFS）でも
         //   はっきり聞こえるため、-60〜0dBFS を 0〜100% に写す。
-        function updateAppAudioMeter(data) {
-            const bar = document.getElementById('liveAudioAppMeterBar');
-            const txt = document.getElementById('liveAudioAppMeterText');
+        // ★「値が来ていない」ときの文言を呼び出し側に決めさせる。未選択なのか、
+        //   選んだのに取れていないのかで、利用者がやるべきことが違うため。
+        function renderInputMeter(barId, txtId, lv, idleLabel) {
+            const bar = document.getElementById(barId);
+            const txt = document.getElementById(txtId);
             if (!bar || !txt) return;
-            const lv = (data && data.app_audio_level) ? data.app_audio_level : null;
             if (!lv || !lv.fresh) {
-                // 配信していない、または補助exeが動いていない。
                 bar.style.width = '0%';
                 bar.style.backgroundColor = '#52525b';
-                txt.textContent = '停止中';
+                txt.textContent = idleLabel || '停止中';
                 txt.className = 'w-16 text-right text-[11px] text-zinc-500 font-mono';
                 return;
             }
@@ -3629,6 +3650,53 @@
             txt.textContent = silent ? '無音' : Math.round(db) + ' dB';
             txt.className = 'w-16 text-right text-[11px] font-mono ' +
                 (silent ? 'text-zinc-500' : (db > -6 ? 'text-amber-400' : 'text-emerald-400'));
+        }
+
+        function updateAppAudioMeter(data) {
+            // 補助exeは配信中しか動かないので、来ていない＝停止中でよい。
+            const lv = (data && data.app_audio_level) ? data.app_audio_level : null;
+            renderInputMeter('liveAudioAppMeterBar', 'liveAudioAppMeterText', lv, '停止中');
+        }
+
+        // ===== マイク／PC出力音声の入力ゲージ =====
+        // ★/api/status には載せない。このGETが来ている間だけホストPCのデバイスを
+        //   掴む作りなので、全クライアントが叩くステータスに混ぜると、
+        //   ゲストのポーリングでホストのマイクが開きっぱなしになる。
+        // ★カードが画面に出ている間だけ測る。閉じれば要求が途絶え、
+        //   サーバー側が自分でデバイスを解放する（Windowsの「マイク使用中」を残さない）。
+        let liveAudioLevelBusy = false;
+
+        function liveAudioCardIsVisible() {
+            const card = document.getElementById('liveAudioCard');
+            // offsetParent が null = 自分か親が非表示（タブ切替も拾える）。
+            return !!(card && !card.classList.contains('hidden') && card.offsetParent !== null);
+        }
+
+        async function pollLiveAudioLevels() {
+            if (liveAudioLevelBusy) return;
+            if (!isLocalEnvironment() || !liveAudioCardIsVisible()) {
+                renderInputMeter('liveAudioMicMeterBar', 'liveAudioMicMeterText', null, '停止中');
+                renderInputMeter('liveAudioLoopbackMeterBar', 'liveAudioLoopbackMeterText', null, '停止中');
+                return;
+            }
+            liveAudioLevelBusy = true;
+            try {
+                const res = await fetch(`${apiBase}/api/live_audio_levels`, { cache: 'no-store' });
+                if (!res.ok) return;                       // 403(ゲスト)/503(起動直後)は黙って見送る
+                const data = await res.json();
+                const lv = (data && data.levels) || {};
+                const mic = lv.mic || {};
+                const loop = lv.loopback || {};
+                // 未選択なら「測れない」ではなく「選んでいない」と出す。
+                renderInputMeter('liveAudioMicMeterBar', 'liveAudioMicMeterText',
+                                 mic, mic.configured ? '待機中' : '未選択');
+                renderInputMeter('liveAudioLoopbackMeterBar', 'liveAudioLoopbackMeterText',
+                                 loop, loop.configured ? '待機中' : '未選択');
+            } catch (e) {
+                // ネットワークの一過性エラーでゲージを壊さない（次の周期で戻る）。
+            } finally {
+                liveAudioLevelBusy = false;
+            }
         }
 
         function syncLiveAudioAppFromStatus(data) {
