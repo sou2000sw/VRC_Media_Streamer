@@ -940,6 +940,8 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 "success": True,
                 "host_view": True,
                 "karaoke": self.streamer_core.karaoke.status_snapshot(),
+                # 「参加者の声が配信に乗っているか」。乗らない理由もここで返す。
+                "voice_bus": self.streamer_core.karaoke_voice_bus_state(),
                 "host_mic": self.streamer_core.get_host_mic_state(request_level=True),
                 "host_mic_route": bool(self.streamer_core.config.get(
                     "karaoke_host_mic_route", False)),

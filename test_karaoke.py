@@ -1596,3 +1596,520 @@ def test_monitor_role_is_localhost_only():
     block = src[i:i + 400]
     assert "is_local_request()" in block
     assert "forbidden" in block
+
+
+# ---------------------------------------------------------------------------
+# 9. 飽和よけ（2026-09-07「急に声がバリバリになった」）
+#
+# ★何が起きていたか
+#   音を足す場所（配信バス・監聴・歌い手モニター）に余裕が無く、天井で頭打ちに
+#   していた。実測: 伴奏ピーク30000 に歌声ピーク12000 を足すと、監聴バスの
+#   サンプルの 19.5% が天井に貼り付いた。これがバリバリの正体。
+# ★なぜ気付かなかったか
+#   それまでの試験が "Me at the zoo"（ピーク11000）という静かな素材で、
+#   飽和 0% だった。普通の伴奏音源は 0dBFS 近くまで詰まっている。
+# ★ここで守ること
+#   「天井を越えない」だけでは足りない（頭打ちも越えてはいない）。
+#   **貼り付いたサンプルが並ばない**ことまで見る。数えれば聞かずに分かる。
+# ---------------------------------------------------------------------------
+from remote_mic import SoftLimiter, LIMITER_CEILING
+
+
+def _loud_stereo(peak, freq, phase=0.0, n=FRAMES_PER_TICK):
+    a = array.array("h", bytes(n * OUTPUT_CHANNELS * BYTES_PER_SAMPLE))
+    for i in range(n):
+        v = int(peak * _math.sin(2 * _math.pi * freq * i / SAMPLE_RATE + phase))
+        a[i * 2] = v
+        a[i * 2 + 1] = v
+    return a
+
+
+class _MonoTone:
+    """参加者のジッタバッファのふり（ミキサはモノラルを受け取る）。"""
+
+    def __init__(self, amp, freq):
+        self.amp = amp
+        self.phase = 0.0
+        self.step = 2 * _math.pi * freq / SAMPLE_RATE
+
+    def take(self, n):
+        a = array.array("h")
+        for _ in range(n):
+            a.append(int(self.amp * _math.sin(self.phase)))
+            self.phase += self.step
+        return a
+
+
+class _SinkSpy:
+    def __init__(self):
+        self.chunks = []
+
+    def write(self, pcm):
+        self.chunks.append(pcm)
+
+    def stop(self):
+        pass
+
+
+def _pinned_percent(pcm):
+    """天井に貼り付いたサンプルの割合（％）。並べば歪んでいる。"""
+    if not len(pcm):
+        return 100.0
+    hit = sum(1 for v in pcm if v >= 32767 or v <= -32768)
+    return hit * 100.0 / len(pcm)
+
+
+def _assert_loud(pcm, floor=20000):
+    """★無音を「飽和していない」と読み違えないための番人。
+
+    遅延ラインを通るぶん、短く回すと出口はまだ無音。それを合格にすると
+    「何を入れても通る試験」になる。先に大きい音が出ていることを確かめる。
+    """
+    assert len(pcm), "出口へ何も出ていない"
+    peak = max(abs(v) for v in pcm)
+    assert peak > floor, f"出口がまだ無音に近い（ピーク {peak}）"
+
+
+def _monitor_pcm(session, sources, ticks, limiter):
+    out = array.array("h")
+    for _ in range(ticks):
+        payload = session._pack_mono(DOWNSTREAM_TYPE_MONITOR, sources,
+                                     FRAMES_PER_TICK, limiter)
+        out.frombytes(payload[DOWNSTREAM_HEADER:])
+    return out
+
+
+def test_limiter_never_exceeds_the_ceiling():
+    lim = SoftLimiter()
+    for peak in (5000, 20000, 40000, 90000):
+        buf = [peak * _math.sin(i * 0.01) for i in range(4000)]
+        lim.process(buf, 1)
+        assert max(abs(v) for v in buf) <= LIMITER_CEILING + 1e-6, peak
+
+
+def test_limiter_leaves_quiet_audio_alone():
+    """余裕があるうちは 1 サンプルも触らない（静かな伴奏の音量を変えない）。"""
+    lim = SoftLimiter()
+    src = [8000 * _math.sin(i * 0.01) for i in range(2000)]
+    buf = list(src)
+    lim.process(buf, 1)
+    assert buf == src
+    assert lim.gain == 1.0
+    assert lim.reduction == 0.0
+
+
+def test_limiter_keeps_the_stereo_image():
+    """左右で別々に下げない。片方だけ引っ込むと定位が動く。"""
+    lim = SoftLimiter()
+    buf = []
+    for i in range(2000):
+        v = 30000 * _math.sin(i * 0.01)
+        buf.extend((v, v * 0.5))            # 右は常に左のちょうど半分
+    lim.process(buf, OUTPUT_CHANNELS)
+    for i in range(0, len(buf), 2):
+        if abs(buf[i]) > 1.0:
+            assert abs(buf[i + 1] / buf[i] - 0.5) < 1e-9
+
+
+def test_monitor_bus_does_not_pin_with_a_loud_accompaniment(session):
+    """監聴（歌声＋伴奏）。伴奏は音量を掛ける**前**で来るので一番危ない。"""
+    sources = [_loud_stereo(12000, 220, 0.3), _loud_stereo(30000, 440)]
+    pcm = _monitor_pcm(session, sources, 10, session._limiter_mon)
+    _assert_loud(pcm)
+    assert _pinned_percent(pcm) == 0.0
+
+
+def test_the_pinning_check_can_actually_see_the_problem(session):
+    """リミッタを外すと確かに貼り付くこと。
+
+    ★この試験が要る理由
+      上の試験が「何を入れても通る空振り」でないことの証拠。壊れた状態を
+      検出できると示せない試験は、直っていることを示せない。
+    """
+    sources = [_loud_stereo(12000, 220, 0.3), _loud_stereo(30000, 440)]
+    pcm = _monitor_pcm(session, sources, 10, None)
+    assert _pinned_percent(pcm) > 10.0
+
+
+def test_reference_bus_does_not_pin_with_a_loud_accompaniment(session):
+    """歌い手モニター（伴奏＋ホストのマイク）も同じ危なさを持つ。"""
+    session.host_mic_source = _Tone(freq=330, amp=15000)
+    sink = _Collector()
+    session.configure(approval_required=False)
+    session.add_participant("p", "歌い手", conn=sink)
+    session.set_state("p", STATE_ACTIVE)
+    session.bgm.take = lambda n: _loud_stereo(30000, 440)
+    # ★下りは参加者ごとの送信スレッドが送る。刻んだ直後には届いていない。
+    #   待たずに読むと「出口へ何も出ていない」でまれに落ちる（実際に落ちた）。
+    deadline = time.time() + 3.0
+    while len(sink.frames) < 10 and time.time() < deadline:
+        session._tick()
+        time.sleep(0.005)
+    pcm = _collect(sink.frames, DOWNSTREAM_TYPE_BGM)
+    _assert_loud(pcm)
+    assert _pinned_percent(pcm) == 0.0
+
+
+def test_stream_bus_does_not_pin_with_a_loud_accompaniment(session):
+    """VRChat へ行く音。伴奏音量は掛かるが、それでも足りない。"""
+    sink = _SinkSpy()
+    session.sink = sink
+    session.configure(approval_required=False)
+    p, _ = session.add_participant("p", "歌い手")
+    session.set_state("p", STATE_ACTIVE)
+    p.buffer = _MonoTone(12000, 220)
+    session.bgm.volume = 0.8
+    session.bgm.take = lambda n: _loud_stereo(30000, 440)
+    # ★歌声も伴奏も 500ms の遅延ラインを通る。短く回すと出口はまだ無音で、
+    #   「飽和していない」と読み違える（実際それで空振りしていた）。
+    for _ in range(80):
+        session._tick()
+    pcm = array.array("h")
+    for c in sink.chunks:
+        pcm.frombytes(c)
+    _assert_loud(pcm)
+    assert _pinned_percent(pcm) == 0.0
+
+
+def test_master_meter_still_shows_the_overload(session):
+    """リミッタは VU を測った後に掛ける。突っ込みすぎがホストから見えること。"""
+    session.configure(approval_required=False)
+    p, _ = session.add_participant("p", "歌い手")
+    session.set_state("p", STATE_ACTIVE)
+    p.buffer = _MonoTone(12000, 220)
+    session.bgm.take = lambda n: _loud_stereo(32000, 440)
+    # ★歌声も伴奏も 500ms の遅延ラインを通る。短く回すと何も出てこない。
+    for _ in range(60):
+        session._tick()
+    assert session.master_level >= 0.999, "メーターが天井を示していない"
+
+
+# ---------------------------------------------------------------------------
+# 10. ホストマイク取り込みの「短い読み」（2026-09-07）
+#
+# ★何が起きていたか
+#   bufsize=0 の ffmpeg のパイプは FileIO で、read(n) は「n まで」しか返さない。
+#   実測: 3840 を要求すると 3840 と 256 が交互に返り、**読みの 50% が短かった**。
+#   短いものを 1 刻みとして積むと take() のゼロ埋めで無音が挟まる。
+# ---------------------------------------------------------------------------
+class _ChoppyStream:
+    """パイプのふり。要求より短く返す（FileIO の実挙動）。"""
+
+    def __init__(self, data, sizes):
+        self.data = data
+        self.sizes = list(sizes)
+        self.pos = 0
+        self.i = 0
+
+    def read(self, n):
+        want = min(n, self.sizes[self.i % len(self.sizes)])
+        self.i += 1
+        chunk = self.data[self.pos:self.pos + want]
+        self.pos += len(chunk)
+        return chunk
+
+    def close(self):
+        pass
+
+
+class _FakeProc:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
+def test_host_mic_queues_only_whole_ticks():
+    import streamer_core
+
+    chunk = FRAMES_PER_TICK * OUTPUT_CHANNELS * BYTES_PER_SAMPLE
+    payload = bytes((i * 7) % 251 + 1 for i in range(chunk * 4))   # 0 を含まない
+    mon = streamer_core.HostMicMonitor()
+    proc = _FakeProc(_ChoppyStream(payload, [chunk, 256]))
+    mon._proc = proc
+    mon._capture = True
+    mon._pump_pcm(proc)
+
+    assert mon._pcm, "何も積まれていない"
+    assert all(len(c) == chunk for c in mon._pcm),         "1 刻みに満たない塊が積まれている（ゼロ埋めで無音が挟まる）"
+    joined = b"".join(mon._pcm)
+    assert joined == payload[:len(joined)], "音が抜けている / 並びが崩れている"
+
+
+def test_host_mic_take_returns_the_queued_tick():
+    """take() が実際に動くこと（array を import し忘れていて必ず落ちていた）。"""
+    import streamer_core
+
+    chunk = FRAMES_PER_TICK * OUTPUT_CHANNELS * BYTES_PER_SAMPLE
+    mon = streamer_core.HostMicMonitor()
+    mon._capture = True
+    mon._pcm.append(bytes(chunk))
+    out = mon.take(FRAMES_PER_TICK)
+    assert out is not None
+    assert len(out) == FRAMES_PER_TICK * OUTPUT_CHANNELS
+
+
+# ---------------------------------------------------------------------------
+# 11. 配信中に有効化したときの張り直し（2026-09-07「参加者の声が配信に乗らない」）
+#
+# ★何が起きていたか
+#   歌声のバスは名前付きパイプという **FFmpeg の入力そのもの**。配信を張った
+#   時点でカラオケが無効なら、その入力は存在しない。あとから卓で有効にしても
+#   フィルタグラフは起動時に固定されているので、参加者の声は永久に乗らない。
+#   しかも卓のVUは振れるし監聴でも聞こえるので、乗っていないことに気付けない。
+# ★音量・リバーブ・遅延補正とは扱いが違う
+#   あちらは Python 側のミックスなので配信は途切れない。ここだけは入力構成が
+#   変わるので張り直しが要る。両方を1つの試験で押さえる。
+# ---------------------------------------------------------------------------
+class _ReloadSpy:
+    """StreamerCore のふり。set_karaoke_settings が触るところだけ持つ。"""
+
+    def __init__(self, sending=True, enabled=False):
+        import streamer_core as sc
+        self.karaoke = KaraokeSession()
+        self.karaoke.configure(enabled=enabled)
+        self.config = {}
+        self.reloads = 0
+        self.sending = sending
+        self.request_stream_reload_if_sending = (
+            lambda: sc.StreamerCore.request_stream_reload_if_sending(self))
+
+    def is_sending(self):
+        return self.sending
+
+    def request_stream_reload(self):
+        self.reloads += 1
+
+    def save_config(self):
+        pass
+
+    def apply(self, **kw):
+        import streamer_core as sc
+        try:
+            return sc.StreamerCore.set_karaoke_settings(self, **kw)
+        finally:
+            self.karaoke.stop()
+
+
+def test_enabling_karaoke_while_sending_reloads_the_stream():
+    """配信中に有効化したら張り直すこと。しないと歌声が永久に乗らない。"""
+    core = _ReloadSpy(sending=True, enabled=False)
+    core.apply(enabled=True)
+    assert core.reloads == 1, "張り直しを要求していない（歌声が配信に乗らない）"
+
+
+def test_disabling_karaoke_while_sending_reloads_the_stream():
+    """無効化も入力が消えるので張り直す。"""
+    core = _ReloadSpy(sending=True, enabled=True)
+    core.apply(enabled=False)
+    assert core.reloads == 1
+
+
+def test_toggling_karaoke_off_air_does_not_reload():
+    """配信していないなら何もしない。
+
+    ★要求を残すと、次に配信を始めた瞬間に張り直しが走る。次の開始時には
+      正しい構成で組み上がっているので、それは無駄なやり直しでしかない。
+    """
+    core = _ReloadSpy(sending=False, enabled=False)
+    core.apply(enabled=True)
+    assert core.reloads == 0
+
+
+def test_same_enabled_value_does_not_reload():
+    core = _ReloadSpy(sending=True, enabled=True)
+    core.apply(enabled=True)
+    assert core.reloads == 0
+
+
+def test_volume_and_reverb_never_interrupt_the_stream():
+    """Python 側で混ぜているものは配信を切らない（既存の約束）。"""
+    core = _ReloadSpy(sending=True, enabled=True)
+    core.apply(master_volume=1.5, reverb="strong", offset_ms=-200)
+    assert core.reloads == 0, "音量やリバーブで配信を切ってはいけない"
+
+
+def test_is_sending_looks_at_the_sender_process():
+    import streamer_core as sc
+
+    class _Core:
+        send_proc = None
+
+    class _Proc:
+        def __init__(self, code):
+            self.code = code
+
+        def poll(self):
+            return self.code
+
+    c = _Core()
+    assert sc.StreamerCore.is_sending(c) is False, "送出していないのに True"
+    c.send_proc = _Proc(None)          # 動いている
+    assert sc.StreamerCore.is_sending(c) is True
+    c.send_proc = _Proc(0)             # 終了済み
+    assert sc.StreamerCore.is_sending(c) is False
+
+
+# ---------------------------------------------------------------------------
+# 12. 歌声バスが「どのモードで」「本当に」乗っているか（2026-09-07）
+#
+# ★何が起きていたか
+#   歌声のパイプを FFmpeg へ繋いでいたのは play_live_audio だけだった。
+#   画面キャプチャで配信している間、参加者の声は原理的に配信へ乗らない。
+#   しかも卓のバッジは繋がっていなければ一律「待機中（配信開始で接続）」と
+#   出していたので、**配信中なのに「配信開始で接続」と嘘をついていた**。
+# ---------------------------------------------------------------------------
+def _core_source():
+    with io.open(os.path.join(BASE_DIR, "streamer_core.py"), encoding="utf-8") as f:
+        return f.read()
+
+
+def _method_block(src, name):
+    i = src.index(f"    def {name}(")
+    j = src.index(chr(10) + "    def ", i + 10)
+    return src[i:j]
+
+
+def test_screen_capture_wires_the_voice_bus():
+    """画面キャプチャでも歌声バスを FFmpeg へ渡し、出口を回収していること。"""
+    block = _method_block(_core_source(), "play_screen_capture")
+    assert "start_karaoke_pipe()" in block, "歌声のパイプを開いていない"
+    assert "remote_mic_pipe=karaoke_pipe" in block, "FFmpeg へ渡していない"
+    assert "bgm_delay_ms=bgm_delay" in block, "伴奏側の下駄を渡していない"
+    assert "reap_karaoke_pipe" in block, "出口を回収していない（パイプが残る）"
+
+
+def test_screen_capture_closes_the_pipe_on_every_early_return():
+    """途中で抜ける経路すべてで出口を閉じること。閉じ忘れるとパイプが残る。"""
+    block = _method_block(_core_source(), "play_screen_capture")
+    # 「開いた後に return する」箇所の数だけ close_sink が要る。
+    after = block[block.index("start_karaoke_pipe()"):]
+    returns = after.count("return None")
+    closes = after.count("close_sink(karaoke_sink)")
+    assert closes >= returns, (
+        f"抜け道 {returns} 本に対して出口を閉じているのは {closes} 本")
+
+
+def test_live_audio_still_wires_the_voice_bus():
+    """元からあった経路を壊していないこと。"""
+    block = _method_block(_core_source(), "play_live_audio")
+    assert "remote_mic_pipe=karaoke_pipe" in block
+
+
+class _BusCore:
+    """karaoke_voice_bus_state のふり。見るところだけ持つ。"""
+
+    class _Sink:
+        def __init__(self, connected):
+            self.connected = connected
+
+    def __init__(self, mode="live", sending=True, connected=True, enabled=True):
+        self.karaoke = KaraokeSession()
+        self.karaoke.enabled = enabled
+        self.karaoke.sink = self._Sink(connected) if connected is not None else None
+        self._mode = mode
+        self._sending = sending
+
+    def get_playback_mode(self):
+        return self._mode
+
+    def is_sending(self):
+        return self._sending
+
+    def state(self):
+        import streamer_core as sc
+        return sc.StreamerCore.karaoke_voice_bus_state(self)
+
+
+def test_voice_bus_is_on_air_in_live_audio_mode():
+    st = _BusCore(mode="live").state()
+    assert st["on_air"] is True
+    assert st["reason"] == "", "乗っているのに理由を出している"
+
+
+def test_voice_bus_is_on_air_in_screen_capture_mode():
+    """★今回の目玉。画面キャプチャでも乗る。"""
+    st = _BusCore(mode="screen").state()
+    assert st["on_air"] is True
+
+
+def test_voice_bus_explains_an_unsupported_mode():
+    """動画やラジオでは乗らない。そう言い切ること。"""
+    for mode in ("video", "radio", "slideshow"):
+        st = _BusCore(mode=mode).state()
+        assert st["on_air"] is False
+        assert st["mode_ok"] is False
+        assert "ライブ音声" in st["reason"], f"{mode}: 直し方を示していない"
+        assert "画面キャプチャ" in st["reason"]
+
+
+def test_voice_bus_explains_that_the_stream_is_not_running():
+    st = _BusCore(mode="live", sending=False, connected=None).state()
+    assert st["on_air"] is False
+    assert "配信" in st["reason"]
+
+
+def test_voice_bus_tells_you_to_rebuild_when_sending_but_unconnected():
+    """配信中なのに繋がっていないなら、張り直しを促すこと。
+
+    ★以前はここで「配信開始で接続」と出していた。既に配信しているので、
+      その案内どおりに操作しても永久に直らない。
+    """
+    st = _BusCore(mode="live", sending=True, connected=False).state()
+    assert st["on_air"] is False
+    assert "張り直" in st["reason"]
+
+
+def test_voice_bus_reports_the_session_being_off():
+    st = _BusCore(enabled=False).state()
+    assert st["on_air"] is False
+    assert "カラオケ" in st["reason"]
+
+
+def test_ui_shows_whether_the_voice_bus_is_on_air():
+    html = _ui_html()
+    for needle in ('id="kaPipeHint"', 'function karaokeRenderVoiceBus',
+                   'karaokeRenderVoiceBus(data.voice_bus)',
+                   '配信に乗っています', '配信に乗っていません'):
+        assert needle in html, needle
+    # 嘘をつく古い文言が**表示に**残っていないこと（説明の引用は残ってよい）
+    assert "innerText = '待機中（配信開始で接続）'" not in html
+
+
+def test_both_ui_copies_stay_identical():
+    """ui/ と plugin/ui/ は同じ中身。片方だけ直すと配布物で症状が変わる。"""
+    import hashlib
+    digests = []
+    for rel in (os.path.join("ui", "index.html"),
+                os.path.join("plugin", "ui", "index.html")):
+        with io.open(os.path.join(BASE_DIR, rel), "rb") as f:
+            digests.append(hashlib.md5(f.read()).hexdigest())
+    assert digests[0] == digests[1], "2つの UI がずれている"
+
+
+def test_screen_capture_input_numbering_stays_aligned():
+    """映像1本＋音声入力の採番が、フィルタの参照とずれていないこと。
+
+    ★ずれても FFmpeg は動いてしまう
+      別の入力を混ぜるだけなので落ちない。実機では「なぜか音が変」としか
+      見えず、原因に辿り着けない。組み立て段階で数えて止める。
+    """
+    import streamer_core as sc
+
+    pipe = "PIPE_FOR_TEST"
+    for mic, loop in (("Mic A", ""), ("Mic A", "Loop B"), ("", "")):
+        v, _ = sc.build_screen_capture_input(
+            source_type="display", display_index=0, framerate=30)
+        a, filt, amap = sc.build_audio_inputs(
+            app_enabled=False, mic_device=mic, loopback_device=loop,
+            start_index=1, remote_mic_pipe=pipe, remote_mic_volume=1.0,
+            bgm_delay_ms=KARAOKE_BASE_DELAY_MS)
+        cmd = ["ffmpeg"] + v + a
+        srcs = [cmd[i + 1] for i, x in enumerate(cmd) if x == "-i"]
+        pat = re.escape("[") + "([0-9]+):a" + re.escape("]")
+        refs = sorted({int(m) for m in re.findall(pat, filt or "")})
+
+        assert v.count("-i") == 1, "映像入力が1本という前提が崩れている"
+        assert srcs.count(pipe) == 1, "歌声のパイプが入力に無い"
+        assert amap, "音声の出口が無い"
+        assert 0 not in refs, "映像入力(0)を音声として参照している"
+        assert refs and max(refs) < len(srcs), "存在しない入力を参照している"
+        assert srcs.index(pipe) in refs, "歌声のパイプをフィルタが参照していない"

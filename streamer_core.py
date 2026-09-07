@@ -1,5 +1,6 @@
 import os
 import sys
+import array
 import ctypes
 import time
 import re
@@ -875,6 +876,15 @@ def build_audio_inputs_with_remote_mic(app_enabled=False, app_volume=1.0,
 #   開き続けるのは筋が悪いので、**要求が来ている間だけ**動かし、
 #   途絶えたら自分で止まる。
 # --------------------------------------------------------------------------
+# 参加者の歌声バス（名前付きパイプ）を FFmpeg へ積んでいる再生モード。
+# ★動画・ラジオ・スライドショーは素材の音がそのまま出口なので通していない。
+#   混ぜるか差し替えるかは別の設計判断が要るため、ここでは対象外と明示する。
+KARAOKE_VOICE_BUS_MODES = ("live", "screen")
+KARAOKE_MODE_LABELS = {
+    "video": "動画", "radio": "ラジオ", "slideshow": "スライドショー",
+    "live": "ライブ音声", "screen": "画面キャプチャ",
+}
+
 HOST_MIC_LEVEL_STALE_SEC = 2.0     # これより古いレベルは「来ていない」扱い
 HOST_MIC_IDLE_STOP_SEC = 6.0       # 要求が途絶えてから止まるまで
 HOST_MIC_RESTART_MIN_SEC = 2.0     # 落ちたデバイスで ffmpeg を連射しない間隔
@@ -1076,18 +1086,33 @@ class HostMicMonitor:
         log_print(f"[{self._label}] {'取り込み' if capture else 'レベル監視'}を開始: {device!r}")
 
     def _pump_pcm(self, proc):
-        """生PCMを 20ms 単位で控えへ。★読み続けないと ffmpeg が詰まって止まる。"""
+        """生PCMを 20ms 単位で控えへ。★読み続けないと ffmpeg が詰まって止まる。
+
+        ★1 刻みぶん貯まるまで控えへ積まない
+          bufsize=0 で開いているので proc.stdout は FileIO。その read(n) は
+          「n バイト**まで**」しか約束せず、パイプに来ているぶんだけ返す。
+          実測（2026-09-07）: 3840 を要求して 3840 と 256 が交互に返り、
+          **読みの 50% が短かった**。短いものをそのまま 1 刻みとして積むと、
+          take() のゼロ埋めで「1.3ms の音＋18.7ms の無音」になり、
+          2 回に 1 回が無音というバリバリの音になる。
+        """
         chunk_bytes = (remote_mic.FRAMES_PER_TICK * remote_mic.OUTPUT_CHANNELS
                        * remote_mic.BYTES_PER_SAMPLE)
+        buf = bytearray()
         try:
             while True:
-                data = proc.stdout.read(chunk_bytes)
+                data = proc.stdout.read(chunk_bytes - len(buf))
                 if not data:
                     break
+                buf += data
+                if len(buf) < chunk_bytes:
+                    continue            # 短い読み。1 刻みぶん揃うまで待つ
+                chunk = bytes(buf)
+                del buf[:]
                 with self._lock:
                     if self._proc is not proc:
                         return
-                    self._pcm.append(data)      # maxlen で古い方が自然に落ちる
+                    self._pcm.append(chunk)     # maxlen で古い方が自然に落ちる
         except Exception:
             pass
         finally:
@@ -2830,7 +2855,8 @@ class StreamerCore:
                 self.config.get("karaoke_host_mic_route", False))
             self.config["karaoke_host_mic_route"] = bool(host_mic_route)
             if changed:
-                self.request_stream_reload()
+                self.request_stream_reload_if_sending()
+        was_enabled = bool(self.karaoke.enabled)
         settings = self.karaoke.configure(
             enabled=enabled, approval_required=approval_required,
             latency_mode=latency_mode, master_volume=master_volume,
@@ -2853,6 +2879,16 @@ class StreamerCore:
             self.karaoke.stop()
             for pid in list(self.karaoke.participants.keys()):
                 self.karaoke.remove_participant(pid)
+
+        # ★有効/無効の切り替えは FFmpeg の**入力構成**が変わる
+        #   歌声は名前付きパイプという 1 本の入力そのもの。配信を張ったときに
+        #   カラオケが無効だったら、その入力は存在しない。あとから有効にしても
+        #   フィルタグラフは起動時に固定されているので、**参加者の声は永久に
+        #   配信へ乗らない**（卓のVUは振れるし、監聴でも聞こえるので、
+        #   乗っていないことに気付きにくい）。音量やリバーブと違い、
+        #   ここだけは張り直しが要る。
+        if bool(settings["enabled"]) != was_enabled:
+            self.request_stream_reload_if_sending()
         return settings
 
     # ----------------------------------------------------------------------
@@ -2945,6 +2981,51 @@ class StreamerCore:
                     and self.config.get("karaoke_host_mic_route", False)
                     and str(self.config.get("live_audio_mic_device", "")).strip())
 
+    def karaoke_voice_bus_state(self):
+        """参加者の声が本当に配信へ流れているか。流れていないなら何が足りないか。
+
+        ★卓のVUが振れることと、配信に乗っていることは別物
+          歌声は Python のミキサまでは必ず届くので、VUは配信と無関係に振れる。
+          そこから先（FFmpeg へ渡っているか）は名前付きパイプが繋がっているか
+          でしか分からない。実際、画面キャプチャで配信しながら
+          「VUは振れているのに VRChat で聞こえない」で詰まった。
+        """
+        enabled = bool(self.karaoke.enabled)
+        mode = self.get_playback_mode()
+        mode_ok = mode in KARAOKE_VOICE_BUS_MODES
+        sending = self.is_sending()
+        sink = self.karaoke.sink
+        connected = bool(sink is not None and getattr(sink, "connected", False))
+
+        if not enabled:
+            reason = "カラオケ受付が無効です。"
+        elif not mode_ok:
+            label = KARAOKE_MODE_LABELS.get(mode, mode)
+            ok_labels = "・".join(KARAOKE_MODE_LABELS[m]
+                                  for m in KARAOKE_VOICE_BUS_MODES)
+            reason = (f"いまは「{label}」モードです。参加者の声を配信へ乗せられるのは"
+                      f"「{ok_labels}」のときだけです。")
+        elif not sending:
+            reason = "まだ配信していません。配信を開始すると乗ります。"
+        elif not connected:
+            reason = ("配信の音声にまだ繋がっていません。数秒待っても変わらなければ、"
+                      "配信を張り直してください。")
+        else:
+            reason = ""
+
+        return {
+            # ★受付が無効なら、パイプが繋がっていても乗っていない扱いにする
+            #   無効化と出口を畳むのは別の処理なので、切り替えの瞬間に
+            #   「無効なのに乗っています」と出る隙間がある。
+            "on_air": bool(enabled and mode_ok and sending and connected),
+            "mode": mode,
+            "mode_label": KARAOKE_MODE_LABELS.get(mode, mode),
+            "mode_ok": mode_ok,
+            "sending": sending,
+            "connected": connected,
+            "reason": reason,
+        }
+
     def start_karaoke_pipe(self):
         """配信を起こす直前に呼ぶ。(パイプ名, sink) を返す。カラオケ無効なら (None, None)。
 
@@ -2969,6 +3050,28 @@ class StreamerCore:
         except Exception:
             pass
         self.karaoke.close_sink(sink)
+
+    def is_sending(self):
+        """今まさに送出FFmpegが動いているか。
+
+        ★`is_running` ではない
+          あちらはアプリの寿命（起動から終了まで True）で、配信しているかとは
+          別物。入力構成を変える設定は「配信中なら張り直す／止まっているなら
+          何もしない」で分けたいので、ここで見分ける。
+        """
+        proc = self.send_proc
+        return bool(proc is not None and proc.poll() is None)
+
+    def request_stream_reload_if_sending(self):
+        """入力構成が変わったときの張り直し。止まっているなら何もしない。
+
+        ★止まっているときに要求を残さない
+          `reload_stream_event` は送出ループの中でしか消費されない。止まっている
+          間に立てると**次に配信を始めた瞬間に張り直しが走る**（次の開始時には
+          正しい構成で組み上がっているので、その張り直しは無駄なやり直し）。
+        """
+        if self.is_sending():
+            self.request_stream_reload()
 
     def request_stream_reload(self):
         """ストリームの再構築を要求する。連続呼び出しはデバウンスされ1回にまとまる。"""
@@ -5775,6 +5878,26 @@ class StreamerCore:
         app_helper = self.start_app_audio_capture()
         app_vol = self.config.get("live_audio_app_volume", 1.0)
 
+        # タスク27: 参加者の歌声。ライブ音声モードと同じ配線をここにも通す。
+        # ★通していなかったので、画面キャプチャで配信している間は参加者の声が
+        #   **原理的に配信へ乗らなかった**（卓のVUは振れるので気付けない）。
+        host_mic_via_python = self.karaoke_host_mic_is_routed()
+        if host_mic_via_python:
+            self.host_mic_monitor.request(mic_dev, capture=True)
+            self.karaoke.host_mic_source = self.host_mic_monitor
+            self.karaoke.configure(host_mic_volume=mic_vol)
+            # ★dshow 側からは外す。両方に入れると同じマイクが二重に乗り、
+            #   しかも片方だけ遅れて山びこになる。
+            mic_dev = ""
+            log_print("[Player] ホストのマイクはカラオケ卓経由（参加者へも配ります）")
+        else:
+            self.karaoke.host_mic_source = None
+            self.host_mic_monitor.release_capture()
+
+        karaoke_pipe, karaoke_sink = self.start_karaoke_pipe()
+        # 伴奏側の下駄は、歌声が実際に乗るときだけ履かせる。
+        bgm_delay = KARAOKE_BASE_DELAY_MS if karaoke_pipe else 0
+
         input_args_a, audio_filter, audio_map = build_audio_inputs(
             app_enabled=bool(app_helper),
             app_volume=app_vol,
@@ -5782,7 +5905,12 @@ class StreamerCore:
             loopback_device=loop_dev,
             mic_volume=mic_vol,
             loopback_volume=loop_vol,
-            start_index=1
+            start_index=1,
+            remote_mic_pipe=karaoke_pipe,
+            # ★常に 1.0。歌声バスのマスタ音量は Python 側のミキサで掛けている
+            #   （FFmpeg のフィルタ値は起動時に固定で、生放送中に動かせない）。
+            remote_mic_volume=1.0,
+            bgm_delay_ms=bgm_delay,
         )
 
         # ★ウィンドウ矩形は「配信を始める瞬間」の値を使う。以降ウィンドウを
@@ -5812,6 +5940,7 @@ class StreamerCore:
                 elif method == "wgc":
                     log_print("[Player] WGC が使えず、方式が 'wgc' 固定のため中止")
                     kill_proc(app_helper)
+                    self.karaoke.close_sink(karaoke_sink)
                     self.status = "error"
                     self.status_detail = "ウィンドウ単位キャプチャ(WGC)を開始できませんでした"
                     return None
@@ -5826,6 +5955,7 @@ class StreamerCore:
             log_print("[Player] Screen capture: could not resolve window capture plan.")
             kill_proc(app_helper)   # ここで抜けるなら補助exeも道連れにする
             kill_proc(win_helper)
+            self.karaoke.close_sink(karaoke_sink)
             self.status = "error"
             self.status_detail = "ウィンドウの取り込み方を決められませんでした"
             return None
@@ -5900,7 +6030,8 @@ class StreamerCore:
             *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"
         ])
 
-        log_print(f"[Player] Encoder path=screen_capture source={source_type} display={display_index} window='{window_title}' fps={fps} size={width}x{height} b:v={b_kbps}k")
+        karaoke_note = f" karaoke=on pipe={karaoke_pipe}" if karaoke_pipe else ""
+        log_print(f"[Player] Encoder path=screen_capture source={source_type} display={display_index} window='{window_title}' fps={fps} size={width}x{height} b:v={b_kbps}k{karaoke_note}")
 
         try:
             proc = subprocess.Popen(
@@ -5914,6 +6045,7 @@ class StreamerCore:
             log_print(f"[Player] Error starting screen capture sender: {e}")
             kill_proc(app_helper)
             kill_proc(win_helper)
+            self.karaoke.close_sink(karaoke_sink)
             self.status = "error"
             self.status_detail = f"Screen capture sender error: {e}"
             return None
@@ -5933,6 +6065,10 @@ class StreamerCore:
         if win_helper:
             threading.Thread(target=self.reap_window_capture_helper,
                              args=(proc, win_helper), daemon=True).start()
+        if karaoke_pipe:
+            # 送出FFmpegの寿命に紐づけて出口を閉じる（補助exeと同じ作法）。
+            threading.Thread(target=self.reap_karaoke_pipe,
+                             args=(proc, karaoke_sink), daemon=True).start()
 
         stop_event = threading.Event()
         threading.Thread(target=self.relay_stream_data,

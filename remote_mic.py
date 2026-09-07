@@ -34,6 +34,7 @@ import array
 import collections
 import ctypes
 import json
+import math
 import os
 import struct
 import subprocess
@@ -131,6 +132,12 @@ MAX_NAME_LEN = 24
 
 # レベル計（VU）の減衰。ピークホールドを緩やかに落とす。
 LEVEL_DECAY_PER_TICK = 0.86
+
+# 合成点のリミッタ（SoftLimiter）。
+# ★天井を 32767 ちょうどにしない: 丸めの誤差で最後の 1 サンプルが折り返す。
+LIMITER_CEILING = 31000.0          # ≒ -0.5dBFS
+# 戻りの速さ。速すぎると伴奏の打点ごとに音量が波打って聞こえる。
+LIMITER_RELEASE_MS = 120.0
 
 SILENCE_TICK = b"\x00" * (FRAMES_PER_TICK * OUTPUT_CHANNELS * BYTES_PER_SAMPLE)
 
@@ -922,6 +929,69 @@ class DelayLine:
         return samples
 
 
+class SoftLimiter:
+    """音を足す場所で飽和させないための、先読みの無いピークリミッタ。
+
+    ★なぜ要るのか（実測 2026-09-07）
+      伴奏ピーク 30000 の音源に歌声ピーク 12000 を足すと、監聴バスのサンプルの
+      **19.5% が天井に貼り付いた**。これが「バリバリ」の正体。足す側に余裕が
+      無いので、素材が大きいほど確実に歪む。
+
+    ★先読みを持たせない
+      監聴と歌い手モニターは「今この瞬間の演奏」に合わせるための音で、
+      1ms でも早い方がよい。先読みぶんの遅れは持ち込めないので、**今の
+      サンプルを見てから**必要なだけ下げる。立ち上がりは即座、戻りだけ緩やか。
+      超過ぶんは必ず抑えるので、天井を越えることはない。
+
+    ★左右で別々に下げない
+      チャンネルごとに違うゲインを掛けると、大きい方だけ引っ込んで定位が動く。
+      stride=2 のときは左右のうち大きい方を見て、同じゲインを両方へ掛ける。
+    """
+
+    def __init__(self, ceiling=LIMITER_CEILING, release_ms=LIMITER_RELEASE_MS):
+        self.ceiling = float(ceiling)
+        self.gain = 1.0
+        # 1 サンプルあたり、ゲインが 1.0 へ戻る歩幅。
+        self._up = 1.0 - math.exp(-1.0 / (SAMPLE_RATE * float(release_ms) / 1000.0))
+        self.reduction = 0.0        # 直近の刻みで下げた量（0.0〜1.0）。UI・試験用。
+
+    def process(self, samples, stride=1):
+        """その場で書き換える。stride=1 でモノラル、2 でインターリーブ。"""
+        ceiling = self.ceiling
+        up = self._up
+        g = self.gain
+        lowest = 1.0
+        stereo = (stride == 2)
+        for i in range(0, len(samples), stride):
+            a = samples[i]
+            if a < 0.0:
+                a = -a
+            if stereo:
+                b = samples[i + 1]
+                if b < 0.0:
+                    b = -b
+                if b > a:
+                    a = b
+            if a * g > ceiling:
+                # 今のサンプルが天井を越える。越えたぶんだけ即座に下げる。
+                g = ceiling / a
+                if g < lowest:
+                    lowest = g
+            samples[i] *= g
+            if stereo:
+                samples[i + 1] *= g
+            # ★戻すのは掛けた**後**
+            #   先に戻すと、そのぶんだけ天井をかすめて越える。掛けてから戻せば
+            #   「出力は必ず天井以下」が常に成り立つ。
+            if g < 1.0:
+                g += (1.0 - g) * up
+                if g > 1.0:
+                    g = 1.0
+        self.gain = g
+        self.reduction = 1.0 - lowest
+        return samples
+
+
 def mix_participants(sources, n_frames):
     """参加者ごとの (array('h') モノラル, 左ゲイン, 右ゲイン) を混ぜる。
 
@@ -1017,6 +1087,11 @@ class KaraokeSession:
         self._host_mic_flush = 0
         self.master_level = 0.0
         self.ticks = 0
+        # 音を足す場所は 3 つあり、どれも余裕が無い。それぞれに独立した
+        # リミッタを置く（1 本を使い回すと、片方の歪みで他方の音量が動く）。
+        self._limiter_out = SoftLimiter()      # 配信バス（VRChatへ）
+        self._limiter_ref = SoftLimiter()      # 歌い手モニター（伴奏＋ホスト）
+        self._limiter_mon = SoftLimiter()      # ホストの監聴（歌声＋伴奏）
 
         # 録音
         self.recordings_dir = recordings_dir or os.path.join(APP_DIR, "recordings")
@@ -1410,31 +1485,45 @@ class KaraokeSession:
         lvl = min(1.0, peak / 32768.0)
         self.master_level = lvl if lvl > self.master_level else self.master_level * LEVEL_DECAY_PER_TICK
 
-        pcm = (float_to_s16le(samples)
-               if (sources or has_bgm or self.reverb != "off"
-                   or self._delay_line._delay_frames)
-               else SILENCE_TICK)
+        # ★リミッタは VU を測った**後**に掛ける
+        #   先に掛けると master_level が天井に届かなくなり、ホストUIから
+        #   「突っ込みすぎている」ことが見えなくなる。メーターは素の音を出し、
+        #   実際に出て行く音だけを守る。
+        if (sources or has_bgm or self.reverb != "off"
+                or self._delay_line._delay_frames):
+            self._limiter_out.process(samples, OUTPUT_CHANNELS)
+            pcm = float_to_s16le(samples)
+        else:
+            pcm = SILENCE_TICK
         if self.sink:
             self.sink.write(pcm)
         self._write_recording(pcm)
         self.ticks += 1
 
     @staticmethod
-    def _pack_mono(frame_type, sources, n):
+    def _pack_mono(frame_type, sources, n, limiter=None):
         """複数のステレオ源を足してモノラルへ落とし、下りフレームに包む。
 
         ★モノラルへ落とす理由
           左右差は「合わせて演奏する」ために要らない。帯域が半分になる方が実利がある。
-        ★クリップは飽和させる。折り返すと轟音のノイズになる。
+        ★足した後にリミッタを通す
+          伴奏は**音量を掛ける前**の素の大きさで来る（歌い手が聴けなくなると
+          困るため）。歌声やホストのマイクを足せば当然天井を越えるので、
+          ここで抑える。飽和させるだけだと歪んで「バリバリ」になる。
+        ★飽和は最後の砦として残す。リミッタが効いていれば届かない。
         """
-        mono = array.array("h", bytes(n * BYTES_PER_SAMPLE))
+        acc_f = [0.0] * n
         for i in range(n):
             j = i * 2
             acc = 0.0
             for src in sources:
                 acc += src[j] + src[j + 1]
-            acc *= 0.5
-            iv = int(acc)
+            acc_f[i] = acc * 0.5
+        if limiter is not None:
+            limiter.process(acc_f, 1)
+        mono = array.array("h", bytes(n * BYTES_PER_SAMPLE))
+        for i in range(n):
+            iv = int(acc_f[i])
             if iv > 32767:
                 iv = 32767
             elif iv < -32768:
@@ -1462,7 +1551,8 @@ class KaraokeSession:
         sources = [x for x in (bgm, host_mic) if x is not None]
         if not sources:
             return
-        payload = self._pack_mono(DOWNSTREAM_TYPE_BGM, sources, n)
+        payload = self._pack_mono(DOWNSTREAM_TYPE_BGM, sources, n,
+                                  self._limiter_ref)
         for p in targets:
             p.push_downstream(payload)
 
@@ -1480,7 +1570,8 @@ class KaraokeSession:
         sources = [participant_mix]
         if bgm is not None:
             sources.append(bgm)
-        payload = self._pack_mono(DOWNSTREAM_TYPE_MONITOR, sources, n)
+        payload = self._pack_mono(DOWNSTREAM_TYPE_MONITOR, sources, n,
+                                  self._limiter_mon)
         for m in monitors:
             m.push_downstream(payload)
 

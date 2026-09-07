@@ -1255,13 +1255,18 @@
                             <i class="ri-sound-module-line text-primary"></i> ホスト卓（ミキサー）
                         </h3>
                         <div class="flex items-center gap-2">
-                            <span id="kaPipeState" class="text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500">配信未接続</span>
+                            <span id="kaPipeState" class="text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500">確認中</span>
                             <button id="kaRecBtn" onclick="karaokeToggleRecording()"
                                     class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-[11px] text-zinc-200 transition">
                                 <i id="kaRecIcon" class="ri-record-circle-line text-rose-400"></i><span id="kaRecLabel">セッション録音</span>
                             </button>
                         </div>
                     </div>
+
+                    <!-- ★「なぜ声が乗らないのか」をここで言い切る
+                         卓のVUは配信と無関係に振れるので、乗っていないことに
+                         気付けない。実際、画面キャプチャ配信中に詰まった。 -->
+                    <p id="kaPipeHint" class="text-[10px] text-amber-300 leading-relaxed hidden"></p>
 
                     <!-- 受付の開閉 -->
                     <div class="flex flex-wrap items-center gap-3 bg-zinc-900/60 border border-zinc-700 rounded p-3">
@@ -5463,24 +5468,40 @@ registerProcessor('mic-sender', MicSender);
             })[c]);
         }
 
+        // ★バッジは「パイプが繋がっているか」だけでは足りない
+        //   以前は繋がっていなければ一律「待機中（配信開始で接続）」と出していた。
+        //   ところが画面キャプチャ等では**配信していても永久に繋がらない**ので、
+        //   その案内は嘘になる。サーバ側で理由まで決めて、ここは映すだけにする。
+        function karaokeRenderVoiceBus(vb) {
+            const badge = document.getElementById('kaPipeState');
+            const hint = document.getElementById('kaPipeHint');
+            if (!vb) return;
+            if (badge) {
+                let text, cls;
+                if (vb.on_air) {
+                    text = '配信に乗っています';
+                    cls = 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300';
+                } else if (!vb.mode_ok || (vb.sending && !vb.connected)) {
+                    // 直さないと乗らない状態。埋もれないよう強く出す。
+                    text = '配信に乗っていません';
+                    cls = 'bg-amber-500/10 border-amber-500/30 text-amber-300';
+                } else {
+                    text = '待機中';
+                    cls = 'bg-zinc-800 border-zinc-700 text-zinc-400';
+                }
+                badge.innerText = text;
+                badge.className = 'text-[10px] font-mono px-2 py-1 rounded border ' + cls;
+            }
+            if (hint) {
+                hint.innerText = vb.reason || '';
+                hint.classList.toggle('hidden', !vb.reason);
+            }
+        }
+
         function karaokeRenderHost(k) {
             if (!k) return;
             karaokeApplyHostSettings(k);
             karaokeRenderSync(k);
-
-            const pipe = document.getElementById('kaPipeState');
-            if (pipe) {
-                if (k.pipe_connected) {
-                    pipe.innerText = '配信に接続中';
-                    pipe.className = 'text-[10px] font-mono px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300';
-                } else if (k.running) {
-                    pipe.innerText = '待機中（配信開始で接続）';
-                    pipe.className = 'text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-400';
-                } else {
-                    pipe.innerText = '停止中';
-                    pipe.className = 'text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500';
-                }
-            }
 
             ka.recording = !!k.recording;
             const recIcon = document.getElementById('kaRecIcon');
@@ -5606,6 +5627,7 @@ registerProcessor('mic-sender', MicSender);
                     ka.hostView = true;
                     karaokeApplyGuestView({ enabled: data.karaoke.enabled });
                     karaokeRenderHost(data.karaoke);
+                    karaokeRenderVoiceBus(data.voice_bus);
                     ka.hostMicRoute = !!data.host_mic_route;
                     karaokeRenderHostMic(data.host_mic);
                     if (data.karaoke.bgm) karaokeRenderBgm(data.karaoke.bgm);
