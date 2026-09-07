@@ -1307,6 +1307,62 @@
                     </div>
 
 
+
+                    <!-- 伴奏（タスク27-B）: YouTube等をカラオケの伴奏に使う -->
+                    <div class="border-t border-border pt-3 flex flex-col gap-3">
+                        <div class="flex items-center justify-between gap-2 flex-wrap">
+                            <span class="text-xs font-semibold text-zinc-200 flex items-center gap-2">
+                                <i class="ri-music-2-line text-primary"></i> 伴奏（YouTube / ファイル）
+                            </span>
+                            <span id="kaBgmState" class="text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 text-zinc-500">未読み込み</span>
+                        </div>
+
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input id="kaBgmSource" type="text" placeholder="YouTubeのURL、または音源ファイルのフルパス"
+                                   class="flex-1 bg-zinc-900 border border-zinc-700 rounded px-2.5 py-1.5 text-xs text-zinc-100 focus:border-primary outline-none">
+                            <button id="kaBgmLoadBtn" onclick="karaokeLoadHostBgm()"
+                                    class="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-primary hover:bg-primary-hover text-zinc-950 font-bold rounded text-xs transition shrink-0">
+                                <i class="ri-download-2-line"></i><span>読み込む</span>
+                            </button>
+                        </div>
+
+                        <div id="kaBgmTitle" class="text-[11px] text-zinc-400 truncate">曲が読み込まれていません</div>
+
+                        <div class="flex items-center gap-2">
+                            <button onclick="karaokeBgmCmd('bgm_play')" title="再生"
+                                    class="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 text-[11px] transition"><i class="ri-play-fill"></i></button>
+                            <button onclick="karaokeBgmCmd('bgm_pause')" title="一時停止"
+                                    class="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 text-[11px] transition"><i class="ri-pause-fill"></i></button>
+                            <button onclick="karaokeBgmCmd('bgm_stop')" title="停止"
+                                    class="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 text-[11px] transition"><i class="ri-stop-fill"></i></button>
+                            <input id="kaBgmSeek" type="range" min="0" max="1000" step="1" value="0"
+                                   oninput="karaokeOnBgmSeekInput()" onchange="karaokeBgmSeek()"
+                                   class="flex-1 accent-primary">
+                            <span id="kaBgmTime" class="text-[10px] font-mono text-zinc-500 w-24 text-right">0:00 / 0:00</span>
+                        </div>
+
+                        <div class="flex flex-col gap-1">
+                            <div class="flex items-center justify-between text-[11px] text-zinc-400">
+                                <span>伴奏音量（配信に乗る音）</span><span id="kaBgmVolVal" class="font-mono text-zinc-300">0.80</span>
+                            </div>
+                            <input id="kaBgmVol" type="range" min="0" max="2" step="0.05" value="0.8"
+                                   oninput="karaokeOnBgmVolInput(this.value)" onchange="karaokeBgmCmd('bgm_volume')"
+                                   class="w-full accent-emerald-500">
+                        </div>
+
+                        <div class="flex items-start gap-2 bg-zinc-900/60 border border-zinc-700 rounded p-2.5">
+                            <div class="flex-1 text-[10px] text-zinc-400 leading-relaxed">
+                                <b class="text-zinc-300">伴奏は ON AIR の参加者へ自動で配信されます。</b>
+                                歌い手はそれを手元モニターで聴きながら歌えます（1人あたり約768kbps）。<br>
+                                歌声は往復ぶん遅れて戻るので、<b>遅延補正</b>で詰めてください。
+                            </div>
+                            <button onclick="karaokeAutoOffset()"
+                                    class="shrink-0 px-2.5 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-[10px] text-zinc-50 font-bold transition">
+                                遅延補正を自動
+                            </button>
+                        </div>
+                    </div>
+
                     <!-- ホストのマイク（タスク27-A）
                          ★設定の実体は「ライブ音声取り込み」と同じ。ここは窓口を増やしただけ。
                            別項目にすると、どちらが配信に乗るのか利用者が判断できなくなる。 -->
@@ -4744,6 +4800,7 @@
                 try { ka.ws.close(); } catch (e) {}
                 ka.ws = null;
             }
+            karaokeStopHostBgm();
             karaokeStopAudio();
             if (ka.pingTimer) { clearInterval(ka.pingTimer); ka.pingTimer = null; }
             if (ka.vuTimer) { clearInterval(ka.vuTimer); ka.vuTimer = null; }
@@ -4773,7 +4830,11 @@
                 };
 
                 ws.onmessage = (ev) => {
-                    if (typeof ev.data !== 'string') return;
+                    if (typeof ev.data !== 'string') {
+                        // バイナリはホストから配られる伴奏。手元モニターで鳴らす。
+                        karaokeOnDownstream(ev.data);
+                        return;
+                    }
                     let msg;
                     try { msg = JSON.parse(ev.data); } catch (e) { return; }
                     karaokeHandleMessage(msg);
@@ -5042,7 +5103,10 @@ registerProcessor('mic-sender', MicSender);
 
         function karaokeSetBgmMonitor(v) {
             document.getElementById('kaBgmMonVal').innerText = `${Math.round(parseFloat(v) * 100)}%`;
+            // 手元のファイルと、ホストから配られる伴奏の両方に効かせる。
+            // 片方だけだと「音量を下げたのに片方だけ鳴り続ける」ことになる。
             if (ka.bgmMonGain) ka.bgmMonGain.gain.value = parseFloat(v);
+            if (ka.hostBgmGain) ka.hostBgmGain.gain.value = parseFloat(v);
         }
 
         function karaokeSetBgmSend(v) {
@@ -5415,6 +5479,7 @@ registerProcessor('mic-sender', MicSender);
                     karaokeApplyGuestView({ enabled: data.karaoke.enabled });
                     karaokeRenderHost(data.karaoke);
                     karaokeRenderHostMic(data.host_mic);
+                    if (data.karaoke.bgm) karaokeRenderBgm(data.karaoke.bgm);
                 } else {
                     karaokeApplyGuestView(data);
                 }
@@ -5579,6 +5644,229 @@ registerProcessor('mic-sender', MicSender);
             hint.className = msg
                 ? 'text-[11px] leading-relaxed rounded p-2.5 border text-amber-300 bg-amber-500/10 border-amber-500/30'
                 : 'hidden text-[11px] leading-relaxed rounded p-2.5 border';
+        }
+
+
+        // ===================================================================
+        // タスク27-B: ホストから配られる伴奏を手元モニターで鳴らす
+        //
+        // ★上りへは混ぜない
+        //   ホスト側が同じ伴奏を配信バスに乗せている。こちらから送り返すと
+        //   二重になり、しかも往復ぶんずれて “山びこ” になる。**聴くだけ**。
+        //
+        // ★再生はスケジュール方式
+        //   届いたチャンクを AudioBufferSourceNode として時間指定で並べる。
+        //   一定の先読み（プリロール）を確保してから鳴らし始めることで、
+        //   多少の揺らぎでは途切れない。
+        // ===================================================================
+        const KARAOKE_DOWNSTREAM_BGM = 1;      // サーバと合わせた種別バイト
+        const KARAOKE_DOWNSTREAM_HEADER = 4;   // ヘッダ長（16bit境界を保つため4）
+        // 鳴らし始める前に貯める時間。短いと途切れ、長いと歌いにくくなる。
+        const KARAOKE_BGM_PREROLL_SEC = 0.18;
+        // ここまで遅れたら作り直す（溜まりすぎて“遅れて聞こえる”のを防ぐ）
+        const KARAOKE_BGM_MAX_LEAD_SEC = 0.9;
+
+        function karaokeEnsureBgmChain() {
+            if (!ka.ac || ka.hostBgmGain) return;
+            ka.hostBgmGain = ka.ac.createGain();
+            ka.hostBgmGain.gain.value =
+                parseFloat(document.getElementById('kaBgmMonitor').value || '0.8');
+            // ★モニターへのみ。uplink には繋がない（二重送出の防止）。
+            ka.hostBgmGain.connect(ka.ac.destination);
+            ka.hostBgmNext = 0;
+        }
+
+        function karaokeOnDownstream(buffer) {
+            const view = new Uint8Array(buffer);
+            if (view.length <= KARAOKE_DOWNSTREAM_HEADER) return;
+            if (view[0] !== KARAOKE_DOWNSTREAM_BGM) return;
+            if (!ka.ac) return;
+            karaokeEnsureBgmChain();
+
+            const pcm = new Int16Array(buffer, KARAOKE_DOWNSTREAM_HEADER,
+                                       (view.length - KARAOKE_DOWNSTREAM_HEADER) >> 1);
+            const ac = ka.ac;
+            const buf = ac.createBuffer(1, pcm.length, KARAOKE_SAMPLE_RATE);
+            const ch = buf.getChannelData(0);
+            for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+
+            const now = ac.currentTime;
+            if (ka.hostBgmNext < now + 0.01) {
+                // 初回、または途切れた後。プリロールぶん先から並べ直す。
+                ka.hostBgmNext = now + KARAOKE_BGM_PREROLL_SEC;
+            } else if (ka.hostBgmNext > now + KARAOKE_BGM_MAX_LEAD_SEC) {
+                // 溜まりすぎ。放っておくと伴奏だけどんどん遅れて歌えなくなる。
+                ka.hostBgmNext = now + KARAOKE_BGM_PREROLL_SEC;
+                ka.hostBgmResyncs = (ka.hostBgmResyncs || 0) + 1;
+            }
+            const src = ac.createBufferSource();
+            src.buffer = buf;
+            src.connect(ka.hostBgmGain);
+            src.start(ka.hostBgmNext);
+            ka.hostBgmNext += buf.duration;
+            ka.hostBgmActiveAt = performance.now();
+        }
+
+        function karaokeHostBgmIsLive() {
+            // 1秒以上届いていなければ「鳴っていない」
+            return !!ka.hostBgmActiveAt && (performance.now() - ka.hostBgmActiveAt) < 1000;
+        }
+
+        function karaokeStopHostBgm() {
+            ka.hostBgmNext = 0;
+            ka.hostBgmActiveAt = 0;
+            try { if (ka.hostBgmGain) ka.hostBgmGain.disconnect(); } catch (e) {}
+            ka.hostBgmGain = null;
+        }
+
+
+        // ===================================================================
+        // タスク27-B: ホスト卓の伴奏操作
+        // ===================================================================
+        let karaokeBgmTouchedAt = 0;   // シーク/音量を触った直後は書き戻さない
+
+        function karaokeFmtTime(sec) {
+            const s = Math.max(0, Math.floor(Number(sec) || 0));
+            return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+        }
+
+        async function karaokeLoadHostBgm() {
+            const src = (document.getElementById('kaBgmSource').value || '').trim();
+            if (!src) { showToast('URL かファイルのパスを入れてください', 'warning'); return; }
+            const btn = document.getElementById('kaBgmLoadBtn');
+            btn.disabled = true;
+            const title = document.getElementById('kaBgmTitle');
+            title.innerText = '読み込み中...（YouTube は数秒かかります）';
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'bgm_load', source: src, autoplay: false }),
+                });
+                const data = await res.json();
+                if (!data.success) {
+                    showToast(data.message || '読み込めませんでした', 'danger');
+                    title.innerText = '読み込めませんでした';
+                    return;
+                }
+                showToast(`伴奏を読み込みました: ${data.bgm.title || ''}`, 'success');
+                karaokeRenderBgm(data.bgm);
+            } catch (e) {
+                showToast(`読み込めませんでした: ${e.message || e}`, 'danger');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function karaokeBgmCmd(action) {
+            karaokeBgmTouchedAt = Date.now();
+            const body = { action };
+            if (action === 'bgm_volume') {
+                body.volume = parseFloat(document.getElementById('kaBgmVol').value);
+            }
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json();
+                if (data.success) karaokeRenderBgm(data.bgm);
+                else showToast(data.message || '操作できません', 'warning');
+            } catch (e) {
+                showToast(`操作できません: ${e.message || e}`, 'danger');
+            }
+        }
+
+        function karaokeOnBgmVolInput(v) {
+            karaokeBgmTouchedAt = Date.now();
+            document.getElementById('kaBgmVolVal').innerText = parseFloat(v).toFixed(2);
+        }
+
+        function karaokeOnBgmSeekInput() {
+            karaokeBgmTouchedAt = Date.now();
+            const dur = ka.bgmDuration || 0;
+            const pos = (parseInt(document.getElementById('kaBgmSeek').value, 10) / 1000) * dur;
+            document.getElementById('kaBgmTime').innerText =
+                `${karaokeFmtTime(pos)} / ${karaokeFmtTime(dur)}`;
+        }
+
+        async function karaokeBgmSeek() {
+            karaokeBgmTouchedAt = Date.now();
+            const dur = ka.bgmDuration || 0;
+            if (!dur) { showToast('曲の長さが分からないためシークできません', 'warning'); return; }
+            const pos = (parseInt(document.getElementById('kaBgmSeek').value, 10) / 1000) * dur;
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'bgm_seek', position: pos }),
+                });
+                const data = await res.json();
+                if (data.success) karaokeRenderBgm(data.bgm);
+            } catch (e) {}
+        }
+
+        async function karaokeAutoOffset() {
+            try {
+                const res = await fetch(`${apiBase}/api/karaoke`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'offset_auto' }),
+                });
+                const data = await res.json();
+                if (!data.success) { showToast(data.message || '自動調整できません', 'warning'); return; }
+                showToast(`遅延補正を ${data.applied_offset_ms} ms にしました（往復ぶんの戻し）`, 'success');
+                ka.hostDragging = false;
+                karaokeRenderHost(data.karaoke);
+            } catch (e) {
+                showToast(`自動調整できません: ${e.message || e}`, 'danger');
+            }
+        }
+
+        function karaokeRenderBgm(b) {
+            if (!b) return;
+            ka.bgmDuration = Number(b.duration) || 0;
+
+            const badge = document.getElementById('kaBgmState');
+            if (badge) {
+                const map = {
+                    idle: ['停止中', 'text-zinc-500'],
+                    loading: ['読み込み中', 'text-sky-300'],
+                    playing: ['再生中 → 歌い手へ配信中', 'text-emerald-300'],
+                    paused: ['一時停止', 'text-amber-300'],
+                    error: ['エラー', 'text-rose-300'],
+                };
+                const [txt, cls] = map[b.state] || map.idle;
+                badge.innerText = b.loaded ? txt : '未読み込み';
+                badge.className = 'text-[10px] font-mono px-2 py-1 rounded bg-zinc-800 border border-zinc-700 ' + cls;
+            }
+
+            const title = document.getElementById('kaBgmTitle');
+            if (title) {
+                // ★エラー色は state が error のときだけ。FFmpeg は無害な行も stderr に
+                //   出すので、error 文字列の有無で赤くすると正常な曲まで赤くなる。
+                const failed = (b.state === 'error');
+                title.innerText = failed
+                    ? `エラー: ${b.error || '再生できません'}`
+                    : (b.title || (b.loaded ? '(タイトル不明)' : '曲が読み込まれていません'));
+                title.className = 'text-[11px] truncate ' + (failed ? 'text-rose-400' : 'text-zinc-300');
+            }
+
+            // 触った直後は書き戻さない（掴んだ端から戻ると操作できない）
+            if (Date.now() - karaokeBgmTouchedAt > 2500) {
+                const seek = document.getElementById('kaBgmSeek');
+                if (seek && ka.bgmDuration > 0) {
+                    seek.value = Math.round((b.position / ka.bgmDuration) * 1000);
+                }
+                const vol = document.getElementById('kaBgmVol');
+                if (vol && parseFloat(vol.value) !== b.volume) {
+                    vol.value = b.volume;
+                    document.getElementById('kaBgmVolVal').innerText = Number(b.volume).toFixed(2);
+                }
+                const t = document.getElementById('kaBgmTime');
+                if (t) t.innerText = `${karaokeFmtTime(b.position)} / ${karaokeFmtTime(b.duration)}`;
+            }
         }
 
     </script>

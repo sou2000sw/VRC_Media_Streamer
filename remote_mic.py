@@ -31,10 +31,12 @@
 """
 
 import array
+import collections
 import ctypes
 import json
 import os
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -58,6 +60,30 @@ if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ★streamer_core と同じ値をここでも持つ。あちらを先頭 import できないため。
+#   付け忘れると、伴奏をデコードするたびに黒いコンソールが一瞬開く。
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+def kill_proc(proc, timeout=2.0):
+    """子プロセスを確実に終わらせる。streamer_core の同名関数と同じ役割。
+
+    ★terminate() だけで済ませない。パイプ待ちで固まった ffmpeg は
+      terminate に反応しないことがあり、居座って次の再生を邪魔する。
+    """
+    if not proc:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=timeout)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -107,6 +133,10 @@ MAX_NAME_LEN = 24
 LEVEL_DECAY_PER_TICK = 0.86
 
 SILENCE_TICK = b"\x00" * (FRAMES_PER_TICK * OUTPUT_CHANNELS * BYTES_PER_SAMPLE)
+
+# 歌い手へ配る伴奏の控えの上限（1人あたり）。20ms × 25 = 0.5 秒。
+# これ以上溜めても、届く頃には歌う役に立たない音になっている。
+BGM_DOWNSTREAM_MAX_CHUNKS = 25
 
 
 def clamp(v, lo, hi):
@@ -227,6 +257,65 @@ class Participant:
         self.jitter_ms = 0
         self.joined_at = time.time()
         self.conn = None              # WebSocketConnection（送信用）
+
+        # ---- 下り（伴奏を歌い手へ配る）----
+        # ★ミキサのスレッドから直接 send してはいけない。相手の回線が詰まると
+        #   ソケット書き込みがブロックし、**ミキサごと止まって全員の音が壊れる**。
+        #   上限付きの控えに積み、この参加者専用のスレッドが送り出す。
+        self._down_q = collections.deque()
+        self._down_cv = threading.Condition()
+        self._down_stop = False
+        self._down_thread = None
+        self.downstream_dropped = 0
+
+    # ------------------------------------------------------------------
+    def start_downstream(self):
+        if self._down_thread:
+            return
+        self._down_stop = False
+        self._down_thread = threading.Thread(
+            target=self._downstream_loop, name=f"karaoke-down-{self.id[:6]}",
+            daemon=True)
+        self._down_thread.start()
+
+    def stop_downstream(self):
+        with self._down_cv:
+            self._down_stop = True
+            self._down_q.clear()
+            self._down_cv.notify_all()
+        self._down_thread = None
+
+    def push_downstream(self, data):
+        """伴奏フレームを控えに積む。溜まりすぎたら**古い方を捨てる**。
+
+        捨てないと、詰まった相手のために遅延が伸び続け、しかも意味のない
+        過去の音を後生大事に送ることになる。
+        """
+        with self._down_cv:
+            if self._down_stop:
+                return
+            if len(self._down_q) >= BGM_DOWNSTREAM_MAX_CHUNKS:
+                self._down_q.popleft()
+                self.downstream_dropped += 1
+            self._down_q.append(data)
+            self._down_cv.notify()
+
+    def _downstream_loop(self):
+        while True:
+            with self._down_cv:
+                while not self._down_q and not self._down_stop:
+                    self._down_cv.wait(0.25)
+                if self._down_stop:
+                    return
+                chunk = self._down_q.popleft()
+            conn = self.conn
+            if not conn:
+                continue
+            try:
+                conn.send_binary(chunk)
+            except Exception:
+                # 相手が消えた。受信側のループが後始末をするので、ここは黙って降りる。
+                return
 
     @property
     def audible(self):
@@ -428,6 +517,280 @@ class NamedPipeSink:
 
 
 # --------------------------------------------------------------------------
+# 伴奏プレイヤー（タスク27-B: YouTube等をカラオケの伴奏に使う）
+# --------------------------------------------------------------------------
+# ★なぜ FFmpeg の入力ではなく Python で持つのか
+#   FFmpeg の入力は**プロセス起動時に固定**される。伴奏を FFmpeg の入力にすると、
+#   曲送り・一時停止・シークのたびに配信を張り直すことになる。カラオケは
+#   曲を次々に変えるものなので、それでは使い物にならない。
+#   Python 側のバスに置けば、再生操作はどれも配信を止めずに効く。
+#
+# ★歌い手に伴奏をどう届けるか（ここが案1の肝）
+#   ホストが鳴らした伴奏は、配信に乗って VRChat へ届くまで数秒かかる。
+#   数秒遅れの伴奏では歌えないので、**同じ音を WebSocket で歌い手へ直接配る**。
+#   歌い手はそれを手元モニターで聴きながら歌う。
+#
+# ★整合（どれをどれだけ遅らせるか）
+#   伴奏は「伴奏側」なので、ホストマイクや PC 音声と同じ固定 500ms の下駄を履く。
+#   歌声は 500+offset。歌い手は伴奏を下りで受け取ってから歌うので、
+#   往復ぶん（RTT）だけ戻す必要がある。したがって理論値は **offset ≒ −RTT**。
+#   RTT は測っているので、卓から自動で当てられる。
+BGM_STATE_IDLE = "idle"
+BGM_STATE_LOADING = "loading"
+BGM_STATE_PLAYING = "playing"
+BGM_STATE_PAUSED = "paused"
+BGM_STATE_ERROR = "error"
+
+# 伴奏デコーダから先読みしておく量。これ以上は溜めない（＝デコーダが自然に待つ）。
+BGM_QUEUE_TICKS = 25          # 20ms × 25 = 0.5 秒
+
+# 下りで歌い手へ配る音声フレームの種別（1バイト目）
+DOWNSTREAM_TYPE_BGM = 1
+DOWNSTREAM_HEADER = 4         # [0]=種別, [1..3]=予約。4バイトにして16bit境界を保つ
+
+
+class AccompanimentPlayer:
+    """伴奏（YouTube の音声URL / ローカル音源）を FFmpeg でデコードして供給する。
+
+    ★ペーシングはミキサ任せ
+      こちらは `take()` された分だけ読み進める。キューが埋まればデコーダは
+      パイプ書き込みでブロックするので、`-re` を付けなくても実時間で進む。
+      一時停止は「読むのをやめる」だけでよい。
+    """
+
+    def __init__(self, ffmpeg_cmd="ffmpeg"):
+        self._ffmpeg = ffmpeg_cmd
+        self._lock = threading.Lock()
+        self._proc = None
+        self._queue = collections.deque()
+        self._queue_cv = threading.Condition(self._lock)
+        self._state = BGM_STATE_IDLE
+        self._title = ""
+        self._duration = 0.0
+        self._error = ""
+        self._frames_played = 0        # 再生位置（シーク基準からのフレーム数）
+        self._seek_base = 0.0          # -ss で飛ばした秒数
+        self._source = None            # (url, headers) 再シーク用に覚えておく
+        self.volume = 0.8
+        self.level = 0.0
+
+    # ---------------- 状態 ----------------
+    def snapshot(self):
+        with self._lock:
+            pos = self._seek_base + self._frames_played / float(SAMPLE_RATE)
+            return {
+                "state": self._state,
+                "title": self._title,
+                "duration": round(self._duration, 1),
+                "position": round(pos, 1),
+                "volume": round(self.volume, 2),
+                "level": round(self.level, 3),
+                "error": self._error,
+                "loaded": bool(self._source),
+            }
+
+    @property
+    def playing(self):
+        return self._state == BGM_STATE_PLAYING
+
+    # ---------------- 操作 ----------------
+    def load(self, url, headers=None, title="", duration=0.0, autoplay=True):
+        """伴奏を差し替える。url は YouTube の音声URLでもローカルパスでもよい。"""
+        with self._lock:
+            self._source = (url, headers or {})
+            self._title = title or ""
+            self._duration = float(duration or 0.0)
+            self._error = ""
+        self._start_decoder(seek=0.0)
+        if not autoplay:
+            self.pause()
+        return self.snapshot()
+
+    def play(self):
+        with self._lock:
+            if not self._source:
+                return self.snapshot()
+            self._state = BGM_STATE_PLAYING
+            # 一時停止中はミキサが読み進めないのでデコーダも待っている。
+            # 起こしてやらないと再開しない。
+            self._queue_cv.notify_all()
+        if not self._proc:
+            self._start_decoder(seek=self._seek_base
+                                + self._frames_played / float(SAMPLE_RATE))
+        return self.snapshot()
+
+    def pause(self):
+        # ★LOADING のときも止められること。読み込み直後（まだデコーダの最初の
+        #   チャンクが来ていない）に止めようとすると、素通りしてしまい、
+        #   デコード開始と同時に鳴り出す。autoplay=False がこれで効かなかった。
+        with self._lock:
+            if self._state in (BGM_STATE_PLAYING, BGM_STATE_LOADING):
+                self._state = BGM_STATE_PAUSED
+        return self.snapshot()
+
+    def stop(self):
+        self._kill_decoder()
+        with self._lock:
+            self._state = BGM_STATE_IDLE
+            self._queue.clear()
+            self._frames_played = 0
+            self._seek_base = 0.0
+            self.level = 0.0
+        return self.snapshot()
+
+    def seek(self, seconds):
+        """★シークはデコーダを立て直す。音のバッファも捨てないと前の位置が混ざる。"""
+        try:
+            sec = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return self.snapshot()
+        with self._lock:
+            if not self._source:
+                return self.snapshot()
+        self._start_decoder(seek=sec)
+        return self.snapshot()
+
+    def set_volume(self, v):
+        try:
+            self.volume = clamp(float(v), 0.0, 2.0)
+        except (TypeError, ValueError):
+            pass
+        return self.snapshot()
+
+    # ---------------- ミキサからの取り出し ----------------
+    def take(self, n_frames):
+        """ステレオ interleaved の array('h') を返す。無ければ無音。
+
+        再生中でなければ**読み進めない**（＝一時停止）。
+        """
+        need = n_frames * OUTPUT_CHANNELS
+        with self._lock:
+            if self._state != BGM_STATE_PLAYING:
+                return None
+            if not self._queue:
+                # デコーダが追いついていない。無音を返して時間軸だけ進める。
+                return None
+            chunk = self._queue.popleft()
+            self._frames_played += n_frames
+            self._queue_cv.notify_all()
+        out = array.array("h")
+        out.frombytes(chunk)
+        if sys.byteorder != "little":
+            out.byteswap()
+        if len(out) < need:
+            out.extend([0] * (need - len(out)))
+        return out
+
+    # ---------------- デコーダ ----------------
+    def _build_cmd(self, url, headers, seek):
+        cmd = [self._ffmpeg, "-hide_banner", "-loglevel", "error"]
+        if headers:
+            cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+        # ★-ss は -i の前に置く（キーフレーム単位の高速シーク）。
+        if seek and seek > 0.05:
+            cmd += ["-ss", f"{seek:.2f}"]
+        cmd += ["-i", url,
+                "-vn",
+                "-f", "s16le", "-acodec", "pcm_s16le",
+                "-ar", str(SAMPLE_RATE), "-ac", str(OUTPUT_CHANNELS),
+                "-"]
+        return cmd
+
+    def _start_decoder(self, seek=0.0):
+        self._kill_decoder()
+        with self._lock:
+            source = self._source
+            if not source:
+                return
+            url, headers = source
+            self._queue.clear()
+            self._frames_played = 0
+            self._seek_base = float(seek or 0.0)
+            self._state = BGM_STATE_LOADING
+        try:
+            proc = subprocess.Popen(
+                self._build_cmd(url, headers, seek),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=0,
+                creationflags=CREATE_NO_WINDOW)
+        except Exception as e:
+            with self._lock:
+                self._state = BGM_STATE_ERROR
+                self._error = str(e)
+            log_print(f"[Karaoke] 伴奏デコーダを起動できません: {e}")
+            return
+        with self._lock:
+            self._proc = proc
+        threading.Thread(target=self._read_loop, args=(proc,),
+                         name="karaoke-bgm", daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(proc,),
+                         name="karaoke-bgm-err", daemon=True).start()
+
+    def _read_loop(self, proc):
+        """デコード結果を 20ms 単位でキューへ。満杯なら待つ（＝自然な実時間ペース）。"""
+        chunk_bytes = FRAMES_PER_TICK * OUTPUT_CHANNELS * BYTES_PER_SAMPLE
+        started = False
+        try:
+            while True:
+                data = proc.stdout.read(chunk_bytes)
+                if not data:
+                    break
+                with self._lock:
+                    if self._proc is not proc:
+                        return              # 差し替えられた
+                    while (len(self._queue) >= BGM_QUEUE_TICKS
+                           and self._proc is proc):
+                        self._queue_cv.wait(0.2)
+                    if self._proc is not proc:
+                        return
+                    self._queue.append(data)
+                    if not started:
+                        started = True
+                        if self._state == BGM_STATE_LOADING:
+                            self._state = BGM_STATE_PLAYING
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            with self._lock:
+                if self._proc is proc:
+                    # 曲が最後まで流れ切った。位置は残したまま止める。
+                    self._proc = None
+                    if self._state in (BGM_STATE_PLAYING, BGM_STATE_LOADING):
+                        self._state = BGM_STATE_IDLE
+                        log_print("[Karaoke] 伴奏の再生が終わりました")
+
+    def _read_stderr(self, proc):
+        """★読み続けないとバッファが詰まってデコーダが止まる。"""
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                log_print(f"[Karaoke:BGM] {line}")
+                with self._lock:
+                    self._error = line[:200]
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    def _kill_decoder(self):
+        with self._lock:
+            proc, self._proc = self._proc, None
+            self._queue.clear()
+            self._queue_cv.notify_all()
+        if proc:
+            kill_proc(proc)
+
+
+# --------------------------------------------------------------------------
 # ミキサ
 # --------------------------------------------------------------------------
 class ReverbLine:
@@ -570,7 +933,7 @@ class KaraokeSession:
     FFmpeg への出口（NamedPipeSink）だけが配信のたびに開閉する。
     """
 
-    def __init__(self, config_get=None, recordings_dir=None):
+    def __init__(self, config_get=None, recordings_dir=None, ffmpeg_cmd="ffmpeg"):
         self._lock = threading.RLock()
         self.participants = {}          # id -> Participant
         self.enabled = False
@@ -586,6 +949,13 @@ class KaraokeSession:
         self._mixer_stop = threading.Event()
         self._reverb_line = ReverbLine()
         self._delay_line = DelayLine(KARAOKE_BASE_DELAY_MS * 2)
+        # タスク27-B: 伴奏バス。歌声とは**別の遅延**を持つ（伴奏側の固定 500ms）。
+        self.bgm = AccompanimentPlayer(ffmpeg_cmd=ffmpeg_cmd)
+        self._bgm_delay = DelayLine(KARAOKE_BASE_DELAY_MS)
+        self._bgm_delay.set_delay_ms(KARAOKE_BASE_DELAY_MS)
+        # 伴奏が止まった後、遅延ラインに残った尾を吐き切るまでの刻み数。
+        self._bgm_flush_ticks = ms_to_frames(KARAOKE_BASE_DELAY_MS) // FRAMES_PER_TICK + 2
+        self._bgm_flush = 0
         self.master_level = 0.0
         self.ticks = 0
 
@@ -660,6 +1030,7 @@ class KaraokeSession:
             "recording_path": os.path.basename(self._wave_path or ""),
             "recording_seconds": (int(time.time() - self._record_started_at)
                                   if self.is_recording else 0),
+            "bgm": self.bgm.snapshot(),
         })
         return data
 
@@ -677,6 +1048,7 @@ class KaraokeSession:
             if not self.approval_required:
                 p.state = STATE_ACTIVE
             self.participants[client_id] = p
+        p.start_downstream()
         log_print(f"[Karaoke] join id={client_id[:8]} name={clean!r} state={p.state}")
         return (p, None)
 
@@ -684,6 +1056,7 @@ class KaraokeSession:
         with self._lock:
             p = self.participants.pop(client_id, None)
         if p:
+            p.stop_downstream()
             log_print(f"[Karaoke] leave id={client_id[:8]} name={p.name!r}")
         return p
 
@@ -785,6 +1158,7 @@ class KaraokeSession:
         if t:
             t.join(timeout=2.0)
         self._mixer_thread = None
+        self.bgm.stop()
         self.close_sink()
         self.stop_recording()
         self.master_level = 0.0
@@ -847,6 +1221,30 @@ class KaraokeSession:
             self._reverb_line.process(samples)
         self._delay_line.process(samples)
 
+        # ---- 伴奏（タスク27-B）----
+        # ★歌い手へは「遅延を掛ける前・音量を掛ける前」の音を配る。
+        #   ・遅延前: 歌い手にはできるだけ早く届いた方が歌いやすい
+        #   ・音量前: ホストが配信side の伴奏を絞っても、歌い手が聴けなくならない
+        bgm = self.bgm.take(n)
+        if bgm is not None:
+            self._bgm_flush = self._bgm_flush_ticks
+            self._broadcast_bgm(bgm, n)
+        if bgm is not None or self._bgm_flush > 0:
+            vol = self.bgm.volume
+            if bgm is None:
+                self._bgm_flush -= 1
+                bgm_f = [0.0] * (n * OUTPUT_CHANNELS)
+            else:
+                bgm_f = [bgm[i] * vol for i in range(n * OUTPUT_CHANNELS)]
+            # 伴奏は「伴奏側」。ホストマイクや PC 音声と同じ固定 500ms の下駄を履く。
+            # 歌声（500+offset）と違い、遅延補正スライダでは動かさない。
+            self._bgm_delay.process(bgm_f)
+            for i in range(n * OUTPUT_CHANNELS):
+                samples[i] += bgm_f[i]
+            has_bgm = True
+        else:
+            has_bgm = False
+
         # マスタのピーク（ホストUIの「配信に乗っている音」の目安）
         peak = 0.0
         for v in samples:
@@ -856,11 +1254,41 @@ class KaraokeSession:
         lvl = min(1.0, peak / 32768.0)
         self.master_level = lvl if lvl > self.master_level else self.master_level * LEVEL_DECAY_PER_TICK
 
-        pcm = float_to_s16le(samples) if sources or self.reverb != "off" or self._delay_line._delay_frames else SILENCE_TICK
+        pcm = (float_to_s16le(samples)
+               if (sources or has_bgm or self.reverb != "off"
+                   or self._delay_line._delay_frames)
+               else SILENCE_TICK)
         if self.sink:
             self.sink.write(pcm)
         self._write_recording(pcm)
         self.ticks += 1
+
+    def _broadcast_bgm(self, stereo, n):
+        """伴奏を ON AIR の参加者へ配る（歌い手の手元モニター用）。
+
+        ★ON AIR の人にだけ送る
+          48kHz モノラルで 1 人あたり約 768kbps。待機中の全員へ配ると
+          ホストの上り帯域がその人数倍になる。歌っている人が聴ければ足りる。
+
+        ★モノラルへ落とす
+          伴奏の左右差は歌うために要らない。帯域を半分にする方が実利がある。
+        """
+        with self._lock:
+            targets = [p for p in self.participants.values()
+                       if p.state == STATE_ACTIVE and p.conn is not None]
+        if not targets:
+            return
+        mono = array.array("h", bytes(n * BYTES_PER_SAMPLE))
+        j = 0
+        for i in range(n):
+            v = (stereo[j] + stereo[j + 1]) >> 1
+            mono[i] = v
+            j += 2
+        if sys.byteorder != "little":
+            mono.byteswap()
+        payload = bytes((DOWNSTREAM_TYPE_BGM, 0, 0, 0)) + mono.tobytes()
+        for p in targets:
+            p.push_downstream(payload)
 
     # ---------------- 録音（設計書 5.3） ----------------
     @property
@@ -872,8 +1300,14 @@ class KaraokeSession:
             return self._wave_path
         try:
             os.makedirs(self.recordings_dir, exist_ok=True)
-            name = time.strftime("karaoke_%Y%m%d_%H%M%S.wav")
-            path = os.path.join(self.recordings_dir, name)
+            # ★秒単位の名前は衝突する。停止してすぐ録り直すと、同じ秒に入って
+            #   前のテイクを黙って上書きしてしまう。空いている名前まで送る。
+            base = time.strftime("karaoke_%Y%m%d_%H%M%S")
+            path = os.path.join(self.recordings_dir, base + ".wav")
+            serial = 2
+            while os.path.exists(path):
+                path = os.path.join(self.recordings_dir, f"{base}_{serial}.wav")
+                serial += 1
             wf = wave.open(path, "wb")
             wf.setnchannels(OUTPUT_CHANNELS)
             wf.setsampwidth(BYTES_PER_SAMPLE)

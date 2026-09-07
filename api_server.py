@@ -1545,6 +1545,59 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 })
                 return
 
+            # タスク27-B: 伴奏（YouTube 等）。ホスト卓からのみ。
+            if action.startswith("bgm_"):
+                bgm = session.bgm
+                if action == "bgm_load":
+                    # ★yt-dlp の解決は数秒かかることがある。ここは POST の中で
+                    #   同期に行う（結果を返さないと、UI が成否を出せない）。
+                    result = self.streamer_core.load_karaoke_bgm(
+                        body_json.get("source"),
+                        autoplay=bool(body_json.get("autoplay", True)))
+                    if not result.get("success"):
+                        self.send_json_response(400, result)
+                        return
+                    self.send_json_response(200, {
+                        "success": True, "bgm": result["bgm"],
+                        "karaoke": session.status_snapshot(),
+                    })
+                    return
+                if action == "bgm_play":
+                    bgm.play()
+                elif action == "bgm_pause":
+                    bgm.pause()
+                elif action == "bgm_stop":
+                    bgm.stop()
+                elif action == "bgm_seek":
+                    bgm.seek(body_json.get("position", 0))
+                elif action == "bgm_volume":
+                    bgm.set_volume(body_json.get("volume", 0.8))
+                else:
+                    self.send_json_response(400, {
+                        "success": False,
+                        "message": f"Unknown karaoke action: {action!r}"})
+                    return
+                self.send_json_response(200, {
+                    "success": True, "bgm": bgm.snapshot(),
+                    "karaoke": session.status_snapshot(),
+                })
+                return
+
+            if action == "offset_auto":
+                # 歌い手は伴奏を下りで受け取ってから歌うので、往復ぶん戻すのが理論値。
+                suggested = self.streamer_core.suggest_karaoke_offset()
+                if suggested is None:
+                    self.send_json_response(400, {
+                        "success": False,
+                        "message": "ON AIR の参加者の回線品質がまだ測れていません"})
+                    return
+                settings = self.streamer_core.set_karaoke_settings(offset_ms=suggested)
+                self.send_json_response(200, {
+                    "success": True, "settings": settings, "applied_offset_ms": suggested,
+                    "karaoke": session.status_snapshot(),
+                })
+                return
+
             if action in ("record_start", "record_stop"):
                 if action == "record_start":
                     path_saved = session.start_recording()

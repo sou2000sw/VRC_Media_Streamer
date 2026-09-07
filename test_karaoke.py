@@ -9,6 +9,7 @@
   3. ミキサ・ジッタバッファ・WebSocket のフレーム処理が仕様どおりであること。
 """
 
+import array
 import io
 import json
 import os
@@ -25,7 +26,7 @@ from remote_mic import (
     JitterBuffer, KaraokeSession, Participant, ReverbLine, DelayLine,
     pan_gains, mix_participants, float_to_s16le, peak_level,
     build_remote_mic_input, ms_to_frames,
-    SAMPLE_RATE, OUTPUT_CHANNELS, FRAMES_PER_TICK, FRAME_MS,
+    SAMPLE_RATE, OUTPUT_CHANNELS, FRAMES_PER_TICK, FRAME_MS, BYTES_PER_SAMPLE,
     KARAOKE_BASE_DELAY_MS, LATENCY_MODES, REVERB_PRESETS,
     STATE_WAITING, STATE_ACTIVE, MAX_PARTICIPANTS,
 )
@@ -931,3 +932,321 @@ def test_ui_has_host_mic_controls_and_reason():
         assert needle in html, needle
     # 今回詰まった原因そのものを、画面で名指しできていること
     assert "ライブ音声" in html and "モードではありません" in html
+
+
+# ---------------------------------------------------------------------------
+# 13. 伴奏（タスク27-B: YouTube 等をカラオケの伴奏にする）
+#
+# ★成立の条件は「歌い手が伴奏を聴けること」。ホストが鳴らすだけでは、
+#   その音が歌い手へ届くのは配信経由＝数秒後で、歌えない。だから
+#   **同じ音を WebSocket で歌い手へ直接配る**。ここを固定する。
+# ---------------------------------------------------------------------------
+import wave as _wave
+from remote_mic import (AccompanimentPlayer, DOWNSTREAM_TYPE_BGM, DOWNSTREAM_HEADER,
+                        BGM_STATE_IDLE, BGM_STATE_PAUSED)
+
+
+def _make_wav(path, seconds=3.0, amp=9000, freq=440):
+    import math
+    a = array.array("h")
+    ph, st = 0.0, 2 * math.pi * freq / SAMPLE_RATE
+    for _ in range(int(SAMPLE_RATE * seconds)):
+        v = int(amp * math.sin(ph))
+        a.extend((v, v))
+        ph += st
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(OUTPUT_CHANNELS)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(a.tobytes())
+    return str(path)
+
+
+@pytest.fixture
+def bgm_file(tmp_path):
+    return _make_wav(tmp_path / "bgm.wav")
+
+
+def test_bgm_decoder_command_is_48k_stereo_s16le():
+    """デコード結果がミキサのバスと一致していること。
+
+    ここがずれると、伴奏だけ速さと音程がおかしくなる。
+    """
+    pl = AccompanimentPlayer(ffmpeg_cmd="ffmpeg")
+    cmd = pl._build_cmd("x.mp3", None, 0)
+    assert cmd[cmd.index("-ar") + 1] == str(SAMPLE_RATE)
+    assert cmd[cmd.index("-ac") + 1] == str(OUTPUT_CHANNELS)
+    assert "s16le" in cmd
+    assert "-vn" in cmd, "映像まで引き込むと無駄に重い"
+
+
+def test_bgm_seek_goes_before_input():
+    """-ss は -i の前。後ろに置くと頭から復号してから捨てるので遅い。"""
+    pl = AccompanimentPlayer(ffmpeg_cmd="ffmpeg")
+    cmd = pl._build_cmd("x.mp3", None, 30)
+    assert cmd.index("-ss") < cmd.index("-i")
+
+
+def test_bgm_passes_http_headers():
+    """YouTube の音声URLはヘッダ込みでないと 403 になることがある。"""
+    pl = AccompanimentPlayer(ffmpeg_cmd="ffmpeg")
+    cmd = pl._build_cmd("https://x/a.m4a", {"User-Agent": "UA"}, 0)
+    assert "-headers" in cmd
+    assert "User-Agent: UA" in cmd[cmd.index("-headers") + 1]
+
+
+def test_bgm_load_without_autoplay_stays_paused(bgm_file):
+    """読み込んだだけで鳴り出さないこと。
+
+    ★以前ここが壊れていた: pause() が LOADING を見ておらず素通りし、
+      デコード開始と同時に鳴り出していた。ホストが選曲した瞬間に
+      配信へ曲が流れてしまう。
+    """
+    pl = AccompanimentPlayer()
+    pl.load(bgm_file, title="t", duration=3.0, autoplay=False)
+    time.sleep(1.0)
+    assert pl.snapshot()["state"] == BGM_STATE_PAUSED
+    assert pl.take(FRAMES_PER_TICK) is None
+    pl.stop()
+
+
+def test_bgm_play_and_pause_control_the_position(bgm_file):
+    pl = AccompanimentPlayer()
+    pl.load(bgm_file, title="t", duration=3.0, autoplay=False)
+    time.sleep(0.6)
+    pl.play()
+    got = 0
+    for _ in range(40):
+        if pl.take(FRAMES_PER_TICK) is not None:
+            got += 1
+        time.sleep(0.02)
+    assert got > 20, "再生が始まらない"
+    pl.pause()
+    time.sleep(0.2)
+    assert pl.take(FRAMES_PER_TICK) is None, "一時停止中に進んでいる"
+    pl.stop()
+    assert pl.snapshot()["state"] == BGM_STATE_IDLE
+
+
+def test_bgm_stop_rewinds_position(bgm_file):
+    pl = AccompanimentPlayer()
+    pl.load(bgm_file, title="t", duration=3.0)
+    time.sleep(0.5)
+    for _ in range(20):
+        pl.take(FRAMES_PER_TICK)
+    pl.stop()
+    assert pl.snapshot()["position"] == 0.0
+    pl.stop()   # 二重停止で壊れないこと
+
+
+def test_bgm_volume_is_clamped():
+    pl = AccompanimentPlayer()
+    assert pl.set_volume(99)["volume"] == 2.0
+    assert pl.set_volume(-1)["volume"] == 0.0
+
+
+def test_bgm_take_is_silent_when_nothing_loaded():
+    pl = AccompanimentPlayer()
+    assert pl.take(FRAMES_PER_TICK) is None
+
+
+def test_bgm_reaches_the_stream_bus(session, bgm_file):
+    """伴奏が配信バス（＝FFmpegへ行く音）に乗ること。"""
+    session.configure(approval_required=False)
+    session.bgm.set_volume(1.0)
+    session.bgm.load(bgm_file, title="t", duration=3.0)
+    session.ensure_mixer()
+    path = session.start_recording()
+    time.sleep(1.5)
+    session.stop_recording()
+    session.stop()
+    with _wave.open(path, "rb") as wf:
+        pcm = array.array("h")
+        pcm.frombytes(wf.readframes(wf.getnframes()))
+    assert max(abs(v) for v in pcm) > 3000, "伴奏が配信バスに乗っていない"
+
+
+def test_bgm_is_broadcast_only_to_on_air_participants(session, bgm_file):
+    """伴奏は ON AIR の人にだけ配ること。
+
+    待機中の全員へ配ると、ホストの上り帯域が人数倍になる（1人 約768kbps）。
+    """
+    got = {"active": [], "waiting": []}
+
+    class _Conn:
+        def __init__(self, key):
+            self.key = key
+
+        def send_binary(self, data):
+            got[self.key].append(data)
+
+    session.configure(approval_required=True)
+    session.add_participant("a", "歌う人", conn=_Conn("active"))
+    session.add_participant("w", "待つ人", conn=_Conn("waiting"))
+    session.set_state("a", STATE_ACTIVE)
+
+    session.bgm.load(bgm_file, title="t", duration=3.0)
+    session.ensure_mixer()
+    time.sleep(1.2)
+    session.stop()
+
+    assert len(got["active"]) > 20, "ON AIR の人へ届いていない"
+    assert got["waiting"] == [], "待機中の人にまで配っている"
+
+
+def test_bgm_downstream_frame_shape(session, bgm_file):
+    """下りフレームの形（種別バイト＋モノラル48k）が仕様どおりであること。"""
+    frames = []
+
+    class _Conn:
+        def send_binary(self, data):
+            frames.append(data)
+
+    session.configure(approval_required=False)
+    session.add_participant("a", "歌う人", conn=_Conn())
+    session.set_state("a", STATE_ACTIVE)
+    session.bgm.load(bgm_file, title="t", duration=3.0)
+    session.ensure_mixer()
+    time.sleep(1.0)
+    session.stop()
+
+    assert frames
+    f = frames[0]
+    assert f[0] == DOWNSTREAM_TYPE_BGM
+    assert len(f) == DOWNSTREAM_HEADER + FRAMES_PER_TICK * BYTES_PER_SAMPLE
+    # 16bit 境界が保たれていること（JS 側で Int16Array を被せるため）
+    assert DOWNSTREAM_HEADER % 2 == 0
+
+
+def test_bgm_downstream_is_pre_volume(session, bgm_file):
+    """下りへは**音量を掛ける前**を配ること。
+
+    ホストが配信側の伴奏を絞ったせいで歌い手に聴こえなくなる、では困る。
+    """
+    frames = []
+
+    class _Conn:
+        def send_binary(self, data):
+            frames.append(data)
+
+    session.configure(approval_required=False)
+    session.add_participant("a", "歌う人", conn=_Conn())
+    session.set_state("a", STATE_ACTIVE)
+    session.bgm.set_volume(0.0)          # 配信側は無音にする
+    session.bgm.load(bgm_file, title="t", duration=3.0)
+    session.ensure_mixer()
+    time.sleep(1.2)
+    session.stop()
+
+    mono = array.array("h")
+    for f in frames:
+        mono.frombytes(f[DOWNSTREAM_HEADER:])
+    assert mono and max(abs(v) for v in mono) > 3000, \
+        "配信側を絞ったら歌い手にも聴こえなくなっている"
+
+
+def test_bgm_downstream_queue_drops_oldest_when_stuck():
+    """詰まった相手には古いフレームを捨てること。
+
+    捨てないと遅延が伸び続け、しかも意味のない過去の音を送り続ける。
+    """
+    p = Participant("id", "x")
+    for i in range(remote_mic.BGM_DOWNSTREAM_MAX_CHUNKS + 15):
+        p.push_downstream(bytes([i & 0xFF]) * 4)
+    assert p.downstream_dropped == 15
+    assert len(p._down_q) == remote_mic.BGM_DOWNSTREAM_MAX_CHUNKS
+
+
+def test_bgm_bus_has_its_own_delay_separate_from_singers(session):
+    """伴奏は歌声と**別の遅延**を持つこと。
+
+    伴奏は伴奏側なので固定 500ms。遅延補正スライダで動かしてよいのは
+    歌声だけで、伴奏まで一緒に動くと補正が意味を成さない。
+    """
+    base = ms_to_frames(KARAOKE_BASE_DELAY_MS)
+    assert session._bgm_delay._delay_frames == base
+    session.configure(offset_ms=300)
+    assert session._delay_line._delay_frames == ms_to_frames(KARAOKE_BASE_DELAY_MS + 300)
+    assert session._bgm_delay._delay_frames == base, "伴奏まで一緒に動いている"
+
+
+def test_bgm_appears_in_status_snapshot(session):
+    snap = session.status_snapshot()
+    assert "bgm" in snap and snap["bgm"]["state"] == BGM_STATE_IDLE
+    assert json.dumps(snap, ensure_ascii=False)
+
+
+def test_offset_suggestion_is_negative_rtt():
+    """遅延補正の推奨は −RTT。
+
+    歌い手は伴奏を下りで受け取ってから歌い、その声が上りで戻るので、
+    往復ぶん歌声が遅れて届く。
+    """
+    import streamer_core
+
+    class _Core:
+        karaoke = KaraokeSession()
+
+    c = _Core()
+    for i, rtt in enumerate((40, 60, 80)):
+        p, _ = c.karaoke.add_participant(f"id{i}", f"P{i}")
+        p.state = STATE_ACTIVE
+        p.rtt_ms = rtt
+    got = streamer_core.StreamerCore.suggest_karaoke_offset(c)
+    assert got == -60, got          # 中央値 60ms の符号反転
+    c.karaoke.stop()
+
+
+def test_offset_suggestion_needs_active_participants():
+    import streamer_core
+
+    class _Core:
+        karaoke = KaraokeSession()
+
+    c = _Core()
+    assert streamer_core.StreamerCore.suggest_karaoke_offset(c) is None
+    p, _ = c.karaoke.add_participant("id", "P")   # 挙手中のまま
+    p.rtt_ms = 50
+    assert streamer_core.StreamerCore.suggest_karaoke_offset(c) is None
+    c.karaoke.stop()
+
+
+def test_ui_has_accompaniment_controls():
+    html = _ui_html()
+    for needle in ('id="kaBgmSource"', 'id="kaBgmSeek"', 'id="kaBgmVol"',
+                   'karaokeLoadHostBgm()', 'karaokeAutoOffset()',
+                   'karaokeOnDownstream'):
+        assert needle in html, needle
+
+
+def test_ui_does_not_send_host_bgm_back_upstream():
+    """受け取った伴奏を上りへ混ぜないこと。
+
+    ホストが同じ伴奏を配信バスに乗せているので、送り返すと二重になり、
+    しかも往復ぶんずれて山びこになる。
+    """
+    html = _ui_html()
+    i = html.index("function karaokeEnsureBgmChain")
+    block = html[i:i + 900]
+    assert "hostBgmGain.connect(ka.ac.destination)" in block
+    # コメント中の語ではなく、実際の接続が無いことを見る。
+    assert "connect(ka.uplink)" not in block, "ホストからの伴奏を上りへ繋いでいる"
+    assert "hostBgmGain.connect(ka.uplink" not in html
+
+
+def test_recording_names_do_not_collide(session):
+    """1秒以内に録り直しても、前のテイクを上書きしないこと。
+
+    ファイル名が秒単位なので、停止してすぐ再開すると同じ名前になり、
+    前の録音が黙って消えていた（テストの干渉として表面化した）。
+    """
+    session.ensure_mixer()
+    first = session.start_recording()
+    time.sleep(0.15)
+    session.stop_recording()
+    second = session.start_recording()
+    time.sleep(0.15)
+    session.stop_recording()
+    session.stop()
+    assert first != second, "同じ秒に録り直すと前のテイクが消える"
+    assert os.path.exists(first) and os.path.exists(second)

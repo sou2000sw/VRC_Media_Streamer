@@ -39,6 +39,7 @@ from remote_mic import (
     KaraokeSession, build_remote_mic_input,
     KARAOKE_BASE_DELAY_MS, LATENCY_MODES as KARAOKE_LATENCY_MODES,
     REVERB_PRESETS as KARAOKE_REVERB_PRESETS,
+    KARAOKE_OFFSET_MIN_MS, KARAOKE_OFFSET_MAX_MS,
 )
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
@@ -2465,7 +2466,8 @@ class StreamerCore:
         # タスク27: 参加型カラオケ。セッションは配信の有無と無関係に 1 本だけ持つ
         # （参加者は配信が止まっても繋ぎっぱなしでよい）。FFmpeg への出口だけが
         # 配信のたびに開閉する。
-        self.karaoke = KaraokeSession(recordings_dir=os.path.join(APP_DIR, "recordings"))
+        self.karaoke = KaraokeSession(recordings_dir=os.path.join(APP_DIR, "recordings"),
+                                      ffmpeg_cmd=get_ffmpeg_cmd())
         self.karaoke.configure(
             enabled=bool(self.config.get("karaoke_enabled", False)),
             approval_required=bool(self.config.get("karaoke_approval_required", True)),
@@ -2555,6 +2557,68 @@ class StreamerCore:
             for pid in list(self.karaoke.participants.keys()):
                 self.karaoke.remove_participant(pid)
         return settings
+
+    # ----------------------------------------------------------------------
+    # タスク27-B: カラオケの伴奏（YouTube 等）
+    # ----------------------------------------------------------------------
+    def load_karaoke_bgm(self, source, autoplay=True):
+        """伴奏を読み込む。YouTube の URL でもローカルの音源でもよい。
+
+        ★YouTube は既存の get_audio_only_stream_urls() を使う。ラジオモードが
+          既に同じ経路で音声だけを流しており、実績のある道をそのまま通す。
+          URL は数時間で失効するので、**再生のたびに取り直す**（保存しない）。
+        """
+        src = str(source or "").strip()
+        if not src:
+            return {"success": False, "message": "URL かファイルを指定してください"}
+
+        # ローカルファイル
+        if os.path.exists(src):
+            title = os.path.splitext(os.path.basename(src))[0]
+            duration = 0.0
+            try:
+                duration = get_video_file_duration(src) or 0.0
+            except Exception:
+                pass
+            snap = self.karaoke.bgm.load(os.path.abspath(src), headers=None,
+                                         title=title, duration=duration,
+                                         autoplay=autoplay)
+            log_print(f"[Karaoke] 伴奏(ローカル): {title}")
+            return {"success": True, "bgm": snap}
+
+        if not (src.startswith("http://") or src.startswith("https://")):
+            return {"success": False,
+                    "message": "URL（http/https）か、実在するファイルのパスを指定してください"}
+
+        try:
+            res = self.get_audio_only_stream_urls(src)
+        except Exception as e:
+            log_print(f"[Karaoke] 伴奏の解決に失敗: {e}")
+            return {"success": False, "message": f"音源を取得できませんでした: {e}"}
+        if not res or not res[0]:
+            return {"success": False, "message": "音源のURLを取得できませんでした"}
+
+        audio_url, title, duration, headers = res[0], res[1], res[2], res[3]
+        snap = self.karaoke.bgm.load(audio_url, headers=headers, title=title,
+                                     duration=duration or 0.0, autoplay=autoplay)
+        log_print(f"[Karaoke] 伴奏: {title} ({duration}s)")
+        return {"success": True, "bgm": snap}
+
+    def suggest_karaoke_offset(self):
+        """遅延補正の推奨値を返す。
+
+        歌い手は伴奏を**下り**で受け取ってから歌い、その声が**上り**で戻る。
+        つまり往復（RTT）ぶんだけ歌声が遅れて届くので、理論値は offset ≒ −RTT。
+        RTT は参加者が毎秒報告しているので、ON AIR の人の中央値を使う。
+        """
+        with self.karaoke._lock:
+            rtts = [p.rtt_ms for p in self.karaoke.participants.values()
+                    if p.state == "active" and p.rtt_ms > 0]
+        if not rtts:
+            return None
+        rtts.sort()
+        median = rtts[len(rtts) // 2]
+        return int(max(KARAOKE_OFFSET_MIN_MS, min(KARAOKE_OFFSET_MAX_MS, -median)))
 
     def start_karaoke_pipe(self):
         """配信を起こす直前に呼ぶ。(パイプ名, sink) を返す。カラオケ無効なら (None, None)。
