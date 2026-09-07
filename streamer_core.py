@@ -1,5 +1,6 @@
 import os
 import sys
+import ctypes
 import time
 import re
 import io
@@ -316,6 +317,132 @@ def get_window_capture_cmd():
         if os.path.exists(path):
             return path
     return None
+
+# --------------------------------------------------------------------------
+# 起動元プロセスの見張り（ゴースト化の防止）
+#
+# ★なぜ必要か
+#   配布EXEは --noconsole でビルドしている。--headless で動かすと
+#   **コンソールもウィンドウも無い**ので、Ctrl+C も×ボタンも届かない。
+#   起動元（VRCBeacon や端末）が消えても本体だけが residual に生き残り、
+#   RTMP シンクや取り込みデバイスを掴んだまま放置される（実際に発生した）。
+#
+# ★PID の再利用で誤爆しないこと
+#   起動時にハンドルを掴んで WaitForSingleObject で待つ。ポーリングして
+#   「PIDが無くなったか」を見る方式は、同じ番号が別プロセスに再利用されると
+#   誤判定する。ハンドルなら対象が入れ替わることはない。
+# --------------------------------------------------------------------------
+_TH32CS_SNAPPROCESS = 0x00000002
+_SYNCHRONIZE = 0x00100000
+_INFINITE = 0xFFFFFFFF
+
+
+class _PROCESSENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("cntUsage", ctypes.c_uint32),
+        ("th32ProcessID", ctypes.c_uint32),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", ctypes.c_uint32),
+        ("cntThreads", ctypes.c_uint32),
+        ("th32ParentProcessID", ctypes.c_uint32),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_uint32),
+        ("szExeFile", ctypes.c_char * 260),
+    ]
+
+
+def _process_table():
+    """{pid: (親pid, exe名)} を1回のスナップショットで取る。"""
+    if sys.platform != "win32":
+        return {}
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snap = k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snap == -1:
+        return {}
+    table = {}
+    try:
+        entry = _PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+        k32.Process32First.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32)]
+        k32.Process32Next.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32)]
+        ok = k32.Process32First(ctypes.c_void_p(snap), ctypes.byref(entry))
+        while ok:
+            table[int(entry.th32ProcessID)] = (
+                int(entry.th32ParentProcessID),
+                entry.szExeFile.decode("mbcs", "replace"))
+            ok = k32.Process32Next(ctypes.c_void_p(snap), ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(snap))
+    return table
+
+
+def find_launcher_pid():
+    """このプロセスを起こした「本当の起動元」の PID を返す。無ければ None。
+
+    ★PyInstaller の onefile は **殻(bootloader) → 本体** の2プロセスになる。
+      os.getppid() が指すのは殻なので、そのまま見張っても Beacon の生死は分からない。
+      親の exe 名が自分と同じなら殻とみなして、もう一段上を起動元とする。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        table = _process_table()
+        me = os.getpid()
+        if me not in table:
+            return None
+        my_exe = table[me][1].lower()
+        # ★自分と同じ exe の祖先は **全部** 飛ばす。
+        #   1段だけ遡る作りだと、onefile の殻を「起動元」と誤認して自分自身の
+        #   殻を見張ることになり、起動元が消えても永久に発火しない（実測で確認）。
+        #   多重の殻や中継が挟まっても効くよう、辿れる限り遡る。
+        chain = [me]
+        cur = table[me][0]
+        seen = {me}
+        while cur in table and cur not in seen and len(seen) < 32:
+            seen.add(cur)
+            chain.append(cur)
+            if table[cur][1].lower() != my_exe:
+                log_print("[Watchdog] 祖先: "
+                          + " <- ".join(f"{pid}:{table[pid][1]}" for pid in chain))
+                return cur
+            cur = table[cur][0]
+        log_print("[Watchdog] 自分と違う exe の祖先が見つからない: "
+                  + " <- ".join(f"{pid}:{table[pid][1]}" for pid in chain))
+        return None
+    except Exception as e:
+        log_print(f"[Watchdog] 起動元の特定に失敗: {e}")
+        return None
+
+
+def watch_process_exit(pid, callback):
+    """pid の終了を待って callback を呼ぶ。掴めなければ False。"""
+    if sys.platform != "win32" or not pid:
+        return False
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        handle = k32.OpenProcess(_SYNCHRONIZE, False, int(pid))
+        if not handle:
+            return False
+
+        def wait():
+            try:
+                k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                k32.WaitForSingleObject(ctypes.c_void_p(handle), _INFINITE)
+            finally:
+                try:
+                    k32.CloseHandle(ctypes.c_void_p(handle))
+                except Exception:
+                    pass
+            callback()
+
+        threading.Thread(target=wait, name="launcher-watchdog", daemon=True).start()
+        return True
+    except Exception as e:
+        log_print(f"[Watchdog] 見張りを開始できません: {e}")
+        return False
+
 
 def kill_proc(proc):
     if not proc:

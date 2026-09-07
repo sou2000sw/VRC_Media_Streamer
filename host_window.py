@@ -240,6 +240,11 @@ def run_host_window(streamer_core, api_server):
     url = f"http://127.0.0.1:{port}/"
 
     bridge = HostBridge(streamer_core, api_server)
+    # ★Webリモコンの「サーバー終了」(/api/shutdown) をここへ繋ぐ。
+    #   繋がっていないと、コアとAPIだけ止まってウィンドウが残る
+    #   （＝殻だけのゴーストプロセスになる）。exit_app はウィンドウも畳むので、
+    #   webview.start() が戻り、主スレッドが正しく終了まで進む。
+    api_server.on_shutdown = bridge.exit_app
     try:
         window = webview.create_window(
             "VRC_Media_Streamer",

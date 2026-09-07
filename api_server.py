@@ -237,6 +237,11 @@ GLOBAL_AUTH_LOCK_SECONDS = 60       # 全体ロックの継続秒数
 GLOBAL_AUTH_FAILS = []              # 直近の失敗時刻（全IP合計）
 GLOBAL_AUTH_BLOCKED_UNTIL = 0.0
 
+# /api/shutdown を受けてから「まだ生きていたら強制終了する」までの猶予。
+# UI の後片付け（配信停止・HLS掃除）が終わるだけの余裕は要るが、長すぎると
+# 利用者は「終了を押したのに閉じない」と感じる。
+SHUTDOWN_GRACE_SEC = 6.0
+
 MAX_REQUEST_BODY_BYTES = 64 * 1024
 MAX_UPLOAD_BODY_BYTES = 20 * 1024 * 1024 # 20MB
 MAX_VIDEO_UPLOAD_BODY_BYTES = 200 * 1024 * 1024 # 200MB
@@ -1705,9 +1710,14 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
 class APIServer:
-    def __init__(self, streamer_core, on_shutdown=None):
+    def __init__(self, streamer_core, on_shutdown=None, owns_process=False):
         self.streamer_core = streamer_core
         self.on_shutdown = on_shutdown
+        # ★このサーバーが「プロセスの寿命を持っている」か。
+        #   本物のアプリ（gui_streamer.main）だけが True。テストは APIServer を
+        #   自前のプロセス内に立てるので、ここが True だと強制終了の保険が
+        #   **テストプロセスごと殺す**（実際に pytest が無言で落ちた）。
+        self.owns_process = owns_process
         self.httpd = None
         self.server_thread = None
 
@@ -1716,14 +1726,52 @@ class APIServer:
                                 shutdown_callback=self._trigger_shutdown, **kwargs)
 
     def _trigger_shutdown(self):
+        """/api/shutdown から**別スレッドで**呼ばれる終了処理。
+
+        ★`sys.exit(0)` をここで呼んではいけない
+          sys.exit() はそのスレッドに SystemExit を投げるだけで、**プロセスは終わらない**。
+          headless は主スレッドが `while core.is_running` を回しているので偶然
+          抜けられていたが、GUI/WebView は主スレッドが mainloop / webview.start() で
+          止まっており、抜ける契機が無い。
+          実測 2026-09-07: GUI版に /api/shutdown を投げると、APIもコアも停止するのに
+          **プロセスだけが殻として生き残った**（RTMPシンクを掴んだまま）。
+
+        ★正しい解き方は「UIごとに主スレッドを解く」こと
+          そのための on_shutdown を APIServer は元から受け取れるようになっていたが、
+          呼び出し側が一度も渡していなかった。各UIから渡すようにしたうえで、
+          それでも解けなかった場合の保険をここに置く。
+        """
         time.sleep(0.5)
-        if self.on_shutdown:
-            self.on_shutdown()
-        else:
-            self.stop()
-            if self.streamer_core:
-                self.streamer_core.shutdown()
-            sys.exit(0)
+        try:
+            if self.on_shutdown:
+                self.on_shutdown()
+            else:
+                self.stop()
+                if self.streamer_core:
+                    self.streamer_core.shutdown()
+        except Exception as e:
+            log_print(f"[APIServer] Shutdown handler failed: {e}")
+        self.force_exit_later()
+
+    def force_exit_later(self, grace=SHUTDOWN_GRACE_SEC):
+        """猶予のあと、まだ生きていたら強制終了する（ゴースト化の最終防波堤）。
+
+        ★os._exit は atexit を走らせない
+          唯一の atexit は HLS 一時ディレクトリの掃除だが、そこは
+          core.shutdown() が既に clean_hls_dir(all_files=True) で済ませている。
+          つまりここまで来た時点で、飛ばして困る後片付けは残っていない。
+        """
+        if not self.owns_process:
+            # 組み込み利用（テスト等）。プロセスを畳む権利は持っていない。
+            return
+
+        def bomb():
+            time.sleep(grace)
+            log_print(f"[APIServer] {grace}秒たっても終了しなかったため強制終了します"
+                      "（UI側の終了処理が主スレッドを解けていません）")
+            os._exit(0)
+
+        threading.Thread(target=bomb, name="shutdown-fallback", daemon=True).start()
 
     def start(self):
         port = self.streamer_core.config.get("port", 8000)

@@ -13,7 +13,12 @@
   "backend": {
     "type": "process",
     "executable": "bin/VRC_Media_Streamer.exe",
-    "args": ["--headless", "--port", "8000"],
+    "args": [
+      "--headless",
+      "--port",
+      "8000",
+      "--exit-with-parent"
+    ],
     "port": 8000,
     "apiBase": "http://127.0.0.1:8000"
   },

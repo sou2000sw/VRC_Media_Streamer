@@ -1609,7 +1609,32 @@ class App(ctk.CTk):
         if self.streamer_core.is_running:
             self.after(500, self.update_ui_loop)
 
-    def on_closing(self):
+    def shutdown_from_api(self):
+        """Webリモコンの「サーバー終了」(/api/shutdown) から呼ばれる。
+
+        ★Tk は主スレッド以外から触ってはいけない。/api/shutdown は別スレッドから
+          来るので、after(0) で主スレッドへ渡す。直接 destroy すると固まる。
+        ★quit() で mainloop を抜けること。ここを繋がないと、コアとAPIだけ止まって
+          ウィンドウが残り、殻だけのゴーストプロセスになる（実測で確認した不具合）。
+        """
+        def do():
+            log_print("Shutting down from the web remote...")
+            try:
+                self.streamer_core.shutdown()
+                self.api_server.stop()
+            except Exception as e:
+                log_print(f"Error during shutdown: {e}")
+            try:
+                self.quit()
+                self.destroy()
+            except Exception:
+                pass
+        try:
+            self.after(0, do)
+        except Exception:
+            do()
+
+    def on_closing(self):
         if messagebox.askokcancel("Quit", "Do you want to quit the streamer?"):
             log_print("Shutting down streamer server and processes...")
             try:
@@ -1620,21 +1645,47 @@ class App(ctk.CTk):
             self.destroy()
             sys.exit(0)
 
-def run_headless_mode(streamer_core, api_server):
+def run_headless_mode(streamer_core, api_server, exit_with_parent=False):
     log_print("==================================================")
     log_print(f"VRC_Media_Streamer Headless API Server Mode Started")
     log_print(f"API Endpoints available on http://{streamer_core.config.get('host')}:{streamer_core.config.get('port')}/api/")
-    log_print("Press Ctrl+C to terminate.")
+    # ★配布EXEは --noconsole でビルドしている。コンソールが無いので Ctrl+C は
+    #   **届かない**。以前ここに「Press Ctrl+C to terminate.」と出していたが、
+    #   配布物では実行できない案内で、止め方が分からずプロセスが残る一因だった。
+    if getattr(sys, "frozen", False):
+        log_print("To stop: POST /api/shutdown (or close the launcher / use Task Manager).")
+    else:
+        log_print("Press Ctrl+C to terminate.")
     log_print("==================================================")
 
     def signal_handler(sig, frame):
         log_print("\n[Headless] Signal received. Shutting down...")
-        streamer_core.shutdown()
+        streamer_core.shutdown()      # is_running=False で下の待ち受けが解ける
         api_server.stop()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # ★/api/shutdown からの終了もここへ繋ぐ。主スレッドは is_running を見ているので、
+    #   コアを止めれば自然に抜けられる。繋がないと APIServer 側の保険（強制終了）
+    #   まで待つことになり、後片付けが中途半端になりうる。
+    def on_shutdown():
+        api_server.stop()
+        streamer_core.shutdown()
+
+    api_server.on_shutdown = on_shutdown
+
+    # ★起動元が消えたら自分も畳む（常駐しない運用のため）。
+    #   VRCBeacon はプラグインの backend として子プロセスで起こす。Beacon が
+    #   落ちたときに本体だけ residual に生き残ると、RTMPシンクや取り込みデバイスを
+    #   掴んだまま放置される（実際に12時間残っていた）。
+    if exit_with_parent:
+        from streamer_core import find_launcher_pid, watch_process_exit
+        launcher = find_launcher_pid()
+        if launcher and watch_process_exit(launcher, on_shutdown):
+            log_print(f"[Headless] 起動元(PID {launcher})の終了を見張ります")
+        else:
+            log_print("[Headless] 起動元を特定できませんでした（見張りなしで続行）")
 
     try:
         while streamer_core.is_running:
@@ -1648,6 +1699,8 @@ def run_headless_mode(streamer_core, api_server):
 def main():
     parser = argparse.ArgumentParser(description="VRC_Media_Streamer and API Server")
     parser.add_argument("--headless", "-hl", action="store_true", help="Run in headless API server mode without GUI")
+    parser.add_argument("--exit-with-parent", action="store_true",
+                        help="Exit when the launching process (e.g. VRCBeacon) goes away")
     parser.add_argument("--tunnel", action="store_true", help="Explicitly enable Cloudflare tunnel")
     parser.add_argument("--no-tunnel", "-nt", action="store_true", help="Disable Cloudflare tunnel (run in local test mode)")
     parser.add_argument("--port", "-p", type=int, default=None, help="Port for API and HLS server (default: 8000 or config.json)")
@@ -1685,7 +1738,9 @@ def main():
         sys.exit(1)
 
     # APIサーバーの初期化
-    server = APIServer(streamer_core=core)
+    # owns_process=True: このプロセスはこのサーバーのために存在する。
+    # 終了要求で主スレッドが解けなかったときに強制終了してよい、という意思表示。
+    server = APIServer(streamer_core=core, owns_process=True)
     if not server.start():
         log_print("Failed to start API/HLS server. Exiting.")
         sys.exit(1)
@@ -1694,7 +1749,7 @@ def main():
     core.start_background_tasks()
 
     if args.headless:
-        run_headless_mode(core, server)
+        run_headless_mode(core, server, exit_with_parent=args.exit_with_parent)
     else:
         # 既定はモダンUI（Webリモコンと同じ画面を WebView2 で表示する）。
         # WebView2 が使えない環境や --classic-ui 指定時は従来の CustomTkinter 画面へ落ちる。
@@ -1710,6 +1765,14 @@ def main():
                 log_print(f"[GUI] Modern host window failed ({e}). Falling back to the classic UI.")
 
         app = App(core, server)
+        # ★Webリモコンの「サーバー終了」でウィンドウも閉じる。繋がっていないと
+        #   コアとAPIだけ止まって窓が残り、殻だけのゴーストプロセスになる。
+        def on_shutdown():
+            try:
+                app.shutdown_from_api()
+            except Exception as e:
+                log_print(f"[GUI] Shutdown handler failed: {e}")
+        server.on_shutdown = on_shutdown
         app.mainloop()
 
 if __name__ == "__main__":
