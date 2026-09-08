@@ -6,6 +6,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <audioclientactivationparams.h>
+#include <avrt.h>
 #include <wrl/client.h>
 
 #include <iostream>
@@ -19,10 +20,20 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <io.h>
 #include <fcntl.h>
 
 using Microsoft::WRL::ComPtr;
+
+// OBS Studio の win-wasapi 実装と同じ5秒。イベント通知の周期はWindows側が
+// 決めるため、バッファを大きくしても通常の取り込み遅延は増えない。一方、映像
+// エンコードやstdoutパイプが一時的に詰まっても、WASAPI側で十分保持できる。
+// OBS: plugins/win-wasapi/win-wasapi.cpp BUFFER_TIME_100NS
+static constexpr REFERENCE_TIME kCaptureBufferDuration = 5LL * 10000000LL;
 
 // 【無音埋め（空振りガード）の設計方針について】
 // 当初の想定では「対象が無音の間はパケットが来ないため、壁時計基準で常時無音を生成・埋める必要がある」と考えられていた。
@@ -230,7 +241,7 @@ static HRESULT SetupAudioCapture(
     HRESULT hrInit = audioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        200000, // 20ms in 100ns units
+        kCaptureBufferDuration,
         0,
         &wfx16,
         nullptr
@@ -260,7 +271,7 @@ static HRESULT SetupAudioCapture(
         HRESULT hrInitFloat = audioClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            200000,
+            kCaptureBufferDuration,
             0,
             &wfx32,
             nullptr
@@ -288,7 +299,7 @@ static HRESULT SetupAudioCapture(
                 hrInitFloat = audioClient->Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
                     AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    200000,
+                    kCaptureBufferDuration,
                     0,
                     &wfxExt.Format,
                     nullptr
@@ -365,6 +376,107 @@ static bool WritePCMData(
     }
     return true;
 }
+
+// WASAPI の取り込みコールバック相当の処理から stdout の背圧を切り離す。
+// FFmpeg は映像入力も同時に読むため、映像の変換・エンコードが一瞬遅れると
+// stdin の読み取りも止まる。その stdout へ取り込みスレッド自身が書くと、
+// WASAPI バッファを回収できず音切れになる。OBS も取り込みと下流処理の間を
+// 非同期化しており、音声取得スレッド上で遅い出力を待たない。
+class AsyncPcmWriter {
+public:
+    AsyncPcmWriter(int rate, int channels)
+        : m_channels((std::max)(1, channels)),
+          // 瞬間的な映像負荷は吸収するが、何秒もの古い音を再生しない。
+          m_maxQueuedSamples(static_cast<size_t>((std::max)(1, rate)) *
+                             static_cast<size_t>(m_channels) * 2) {}
+
+    void Start() {
+        m_thread = std::thread([this]() { Run(); });
+    }
+
+    bool Enqueue(const int16_t* samples, size_t sampleCount) {
+        if (sampleCount == 0) return true;
+        if (m_failed.load()) return false;
+
+        std::vector<int16_t> chunk(samples, samples + sampleCount);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // 下流が実時間から遅れた場合、古い音声を延々溜めると映像とのずれが
+            // 拡大する。WGC 側も背圧時には途中フレームを飛ばして最新画へ戻るため、
+            // 音声も同じ方針で最古データを捨てる。
+            while (!m_queue.empty() &&
+                   m_queuedSamples + chunk.size() > m_maxQueuedSamples) {
+                m_droppedSamples.fetch_add(m_queue.front().size());
+                m_queuedSamples -= m_queue.front().size();
+                m_queue.pop_front();
+            }
+            if (chunk.size() > m_maxQueuedSamples) {
+                const size_t trim = chunk.size() - m_maxQueuedSamples;
+                m_droppedSamples.fetch_add(trim);
+                chunk.erase(chunk.begin(), chunk.begin() + trim);
+            }
+            m_queuedSamples += chunk.size();
+            m_queue.emplace_back(std::move(chunk));
+        }
+        m_cv.notify_one();
+        return true;
+    }
+
+    void Finish() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_finished = true;
+        }
+        m_cv.notify_one();
+        if (m_thread.joinable()) m_thread.join();
+    }
+
+    bool Failed() const { return m_failed.load(); }
+    uint64_t DroppedFrames() const {
+        return m_droppedSamples.load() / static_cast<uint64_t>(m_channels);
+    }
+
+private:
+    void Run() {
+        for (;;) {
+            std::vector<int16_t> chunk;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_cv.wait(lock, [this]() { return m_finished || !m_queue.empty(); });
+                if (m_queue.empty()) {
+                    if (m_finished) break;
+                    continue;
+                }
+                chunk = std::move(m_queue.front());
+                m_queuedSamples -= chunk.size();
+                m_queue.pop_front();
+            }
+
+            const size_t written = fwrite(chunk.data(), sizeof(int16_t),
+                                          chunk.size(), stdout);
+            if (written != chunk.size()) {
+                m_failed.store(true);
+                g_stopRequested.store(true);
+                break;
+            }
+            // stdio の小さな内部バッファだけを許す。WASAPIスレッドはここを
+            // 待たないため、flush がブロックしても取り込みは継続できる。
+            fflush(stdout);
+        }
+        fflush(stdout);
+    }
+
+    int m_channels;
+    size_t m_maxQueuedSamples;
+    size_t m_queuedSamples = 0;
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::deque<std::vector<int16_t>> m_queue;
+    std::thread m_thread;
+    bool m_finished = false;
+    std::atomic<bool> m_failed{false};
+    std::atomic<uint64_t> m_droppedSamples{0};
+};
 
 int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
@@ -499,6 +611,17 @@ int main(int argc, char* argv[]) {
         _setmode(_fileno(stdout), _O_BINARY);
     }
 
+    std::unique_ptr<AsyncPcmWriter> asyncWriter;
+    if (wavPath.empty() && !probe) {
+        asyncWriter = std::make_unique<AsyncPcmWriter>(rate, channels);
+        asyncWriter->Start();
+    }
+    auto writePcm = [&](const int16_t* data, size_t sampleCount) {
+        if (asyncWriter) return asyncWriter->Enqueue(data, sampleCount);
+        return WritePCMData(data, sampleCount, wavPath, wavFile,
+                            wavDataBytesWritten, probe);
+    };
+
     // Capture loop state variables
     uint64_t totalBytesCaptured = 0;
     uint64_t totalProducedFrames = 0;
@@ -539,6 +662,17 @@ int main(int argc, char* argv[]) {
     auto lastProcCheckTime = startTime;
     auto lastStatsTime = startTime;
     auto lastLevelTime = lastStatsTime;
+
+    // 音声取り込みをMMCSSへ登録し、高負荷時にもWASAPIの読み出しを優先する。
+    // "Pro Audio" は映像キャプチャ/エンコードを飢餓状態にして画面をカクつかせる
+    // 場合があるため、通常の "Audio" カテゴリで両者の処理時間を確保する。
+    // 登録できない環境では通常優先度のまま続行する。
+    DWORD mmcssTaskIndex = 0;
+    HANDLE hMmcssTask = AvSetMmThreadCharacteristicsW(L"Audio", &mmcssTaskIndex);
+    if (hMmcssTask == NULL) {
+        fprintf(stderr, "[AppAudio] warning: MMCSS registration failed: %lu\n", GetLastError());
+    }
+    uint64_t discontinuityCount = 0;
 
     // Main capture loop
     while (!g_stopRequested.load()) {
@@ -591,8 +725,12 @@ int main(int argc, char* argv[]) {
             long long driftMs = static_cast<long long>(std::round((producedSec - elapsedSec) * 1000.0));
             long long silenceFilledMs = static_cast<long long>(std::round((static_cast<double>(totalSilenceFilledFrames) / rate) * 1000.0));
 
-            fprintf(stderr, "[AppAudio] stats: produced=%.2fs elapsed=%.2fs drift=%lldms silence_filled=%lldms\n",
-                    producedSec, elapsedSec, driftMs, silenceFilledMs);
+            const long long pipeDroppedMs = asyncWriter
+                ? static_cast<long long>(std::llround(
+                    static_cast<double>(asyncWriter->DroppedFrames()) * 1000.0 / rate))
+                : 0;
+            fprintf(stderr, "[AppAudio] stats: produced=%.2fs elapsed=%.2fs drift=%lldms silence_filled=%lldms pipe_dropped=%lldms\n",
+                    producedSec, elapsedSec, driftMs, silenceFilledMs, pipeDroppedMs);
         }
 
         DWORD waitRes = WaitForSingleObject(hAudioEvent, 50);
@@ -621,6 +759,13 @@ int main(int argc, char* argv[]) {
                     if (FAILED(hrBuf)) {
                         fprintf(stderr, "[AppAudio] GetBuffer failed: 0x%08X\n", hrBuf);
                         break;
+                    }
+
+                    if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+                        ++discontinuityCount;
+                        fprintf(stderr,
+                                "[AppAudio] warning: capture discontinuity #%llu (buffer overrun)\n",
+                                static_cast<unsigned long long>(discontinuityCount));
                     }
 
                     if (numFramesToRead > 0) {
@@ -668,7 +813,7 @@ int main(int argc, char* argv[]) {
                             levelSampleCount += sampleCount;
                         }
 
-                        if (!WritePCMData(s16Buf.data(), sampleCount, wavPath, wavFile, wavDataBytesWritten, probe)) {
+                        if (!writePcm(s16Buf.data(), sampleCount)) {
                             fprintf(stderr, "[AppAudio] stdout write failed or pipe closed by downstream, exiting cleanly\n");
                             exitCode = 0;
                             g_stopRequested.store(true);
@@ -719,7 +864,7 @@ int main(int argc, char* argv[]) {
                     totalProducedFrames += silenceFrames;
                     totalSilenceFilledFrames += silenceFrames;
 
-                    if (!WritePCMData(silenceBuf.data(), silenceSamples, wavPath, wavFile, wavDataBytesWritten, probe)) {
+                    if (!writePcm(silenceBuf.data(), silenceSamples)) {
                         fprintf(stderr, "[AppAudio] stdout pipe closed during device re-activation, exiting cleanly\n");
                         exitCode = 0;
                         g_stopRequested.store(true);
@@ -767,7 +912,7 @@ int main(int argc, char* argv[]) {
                     totalProducedFrames += missingFrames;
                     totalSilenceFilledFrames += missingFrames;
 
-                    if (!WritePCMData(silenceBuf.data(), silenceSamples, wavPath, wavFile, wavDataBytesWritten, probe)) {
+                    if (!writePcm(silenceBuf.data(), silenceSamples)) {
                         fprintf(stderr, "[AppAudio] stdout pipe closed during silence fill, exiting cleanly\n");
                         exitCode = 0;
                         g_stopRequested.store(true);
@@ -807,6 +952,14 @@ int main(int argc, char* argv[]) {
     if (audioClient) {
         audioClient->Stop();
     }
+    if (asyncWriter) {
+        asyncWriter->Finish();
+        const uint64_t droppedFrames = asyncWriter->DroppedFrames();
+        if (droppedFrames > 0) {
+            fprintf(stderr, "[AppAudio] stdout backpressure dropped %.0f ms of stale audio\n",
+                    static_cast<double>(droppedFrames) * 1000.0 / rate);
+        }
+    }
 
     // Finalize WAV file header if writing WAV
     if (!wavPath.empty() && wavFile.is_open()) {
@@ -829,6 +982,9 @@ int main(int argc, char* argv[]) {
     if (hParent != NULL) {
         CloseHandle(hParent);
         hParent = NULL;
+    }
+    if (hMmcssTask != NULL) {
+        AvRevertMmThreadCharacteristics(hMmcssTask);
     }
 
     // Summary of silence guard (Section 2)

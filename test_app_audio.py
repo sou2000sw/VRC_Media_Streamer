@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 from streamer_core import (
     StreamerCore, build_app_audio_input, build_audio_inputs,
     build_dshow_audio_inputs, start_app_audio_helper,
-    get_app_audio_capture_cmd, _fmt_audio_volume,
+    get_app_audio_capture_cmd, find_app_audio_window, _fmt_audio_volume,
 )
 
 
@@ -14,7 +14,7 @@ from streamer_core import (
 def test_build_app_audio_input():
     args = build_app_audio_input()
     assert args == ["-f", "s16le", "-ar", "48000", "-ac", "2",
-                    "-thread_queue_size", "1024", "-i", "pipe:0"]
+                    "-thread_queue_size", "64", "-i", "pipe:0"]
 
 
 def test_build_audio_inputs_disabled_matches_legacy():
@@ -75,6 +75,27 @@ def test_app_volume_is_clamped():
     _, filt2, _ = build_audio_inputs(app_enabled=True, app_volume=-3, start_index=1)
     assert "volume=0.0" in filt2
     assert _fmt_audio_volume("abc") == "1.0"
+
+
+def test_find_app_audio_window_follows_changed_browser_title():
+    windows = [
+        {"title": "別の動画 - YouTube - Google Chrome", "pid": 123},
+        {"title": "メモ帳", "pid": 456},
+    ]
+    with patch("streamer_core.enumerate_capture_windows", return_value=windows):
+        win, followed = find_app_audio_window(
+            "前の動画 - YouTube - Google Chrome")
+    assert win["pid"] == 123
+    assert followed is True
+
+
+def test_find_app_audio_window_does_not_guess_unrelated_app():
+    windows = [{"title": "別の動画 - Microsoft Edge", "pid": 123}]
+    with patch("streamer_core.enumerate_capture_windows", return_value=windows):
+        win, followed = find_app_audio_window(
+            "前の動画 - YouTube - Google Chrome")
+    assert win is None
+    assert followed is False
 
 
 # ---------------------------------------------------------------- 補助exeの起動
@@ -161,8 +182,8 @@ def test_resolve_pid_found():
     core = _core()
     core.config["live_audio_app_enabled"] = True
     core.config["live_audio_app_window_title"] = "Chrome"
-    with patch("streamer_core.find_capture_window",
-               return_value={"title": "Chrome", "pid": 777, "hwnd": 1}):
+    with patch("streamer_core.find_app_audio_window",
+               return_value=({"title": "Chrome", "pid": 777, "hwnd": 1}, False)):
         assert core._resolve_app_audio_pid() == 777
 
 

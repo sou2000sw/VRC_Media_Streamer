@@ -48,7 +48,7 @@ cl /nologo /std:c++17 /utf-8 /EHsc /O2 /W4 /DUNICODE /D_UNICODE ^
    /Fe:"%OUTDIR%\app_audio_capture.exe" ^
    /Fo:"%OUTDIR%\\" ^
    "%SRC%" ^
-   /link ole32.lib mmdevapi.lib
+   /link ole32.lib mmdevapi.lib avrt.lib
 
 if errorlevel 1 (
     echo [build] FAILED

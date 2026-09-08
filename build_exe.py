@@ -108,6 +108,18 @@ def write_dist_config(dest_path, overrides=None):
         f.write("\n")
     return True
 
+
+def dist_config_bytes(overrides=None):
+    """ZIPへ直接入れる、個人設定を含まない配布用configを返す。"""
+    template = os.path.abspath("config.dist.json")
+    if not os.path.exists(template):
+        return None
+    with open(template, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    if overrides:
+        cfg.update(overrides)
+    return (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
 def generate_startup_shortcuts(target_dir):
     """指定ディレクトリに各種起動用バッチファイルを作成"""
     os.makedirs(target_dir, exist_ok=True)
@@ -350,8 +362,12 @@ def create_versioned_release(version=APP_VERSION):
     # 2. ffmpeg.exe のコピー
     copy_media_tools(target_dir, os.path.basename(target_dir) + "/")
 
-    # 3. config.json の生成 (配布用テンプレート config.dist.json から)
-    if write_dist_config(os.path.join(target_dir, "config.json")):
+    # 3. 同じ版への上書きビルドでは利用者の設定を保持する。
+    # ZIPには下で常に配布用テンプレートを入れるため、秘密の配信キーは混入しない。
+    release_config = os.path.join(target_dir, "config.json")
+    if os.path.exists(release_config):
+        print("[OK] Preserved existing runtime config.json", flush=True)
+    elif write_dist_config(release_config):
         print("[OK] Generated config.json from config.dist.json", flush=True)
 
     # 4. ドキュメント類のコピー
@@ -386,8 +402,14 @@ def create_versioned_release(version=APP_VERSION):
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for file_path in iter_packagable_files(target_dir):
+                if os.path.normcase(os.path.abspath(file_path)) == os.path.normcase(os.path.abspath(release_config)):
+                    continue
                 arcname = os.path.relpath(file_path, releases_root)
                 zf.write(file_path, arcname)
+            clean_config = dist_config_bytes()
+            if clean_config is not None:
+                config_arcname = os.path.join(release_dir_name, "config.json").replace("\\", "/")
+                zf.writestr(config_arcname, clean_config)
         print(f"[OK] Successfully generated ZIP: {zip_path}", flush=True)
     except Exception as e:
         print(f"[WARN] Failed to create ZIP archive: {e}", flush=True)
@@ -417,6 +439,13 @@ def verify_release(target_dir, port=8991, timeout=45):
 
     exe_path = os.path.join(target_dir, "VRC_Media_Streamer.exe")
     ui_path = os.path.abspath(os.path.join("ui", "index.html"))
+    config_path = os.path.join(target_dir, "config.json")
+    # 上書きビルドでは実利用中の設定を検証起動の前後で完全に保持する。
+    # 新規配布フォルダだけは従来どおりテンプレートへ戻す。
+    preserved_config = None
+    if os.path.exists(config_path):
+        with open(config_path, "rb") as f:
+            preserved_config = f.read()
 
     print(f"\n==================================================", flush=True)
     print(f"Verifying release package...", flush=True)
@@ -563,9 +592,13 @@ def verify_release(target_dir, port=8991, timeout=45):
             if os.path.isdir(stale):
                 print(f"[WARN] Could not remove runtime artifacts: {stale}", flush=True)
 
-        # 検証起動によって config.json に実行時の値が書き戻されていないか確認し、
-        # 差異があればテンプレートから生成し直す。
-        write_dist_config(os.path.join(target_dir, "config.json"))
+        # 検証起動が書き戻した値を除去する。上書きビルドなら利用者設定を
+        # バイト単位で復元し、新規配布ならテンプレートを生成する。
+        if preserved_config is not None:
+            with open(config_path, "wb") as f:
+                f.write(preserved_config)
+        else:
+            write_dist_config(config_path)
 
 
 def build(version=APP_VERSION):
@@ -632,8 +665,8 @@ def build(version=APP_VERSION):
     print(f"Running command: {' '.join(cmd)}", flush=True)
     try:
         subprocess.run(cmd, check=True)
-    except FileNotFoundError:
-        print("pyinstaller command not found in PATH. Retrying with python -m PyInstaller...", flush=True)
+    except (FileNotFoundError, PermissionError):
+        print("pyinstaller launcher unavailable. Retrying with python -m PyInstaller...", flush=True)
         cmd[0:1] = [sys.executable, "-m", "PyInstaller"]
         print(f"Running command: {' '.join(cmd)}", flush=True)
         subprocess.run(cmd, check=True)

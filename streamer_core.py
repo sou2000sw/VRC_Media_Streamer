@@ -712,7 +712,10 @@ def build_app_audio_input(rate=APP_AUDIO_RATE, channels=APP_AUDIO_CHANNELS):
         "-f", "s16le",
         "-ar", str(int(rate)),
         "-ac", str(int(channels)),
-        "-thread_queue_size", "1024",
+        # s16le の1パケットは小さいため1024パケットでは約20秒分まで
+        # 膨らみ得る。映像が遅れた際に音声だけ先読みして巨大な時間差を
+        # 作らないよう、約1秒強に制限する。
+        "-thread_queue_size", "64",
         "-i", "pipe:0"
     ]
 
@@ -1505,6 +1508,46 @@ def find_capture_window(title):
     return None
 
 
+def find_app_audio_window(title):
+    """音声対象を解決する。完全一致が無ければ同じアプリの窓へ追従する。
+
+    Chrome/Edge はタブや動画が変わるたびトップレベルタイトルも変わる。
+    画面キャプチャで曖昧一致すると別窓を映す危険があるため従来どおり完全一致、
+    アプリ音声だけは末尾のアプリ名（例: ``Google Chrome``）が一致する窓へ
+    追従する。プロセスループバックはそのブラウザのプロセスツリーを取るので、
+    動画タイトル部分を識別子にしてはいけない。
+    """
+    windows = enumerate_capture_windows()
+    for w in windows:
+        if w.get("title") == title:
+            return w, False
+
+    text = str(title or "").strip()
+    if " - " not in text:
+        return None, False
+    app_name = text.rsplit(" - ", 1)[-1].strip().casefold()
+    # 短い一般語で誤追従しない。実アプリ名として十分な長さだけ許す。
+    if len(app_name) < 4:
+        return None, False
+    suffix = " - " + app_name
+    matches = [w for w in windows
+               if str(w.get("title", "")).casefold().endswith(suffix)]
+    if not matches:
+        return None, False
+
+    # 元タイトルとの共通末尾が長いものを優先し、同点なら列挙順で安定させる。
+    folded = text.casefold()
+    def common_suffix_len(candidate):
+        other = str(candidate.get("title", "")).casefold()
+        n = 0
+        for a, b in zip(reversed(folded), reversed(other)):
+            if a != b:
+                break
+            n += 1
+        return n
+    return max(matches, key=common_suffix_len), True
+
+
 def even_dimension(value, minimum=2):
     """yuv420p 用に偶数へ切り下げる。"""
     try:
@@ -1865,7 +1908,11 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
             input_args = [
                 "-f", "rawvideo", "-pixel_format", "bgra",
                 "-video_size", f"{w}x{h}", "-framerate", str(fps),
-                "-thread_queue_size", "1024",
+                # WGC は非圧縮 BGRA（2560x1392 なら1枚約14MB）。1024枚の
+                # キューは遅延を吸収するどころか、送出が少し遅れただけで
+                # 数百MB・数秒分の古い映像を溜め、音声も一緒に詰まらせる。
+                # OBS と同様に古い画を長く保持せず、短いキューで背圧を返す。
+                "-thread_queue_size", "4",
                 "-i", pipe_name
             ]
             return (input_args, False)
@@ -1873,7 +1920,7 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
             _, idx, ox, oy, w, h = window_plan
             dm = "true" if draw_mouse else "false"
             input_args = [
-                "-f", "lavfi", "-thread_queue_size", "1024",
+                "-f", "lavfi", "-thread_queue_size", "4",
                 "-i", (f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
                        f":video_size={w}x{h}:offset_x={ox}:offset_y={oy}")
             ]
@@ -1884,7 +1931,7 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
             # ★offset_x/offset_y は仮想画面の**絶対座標**。原点からの相対値を
             #   渡すと `extends outside window area` で起動しない（実測で確認）。
             input_args = [
-                "-f", "gdigrab", "-thread_queue_size", "1024",
+                "-f", "gdigrab", "-thread_queue_size", "4",
                 "-framerate", str(fps), "-draw_mouse", dm,
                 "-offset_x", str(x), "-offset_y", str(y),
                 "-video_size", f"{w}x{h}",
@@ -1901,7 +1948,7 @@ def build_screen_capture_input(source_type="display", display_index=0, window_ti
         idx = 0
     dm = "true" if draw_mouse else "false"
     input_args = [
-        "-f", "lavfi", "-thread_queue_size", "1024",
+        "-f", "lavfi", "-thread_queue_size", "4",
         "-i", f"ddagrab=output_idx={idx}:framerate={fps}:draw_mouse={dm}"
     ]
     return (input_args, True)
@@ -3879,7 +3926,11 @@ class StreamerCore:
         ffmpeg = get_ffmpeg_cmd()
         head = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-nostats",
-            "-fflags", "+nobuffer+flush_packets+genpts+igndts",
+            # 送信側は連続PTSを持つMPEG-TSを出している。nobuffer と
+            # packet毎flushを入口にも掛けると、ネットワークの揺れがそのまま
+            # 映像・音声の読み取りへ逆流するため、シンク側には通常の
+            # demux/interleave バッファを持たせる。
+            "-fflags", "+genpts+igndts",
             "-i", "pipe:0",
         ]
 
@@ -4854,7 +4905,10 @@ class StreamerCore:
             "-bufsize", "200k",
             "-c:a", "aac",
             "-b:a", "128k",
-            "-ar", "44100",
+            # アプリ音声/WASAPI/参加型マイクはいずれも48kHz。ここだけ44.1kHzへ
+            # 落とすとライブ中ずっと非整数比の再サンプリングが走り、短い音切れが
+            # 「ぶつぶつ」と聞こえる。入口からAACまで48kHzで統一する。
+            "-ar", str(APP_AUDIO_RATE),
             "-af", radio_af,
             "-shortest",
             "-fflags", "+nobuffer+flush_packets",
@@ -5424,10 +5478,12 @@ class StreamerCore:
         if not title:
             log_print("[AppAudio] 対象ウィンドウ未選択 -> アプリ音声なしで続行")
             return None
-        win = find_capture_window(title)
+        win, followed = find_app_audio_window(title)
         if not win:
             log_print(f"[AppAudio] 対象ウィンドウが見つからない: '{title}' -> アプリ音声なしで続行")
             return None
+        if followed:
+            log_print(f"[AppAudio] タイトル変更へ追従: '{title}' -> '{win.get('title', '')}'")
         pid = win.get("pid")
         log_print(f"[AppAudio] 対象ウィンドウ '{title}' -> pid={pid}")
         return pid
@@ -5440,7 +5496,9 @@ class StreamerCore:
         proc = start_app_audio_helper(
             pid,
             mode=self.config.get("live_audio_app_mode", "include"),
-            stats_sec=int(self.config.get("live_audio_app_stats_sec", 0) or 0)
+            # 実配信でのみ現れる背圧・ドリフトを追えるよう定期統計を残す。
+            # レベル行と違い10秒に1行だけなのでログ量への影響は小さい。
+            stats_sec=int(self.config.get("live_audio_app_stats_sec", 10) or 10)
         )
         if proc:
             self.app_audio_level = None
@@ -5514,7 +5572,10 @@ class StreamerCore:
                     continue
                 low = line.lower()
                 if ("error" in low or "invalid" in low or "failed" in low
-                        or "no such file" in low or "conversion failed" in low):
+                        or "no such file" in low or "conversion failed" in low
+                        or "thread message queue blocking" in low
+                        or "buffer queue overflow" in low
+                        or "non-monoton" in low):
                     if kept < max_lines:
                         log_print(f"[FFmpeg:{label}] {line}")
                         kept += 1
@@ -6047,7 +6108,7 @@ class StreamerCore:
         silent_audio = not audio_map
         if silent_audio:
             input_args_a = ["-f", "lavfi", "-i",
-                            "anullsrc=channel_layout=stereo:sample_rate=44100"]
+                            f"anullsrc=channel_layout=stereo:sample_rate={APP_AUDIO_RATE}"]
 
         cmd = [get_ffmpeg_cmd()] + input_args_v + input_args_a
 
@@ -6090,11 +6151,15 @@ class StreamerCore:
                 gop_frames=fps, fps=fps)
         ])
 
-        cmd.extend(["-c:a", "aac", "-b:a", "192k" if audio_map else "64k", "-ar", "44100"])
+        cmd.extend(["-c:a", "aac", "-b:a", "192k" if audio_map else "64k",
+                    "-ar", str(APP_AUDIO_RATE)])
 
         cmd.extend([
-            "-fflags", "+nobuffer+flush_packets", "-flush_packets", "1",
-            "-muxdelay", "0", "-muxpreload", "0", "-max_interleave_delta", "0",
+            # raw WGC と raw PCM はどちらも壁時計で供給される。ここで
+            # nobuffer + packet毎flushまで強制すると、映像・音声のわずかな
+            # 到着差を吸収できず小刻みなTS書き込みになり、下流RTMPの背圧が
+            # そのまま両キャプチャへ波及する。多重化に必要な最小限だけ待つ。
+            "-muxdelay", "0.1", "-muxpreload", "0",
             *self._ts_offset_opts(), "-f", "mpegts", "pipe:1"
         ])
 
@@ -6106,7 +6171,7 @@ class StreamerCore:
                 cmd,
                 stdin=(app_helper.stdout if app_helper else subprocess.DEVNULL),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, bufsize=0,
+                stderr=subprocess.PIPE, bufsize=0,
                 creationflags=CREATE_NO_WINDOW
             )
         except Exception as e:
@@ -6120,6 +6185,9 @@ class StreamerCore:
 
         with self.process_lock:
             self.send_proc = proc
+
+        threading.Thread(target=self.pump_sender_stderr,
+                         args=(proc, "screen_capture"), daemon=True).start()
 
         # ★親側の読み口は閉じる。閉じないと補助exeが終わってもEOFが伝わらない。
         if app_helper and app_helper.stdout:
