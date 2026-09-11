@@ -566,6 +566,7 @@ def test_live_audio_levels_endpoint_is_localhost_only():
     assert "is_local_request()" in block
     assert "check_web_password_auth()" in block
     assert "request_level=True" in block
+    assert "get_app_audio_level()" in block
 
 
 def test_status_does_not_carry_input_levels():
@@ -585,6 +586,14 @@ def test_ui_has_input_meters_for_mic_and_loopback():
                    'id="liveAudioLoopbackMeterBar"', 'id="liveAudioLoopbackMeterText"',
                    'function pollLiveAudioLevels', '/api/live_audio_levels'):
         assert needle in html, needle
+
+
+def test_app_audio_meter_uses_fast_level_polling():
+    """アプリ音声も2秒のstatusではなく、250msの入力レベル取得で更新する。"""
+    html = _ui_html()
+    start = html.index("async function pollLiveAudioLevels()")
+    block = html[start:start + 3000]
+    assert "updateAppAudioMeter(data)" in block
 
 
 def test_ui_stops_metering_when_the_card_is_not_shown():

@@ -1,5 +1,14 @@
 # 更新履歴 (CHANGELOG)
 
+## [2.11.0-gst-beta.1] - 2026-09-09
+
+### 🚀 GStreamer 画面キャプチャ・バックエンド（ベータ版）
+
+- **単一パイプラインの導入**: D3D11（画面 / WGC ウィンドウキャプチャ）と WASAPI2 / DirectShow（アプリ音声 / マイク / ループバック）を単一の GStreamer パイプライン内で合成し、HLS (`hlssink2`) および RTMP (`flvmux` + `rtmpsink`) へ直接送出します。
+- **MPEG-TS リレイと二重 FFmpeg の廃止**: GStreamer バックエンド動作時は、Python MPEG-TS 中継および 2 つ目の persistent FFmpeg シンクがバイパスされ、CPU・メモリ負荷および遅延が大幅に削減されます。
+- **FFmpeg 自動フォールバック**: ランタイム未設定・事前検証失敗・カラオケ機能有効化などの場合、既存の FFmpeg キャプチャ経路へ自動的にフォールバックします。
+- **独立パッケージ化**: PyPI `gstreamer-bundle==1.28.6` (~331 MiB) を用いた個別パッケージとしてビルドされます。
+
 ## [Unreleased] - develop
 
 ### 🎛 操作画面を OBS 風の3ペイン（シーン / ソース / 音声ミキサー）にした

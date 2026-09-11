@@ -129,3 +129,10 @@ standby_test.png
 # ビルド時に ui/vendor/ から同期される（正本は ui/vendor/）。
 # 1.4MB の第三者バイナリをリポジトリに二重で持たないため除外する。
 plugin/ui/vendor/
+
+# GStreamer 開発用ランタイム
+.gstreamer_runtime/
+
+# ローカルテストの一時出力
+.pytest_temp/
+.tmp_diag/pytest_*/

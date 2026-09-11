@@ -884,6 +884,9 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response(200, {
                 "success": True,
                 "levels": self.streamer_core.get_live_audio_levels(request_level=True),
+                # アプリ音声も同じ高速ポーリングへ載せる。通常の /api/status は
+                # 2秒周期なので、そこだけに頼るとVUメーターとして反応が遅すぎる。
+                "app_audio_level": self.streamer_core.get_app_audio_level(),
             })
             return
 

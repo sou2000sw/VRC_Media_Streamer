@@ -42,6 +42,7 @@
   "screen_capture_height": 1080,
   "screen_capture_draw_mouse": true,
   "screen_capture_bitrate_kbps": 4000,
+  "screen_capture_backend": "gstreamer",
   "radio_bg_source": "card",
   "radio_crossfade_duration": 3,
   "standby_mode": "image",

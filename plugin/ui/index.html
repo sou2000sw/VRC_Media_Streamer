@@ -3890,6 +3890,7 @@
             if (!isLocalEnvironment() || !liveAudioCardIsVisible()) {
                 renderInputMeter('liveAudioMicMeterBar', 'liveAudioMicMeterText', null, '停止中');
                 renderInputMeter('liveAudioLoopbackMeterBar', 'liveAudioLoopbackMeterText', null, '停止中');
+                renderInputMeter('liveAudioAppMeterBar', 'liveAudioAppMeterText', null, '停止中');
                 return;
             }
             liveAudioLevelBusy = true;
@@ -3905,6 +3906,9 @@
                                  mic, mic.configured ? '待機中' : '未選択');
                 renderInputMeter('liveAudioLoopbackMeterBar', 'liveAudioLoopbackMeterText',
                                  loop, loop.configured ? '待機中' : '未選択');
+                // アプリ音声もマイク／PC出力と同じ250ms周期で描く。
+                // /api/status の2秒周期では短いピークをほぼ取りこぼす。
+                updateAppAudioMeter(data);
             } catch (e) {
                 // ネットワークの一過性エラーでゲージを壊さない（次の周期で戻る）。
             } finally {

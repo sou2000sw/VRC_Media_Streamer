@@ -43,6 +43,11 @@ from remote_mic import (
     REVERB_PRESETS as KARAOKE_REVERB_PRESETS,
     KARAOKE_OFFSET_MIN_MS, KARAOKE_OFFSET_MAX_MS,
 )
+import gstreamer_backend
+from gstreamer_backend import (
+    get_gstreamer_runtime_dir, validate_gstreamer_runtime,
+    build_gstreamer_screen_capture_plan, redact_gstreamer_log
+)
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 HLS_DIR = os.path.join(APP_DIR, "hls_output")
@@ -182,6 +187,7 @@ DEFAULT_CONFIG = {
     "screen_capture_height": 1080,
     "screen_capture_draw_mouse": True,
     "screen_capture_bitrate_kbps": 4000,
+    "screen_capture_backend": "gstreamer",
     "radio_mode": False,
     "radio_bg_source": "card",
     # ラジオの曲頭・曲尾フェード秒数（0で無効・最大5秒）: タスク17
@@ -2100,7 +2106,7 @@ def build_video_encoder_opts(encoder, *, v_kbps, max_kbps, buf_kbps,
                              h264_profile="baseline", sw_preset="ultrafast",
                              sw_tune="zerolatency", level="3.1",
                              gop_frames=None, fps=None, bf_zero=True,
-                             sc_threshold_zero=False):
+                             sc_threshold_zero=False, input_is_d3d11=False):
     """`-c:v` から始まる映像エンコード引数一式を組み立てる。
 
     **エンコーダーごとに完全に別の一覧を返す。共通部分に足し込む形にしてはいけない。**
@@ -2128,7 +2134,12 @@ def build_video_encoder_opts(encoder, *, v_kbps, max_kbps, buf_kbps,
             #   libx264 は黙って辻褄を合わせるので、同じ値を流用すると
             #   「x264では動くのにNVENCだけ起動しない」になる。1080p の実力値へ上げる。
             opts += ["-level", "4.1" if str(level) == "3.1" else str(level)]
-        opts += ["-pix_fmt", "yuv420p"] + rate
+        # ddagrab の D3D11 テクスチャを直接渡す場合、-pix_fmt yuv420p は
+        # software auto_scale を挿入してGPU直結を壊す。最終的な配信用
+        # yuv420p化は永続シンク側で行う。
+        if not input_is_d3d11:
+            opts += ["-pix_fmt", "yuv420p"]
+        opts += rate
         if bf_zero:
             opts += ["-bf", "0"]
         # -sc_threshold は libx264 専用。NVENC に渡すと弾かれるので出さない。
@@ -2787,6 +2798,11 @@ class StreamerCore:
         self._sink_retry_at = 0.0
         self._sink_force_restart = False
         self._sink_stderr_tail = collections.deque(maxlen=20)
+
+        # GStreamer バックエンド状態
+        self._direct_capture_active = False
+        self.active_screen_capture_backend = self.config.get("screen_capture_backend", "gstreamer")
+        self.gstreamer_fallback_reason = None
 
         self.play_queue = [] # list of dict: [{"title": "...", "url": "...", "duration": ..., "type": "video"}]
         self.photo_pool = [] # list of dict: [{"id": "...", "type": "image", "title": "...", "url": "...", "path": "...", "duration": ...}]
@@ -3467,6 +3483,10 @@ class StreamerCore:
             "screen_capture_draw_mouse": bool(self.config.get("screen_capture_draw_mouse", True)),
             "screen_capture_bitrate_kbps": int(self.config.get("screen_capture_bitrate_kbps", 4000)),
             "screen_capture_window_method": str(self.config.get("screen_capture_window_method", "auto")),
+            "screen_capture_backend": str(self.config.get("screen_capture_backend", "gstreamer")),
+            "active_screen_capture_backend": getattr(self, "active_screen_capture_backend", str(self.config.get("screen_capture_backend", "gstreamer"))),
+            "gstreamer_available": self.is_gstreamer_available(),
+            "gstreamer_fallback_reason": getattr(self, "gstreamer_fallback_reason", None),
             "window_capture_available": bool(get_window_capture_cmd()),
             "standby_mode": str(self.config.get("standby_mode", "image")),
             "standby_image_path": str(self.config.get("standby_image_path", "")),
@@ -4071,6 +4091,8 @@ class StreamerCore:
     def ensure_stream_sink(self):
         """配信先シンクFFmpegが動いていれば維持し、未起動/停止時のみ起動する
         （ストリーム連続性を保持）。destination の切り替え点はここ1箇所だけ。"""
+        if getattr(self, "_direct_capture_active", False):
+            return True
         with self.process_lock:
             force = bool(getattr(self, "_sink_force_restart", False))
             if not force and self.hls_proc and self.hls_proc.poll() is None and self.current_stdin:
@@ -4130,6 +4152,8 @@ class StreamerCore:
 
     def _destination_watchdog_tick(self):
         """ウォッチドッグ1回分。ループと分けてあるのは単体テストから叩けるようにするため。"""
+        if getattr(self, "_direct_capture_active", False):
+            return
         try:
             proc = self.hls_proc
             if proc is not None and proc.poll() is not None:
@@ -5680,12 +5704,14 @@ class StreamerCore:
     def set_screen_capture_source(self, source_type=None, display_index=None, window_title=None,
                                   framerate=None, width=None, height=None,
                                   draw_mouse=None, bitrate_kbps=None,
-                                  window_method=None):
+                                  window_method=None, backend=None):
         """画面キャプチャ設定（入力ソース・フレームレート・解像度等）を更新"""
         if source_type in ("display", "window"):
             self.config["screen_capture_source_type"] = source_type
         if window_method in ("auto", "wgc", "desktop_crop"):
             self.config["screen_capture_window_method"] = window_method
+        if backend in ("ffmpeg", "gstreamer"):
+            self.config["screen_capture_backend"] = backend
         if display_index is not None:
             try:
                 idx = int(display_index)
@@ -5741,6 +5767,7 @@ class StreamerCore:
             "draw_mouse": self.config.get("screen_capture_draw_mouse", True),
             "bitrate_kbps": self.config.get("screen_capture_bitrate_kbps", 4000),
             "window_method": self.config.get("screen_capture_window_method", "auto"),
+            "backend": self.config.get("screen_capture_backend", "gstreamer"),
             "wgc_available": get_window_capture_cmd() is not None,
         }
 
@@ -5955,8 +5982,258 @@ class StreamerCore:
                          args=(proc, stop_event), daemon=True).start()
         return stop_event
 
+    def is_gstreamer_available(self, validate=False, override_path=None):
+        rt_dir = get_gstreamer_runtime_dir(override_path)
+        if not rt_dir:
+            return False
+        if validate:
+            ok, _ = validate_gstreamer_runtime(rt_dir)
+            return ok
+        return True
+
+    def _pump_gstreamer_stderr(self, proc):
+        if not proc or not proc.stderr:
+            return
+        try:
+            while True:
+                line = proc.stderr.readline()
+                if not line or line == b"":
+                    break
+                if isinstance(line, bytes):
+                    text = line.decode("utf-8", errors="replace").strip()
+                else:
+                    text = str(line).strip()
+                if not text:
+                    continue
+                sanitized = redact_gstreamer_log(text)
+                if any(k in sanitized.lower() for k in ("error", "warn", "failed")):
+                    log_print(f"[GStreamer] {sanitized}")
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    def _release_gstreamer_direct_state(self, proc):
+        """Release direct-output state only if *proc* still owns the slot."""
+        with self.process_lock:
+            # Normal queue cleanup clears send_proc before the watcher can take
+            # this lock.  None still means this stopped pipeline can release the
+            # flag.  A different process means a new capture owns the slot.
+            if self.send_proc is not None and self.send_proc is not proc:
+                return False
+            self._direct_capture_active = False
+            return True
+
+    def _play_screen_capture_gstreamer(self):
+        source_type = self.config.get("screen_capture_source_type", "display")
+        display_index = self.config.get("screen_capture_display_index", 0)
+        window_title = self.config.get("screen_capture_window_title", "")
+        framerate = self.config.get("screen_capture_framerate", 30)
+        width = self.config.get("screen_capture_width", 1920)
+        height = self.config.get("screen_capture_height", 1080)
+        draw_mouse = self.config.get("screen_capture_draw_mouse", True)
+        bitrate_kbps = self.config.get("screen_capture_bitrate_kbps", 4000)
+
+        # 1. Karaoke voice routing check (Spec line 60)
+        if bool(getattr(self, "karaoke", None) and self.karaoke.enabled):
+            reason = "Karaoke voice routing is active (unsupported in GStreamer backend)"
+            log_print(f"[GStreamer] {reason}; falling back to FFmpeg backend.")
+            self.gstreamer_fallback_reason = reason
+            self.active_screen_capture_backend = "ffmpeg"
+            return None
+
+        # 2. Runtime resolution & validation
+        runtime_dir = get_gstreamer_runtime_dir()
+        if not runtime_dir:
+            reason = "GStreamer runtime directory not found"
+            log_print(f"[GStreamer] {reason}; falling back to FFmpeg backend.")
+            self.gstreamer_fallback_reason = reason
+            self.active_screen_capture_backend = "ffmpeg"
+            return None
+
+        ok, val_err = validate_gstreamer_runtime(runtime_dir)
+        if not ok:
+            reason = f"GStreamer runtime validation failed: {val_err}"
+            log_print(f"[GStreamer] {reason}; falling back to FFmpeg backend.")
+            self.gstreamer_fallback_reason = reason
+            self.active_screen_capture_backend = "ffmpeg"
+            return None
+
+        # 3. Window handle resolution
+        hwnd = None
+        if source_type == "window":
+            if not window_title:
+                self.status = "error"
+                self.status_detail = "キャプチャ対象のウィンドウが未選択です"
+                return "ERROR"
+            win = get_window_rect_by_hwnd(getattr(self, "_screen_capture_hwnd", None))
+            if win is None:
+                win = find_capture_window(window_title)
+                if win is not None:
+                    self._screen_capture_hwnd = win.get("hwnd")
+            if win is None:
+                log_print(f"[Player] Screen capture window not found: '{window_title}'")
+                self.status = "error"
+                self.status_detail = f"ウィンドウが見つかりません: {window_title}"
+                return "ERROR"
+            hwnd = win.get("hwnd")
+
+        # 4. Resolve App PID if app audio enabled
+        app_pid = None
+        app_enabled = bool(self.config.get("live_audio_app_enabled", False))
+        if app_enabled:
+            app_pid = self._resolve_app_audio_pid()
+
+        mic_dev = self.config.get("live_audio_mic_device", "")
+        loop_dev = self.config.get("live_audio_loopback_device", "")
+        mic_vol = self.config.get("live_audio_mic_volume", 1.0)
+        loop_vol = self.config.get("live_audio_loopback_volume", 0.7)
+        app_vol = self.config.get("live_audio_app_volume", 1.0)
+        app_mode = self.config.get("live_audio_app_mode", "include")
+        audio_bitrate_kbps = self.config.get("rtmp_audio_bitrate_kbps", 192)
+
+        # 5. Output mode & RTMP endpoint probe
+        target_output_mode = self.get_active_output_mode()
+        rtmp_publish_url = None
+
+        if target_output_mode in RTMP_OUTPUT_MODES:
+            bitrate_kbps = self.config.get("rtmp_video_bitrate_kbps", 2000)
+            url = self.get_rtmp_publish_url(target_output_mode)
+            if not url:
+                self.status = "error"
+                self.status_detail = f"RTMP publish URL is empty ({target_output_mode})"
+                return "ERROR"
+            ok, probe_err = self.probe_rtmp_endpoint(url)
+            if not ok:
+                log_print(f"[GStreamer] RTMP endpoint probe failed for '{target_output_mode}': {probe_err}")
+                if bool(self.config.get("rtmp_fallback_to_hls", True)):
+                    log_print("[GStreamer] Falling back RTMP output to HLS mode")
+                    target_output_mode = "hls"
+                    bitrate_kbps = self.config.get("screen_capture_bitrate_kbps", 4000)
+                else:
+                    self.status = "error"
+                    self.status_detail = f"RTMP endpoint unavailable: {probe_err}"
+                    return "ERROR"
+            else:
+                rtmp_publish_url = url
+                dest_w = int(self.config.get("rtmp_video_width", 1280))
+                dest_h = int(self.config.get("rtmp_video_height", 720))
+                width, height = clamp_capture_size_to_destination(width, height, dest_w, dest_h)
+
+        plan_output_mode = "rtmp" if (target_output_mode in RTMP_OUTPUT_MODES or target_output_mode == "rtmp") else "hls"
+
+        # 6. Build plan
+        try:
+            plan = build_gstreamer_screen_capture_plan(
+                runtime_dir=runtime_dir,
+                source_type=source_type,
+                display_index=display_index,
+                hwnd=hwnd,
+                width=width,
+                height=height,
+                fps=framerate,
+                draw_mouse=draw_mouse,
+                bitrate_kbps=bitrate_kbps,
+                gop_seconds=float(self.config.get("rtmp_gop_seconds", 2.0)),
+                app_audio_enabled=app_enabled and (app_pid is not None and app_pid > 0),
+                app_pid=app_pid,
+                app_mode=app_mode,
+                app_volume=app_vol,
+                mic_device=mic_dev,
+                mic_volume=mic_vol,
+                loopback_device=loop_dev,
+                loopback_volume=loop_vol,
+                audio_bitrate_kbps=audio_bitrate_kbps,
+                output_mode=plan_output_mode,
+                hls_dir=HLS_DIR,
+                hls_segment_time=int(self.config.get("hls_segment_time", 3)),
+                hls_list_size=int(self.config.get("hls_list_size", 15)),
+                rtmp_url=rtmp_publish_url,
+            )
+        except Exception as e:
+            reason = f"GStreamer plan construction error: {e}"
+            log_print(f"[GStreamer] {reason}; falling back to FFmpeg backend.")
+            self.gstreamer_fallback_reason = reason
+            self.active_screen_capture_backend = "ffmpeg"
+            return None
+
+        # 7. Close persistent sink under process_lock and start process
+        with self.process_lock:
+            if self.current_stdin:
+                try:
+                    self.current_stdin.close()
+                except Exception:
+                    pass
+                self.current_stdin = None
+            if self.hls_proc:
+                kill_proc(self.hls_proc)
+                self.hls_proc = None
+
+            self._direct_capture_active = True
+            self.active_screen_capture_backend = "gstreamer"
+            self.gstreamer_fallback_reason = None
+
+        creation_flags = 0x08000000 if sys.platform == "win32" else 0
+        try:
+            proc = subprocess.Popen(
+                plan.cmd,
+                env=plan.env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=creation_flags,
+                shell=False,
+            )
+        except Exception as e:
+            with self.process_lock:
+                self._direct_capture_active = False
+            reason = f"GStreamer process launch error: {e}"
+            log_print(f"[GStreamer] {reason}; falling back to FFmpeg backend.")
+            self.gstreamer_fallback_reason = reason
+            self.active_screen_capture_backend = "ffmpeg"
+            return None
+
+        with self.process_lock:
+            self.send_proc = proc
+
+        log_print(f"[Player] GStreamer direct capture active: {plan.display_target}")
+        self.status = "streaming"
+        self.status_detail = plan.display_target
+
+        threading.Thread(
+            target=self._pump_gstreamer_stderr,
+            args=(proc,),
+            daemon=True
+        ).start()
+
+        stop_event = threading.Event()
+
+        def _watch_gstreamer():
+            try:
+                proc.wait()
+            except Exception:
+                pass
+            if not self._release_gstreamer_direct_state(proc):
+                return
+            if not stop_event.is_set():
+                log_print("[Monitor] Video finished naturally.")
+                self.video_done_event.set()
+
+        threading.Thread(target=_watch_gstreamer, daemon=True).start()
+        return stop_event
+
     def play_screen_capture(self):
         """ホストPCの画面（ディスプレイ or ウィンドウ）を音声つきでライブ配信"""
+        configured_backend = self.config.get("screen_capture_backend", "gstreamer")
+        if configured_backend == "gstreamer":
+            res = self._play_screen_capture_gstreamer()
+            if res == "ERROR":
+                return None
+            elif res is not None:
+                return res
+            # Fallback to FFmpeg implementation below
         source_type = self.config.get("screen_capture_source_type", "display")
         display_index = self.config.get("screen_capture_display_index", 0)
         window_title = self.config.get("screen_capture_window_title", "")
@@ -6112,14 +6389,42 @@ class StreamerCore:
 
         cmd = [get_ffmpeg_cmd()] + input_args_v + input_args_a
 
-        video_chain = build_screen_video_filter(needs_hwdownload, width, height, clock_filter)
+        encoder = self.get_video_encoder()
+        try:
+            fps = int(framerate)
+        except (TypeError, ValueError):
+            fps = 30
+        fps = max(1, min(60, fps))
 
-        if audio_filter:
-            cmd.extend(["-filter_complex", f"{video_chain};{audio_filter}"])
+        d3d11_direct = (
+            needs_hwdownload
+            and self.get_active_output_mode() in RTMP_OUTPUT_MODES
+            and encoder == "h264_nvenc"
+            and not clock_filter
+        )
+
+        if d3d11_direct:
+            # ddagrab -> hwdownload -> CPU scale -> NVENC では、このPCで実画像が
+            # 約16fpsまで低下し、FFmpegが大量複製して見かけの30fpsを作っていた。
+            # Topaz用シンクが必ず1280x720へ変換するため、ここではD3D11の
+            # 元テクスチャをそのままNVENCへ渡し、GPU→RAM→GPU往復を無くす。
+            # ddagrab は負荷や下流の背圧があると同じPTSを複数フレームへ付ける
+            # ことがあり、MPEG-TSで Non-monotonic DTS が連発して実効fpsが落ちる。
+            # setpts はD3D11テクスチャをCPUへ戻さず、時刻だけを等間隔へ直せる。
+            video_chain = f"[0:v]setpts=N/({fps}*TB)[vout]"
+            if audio_filter:
+                cmd.extend(["-filter_complex", f"{video_chain};{audio_filter}"])
+            else:
+                cmd.extend(["-filter_complex", video_chain])
+            cmd.extend(["-map", "[vout]"])
         else:
-            cmd.extend(["-filter_complex", video_chain])
-
-        cmd.extend(["-map", "[vout]"])
+            video_chain = build_screen_video_filter(
+                needs_hwdownload, width, height, clock_filter)
+            if audio_filter:
+                cmd.extend(["-filter_complex", f"{video_chain};{audio_filter}"])
+            else:
+                cmd.extend(["-filter_complex", video_chain])
+            cmd.extend(["-map", "[vout]"])
         if audio_map:
             cmd.extend(["-map", audio_map])
         else:
@@ -6127,29 +6432,31 @@ class StreamerCore:
             cmd.extend(["-map", "1:a"])
 
         try:
-            fps = int(framerate)
-        except (TypeError, ValueError):
-            fps = 30
-        fps = max(1, min(60, fps))
-
-        try:
             b_kbps = int(bitrate_kbps)
         except (TypeError, ValueError):
             b_kbps = 4000
         b_kbps = max(500, min(20000, b_kbps))
 
+        encode_kbps = max(b_kbps, 8000) if d3d11_direct else b_kbps
         cmd.extend([
             *build_video_encoder_opts(
-                self.get_video_encoder(),
-                v_kbps=b_kbps, max_kbps=int(b_kbps * 1.15), buf_kbps=b_kbps,
+                encoder,
+                v_kbps=encode_kbps, max_kbps=int(encode_kbps * 1.15),
+                buf_kbps=encode_kbps,
                 h264_profile="baseline", sc_threshold_zero=True,
                 # ★GOPは必ず1秒。hls_segment_time(既定3秒)を割り切れる値でないと、
                 #   HLSはキーフレームでしか切れないためセグメント長が振れる。
                 #   実測: GOP2秒だと 120/60/120/60 フレーム＝4秒・2秒・4秒・2秒に
                 #   なり、再生側にはカクつきとして出た。1秒にすると 90 フレーム
                 #   ＝3.0秒でぴたりと揃う。他の再生モードも1秒で揃えている。
-                gop_frames=fps, fps=fps)
+                gop_frames=fps, fps=None if d3d11_direct else fps,
+                level=None if d3d11_direct else "3.1",
+                input_is_d3d11=d3d11_direct)
         ])
+
+        if d3d11_direct:
+            # setptsで正規化したPTSをCFR変換せず、そのまま中間TSへ渡す。
+            cmd.extend(["-fps_mode", "passthrough"])
 
         cmd.extend(["-c:a", "aac", "-b:a", "192k" if audio_map else "64k",
                     "-ar", str(APP_AUDIO_RATE)])
@@ -6164,7 +6471,8 @@ class StreamerCore:
         ])
 
         karaoke_note = f" karaoke=on pipe={karaoke_pipe}" if karaoke_pipe else ""
-        log_print(f"[Player] Encoder path=screen_capture source={source_type} display={display_index} window='{window_title}' fps={fps} size={width}x{height} b:v={b_kbps}k{karaoke_note}")
+        path_note = " d3d11-direct=on" if d3d11_direct else ""
+        log_print(f"[Player] Encoder path=screen_capture source={source_type} display={display_index} window='{window_title}' fps={fps} size={width}x{height} b:v={encode_kbps}k{path_note}{karaoke_note}")
 
         try:
             proc = subprocess.Popen(

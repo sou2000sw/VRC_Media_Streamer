@@ -415,3 +415,44 @@ def test_screen_capture_caps_size_for_rtmp(monkeypatch):
         assert "1920:1080" not in joined
     finally:
         core.shutdown()
+
+
+def test_screen_capture_uses_d3d11_direct_path_for_topaz_nvenc(monkeypatch):
+    """ddagrabをCPUへ戻さず、そのままNVENCへ渡して実フレームを維持する。"""
+    core = StreamerCore(override_port=8991, override_enable_tunnel=False)
+    captured = {}
+
+    class _FakeProc:
+        returncode = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+    try:
+        core.config["live_audio_app_enabled"] = False
+        core.set_live_audio_devices(mic_device="", loopback_device="")
+        core.set_screen_capture_source(source_type="display", display_index=1,
+                                       width=1920, height=1080, framerate=30,
+                                       bitrate_kbps=4000)
+        monkeypatch.setattr(core, "get_active_output_mode", lambda: "topaz")
+        monkeypatch.setattr(core, "ensure_stream_sink", lambda: True)
+        monkeypatch.setattr(core, "get_video_encoder", lambda: "h264_nvenc")
+        monkeypatch.setattr(streamer_core.subprocess, "Popen",
+                            lambda cmd, *a, **kw: (captured.__setitem__("cmd", cmd), _FakeProc())[1])
+        monkeypatch.setattr(core, "relay_stream_data", lambda *a, **k: None)
+        monkeypatch.setattr(core, "watch_send_proc", lambda *a, **k: None)
+
+        core.play_screen_capture()
+        cmd = captured["cmd"]
+        joined = " ".join(str(c) for c in cmd)
+        assert "hwdownload" not in joined
+        assert "scale=1280:720" not in joined
+        assert cmd[cmd.index("-map") + 1] == "[vout]"
+        assert "[0:v]setpts=N/(30*TB)[vout]" in cmd[cmd.index("-filter_complex") + 1]
+        assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
+        assert cmd[cmd.index("-b:v") + 1] == "8000k"
+        assert "-pix_fmt" not in cmd
+    finally:
+        core.shutdown()

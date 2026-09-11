@@ -9,7 +9,7 @@ import subprocess
 import shutil
 import zipfile
 
-if sys.platform == "win32" and sys.stdout is not None:
+if sys.platform == "win32" and hasattr(sys.stdout, "buffer") and not isinstance(sys.stdout, io.TextIOWrapper):
     try:
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
@@ -236,8 +236,77 @@ def get_window_capture_source():
         return local
     return _find_bundled_tool("window_capture")
 
+def resolve_gstreamer_build_source():
+    """GStreamer ビルド用ランタイムのソースパスを解像する。
+
+    優先順位:
+      1. --gstreamer-root 引数
+      2. 環境変数 VRC_MEDIA_STREAMER_GSTREAMER_ROOT
+      3. リポジトリ直下の .gstreamer_runtime
+    """
+    for i, arg in enumerate(sys.argv[:-1]):
+        if arg == "--gstreamer-root":
+            val = sys.argv[i + 1]
+            if os.path.isdir(val):
+                return os.path.abspath(val)
+
+    env_root = os.environ.get("VRC_MEDIA_STREAMER_GSTREAMER_ROOT", "").strip()
+    if env_root and os.path.isdir(env_root):
+        return os.path.abspath(env_root)
+
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    repo_rt = os.path.join(base_path, ".gstreamer_runtime")
+    if os.path.isdir(repo_rt):
+        return os.path.abspath(repo_rt)
+    return None
+
+
+def copy_gstreamer_runtime(target_dir, label, version=APP_VERSION):
+    """GStreamer ランタイムを target_dir/gstreamer へコピーする。"""
+    src_dir = resolve_gstreamer_build_source()
+    is_gst_version = "gst" in version.lower()
+
+    if not src_dir or not os.path.isdir(src_dir):
+        msg = f"[ERROR] GStreamer runtime source not found (version={version})"
+        if is_gst_version:
+            print(msg, flush=True)
+            sys.exit(1)
+        else:
+            print(f"[WARN] {msg}", flush=True)
+            return False
+
+    import gstreamer_backend
+    gst_launch = gstreamer_backend.get_gst_launch_path(src_dir)
+    gst_inspect = gstreamer_backend.get_gst_inspect_path(src_dir)
+    if not gst_launch or not gst_inspect:
+        msg = f"[ERROR] GStreamer executables missing in source: {src_dir}"
+        if is_gst_version:
+            print(msg, flush=True)
+            sys.exit(1)
+        else:
+            print(f"[WARN] {msg}", flush=True)
+            return False
+
+    ok, err = gstreamer_backend.validate_gstreamer_runtime(src_dir)
+    if not ok:
+        msg = f"[ERROR] GStreamer build source validation failed ({src_dir}): {err}"
+        if is_gst_version:
+            print(msg, flush=True)
+            sys.exit(1)
+        else:
+            print(f"[WARN] {msg}", flush=True)
+            return False
+
+    dst_dir = os.path.join(target_dir, "gstreamer")
+    if os.path.exists(dst_dir):
+        shutil.rmtree(dst_dir, ignore_errors=True)
+    shutil.copytree(src_dir, dst_dir)
+    print(f"[OK] Copied GStreamer runtime -> {label}gstreamer", flush=True)
+    return True
+
+
 def copy_media_tools(target_dir, label):
-    """ffmpeg.exe / ffprobe.exe を配布先へコピーする"""
+    """ffmpeg.exe / ffprobe.exe / GStreamer runtime を配布先へコピーする"""
     for name, finder in (("ffmpeg", get_ffmpeg_source), ("ffprobe", get_ffprobe_source)):
         src_path = finder()
         if src_path and os.path.exists(src_path):
@@ -265,6 +334,8 @@ def copy_media_tools(target_dir, label):
               "ウィンドウ取り込みは従来のデスクトップ切り出しになり、"
               "手前に重なったウィンドウが映ります "
               "(native/window_capture/build.bat でビルドしてください)。", flush=True)
+
+    copy_gstreamer_runtime(target_dir, label)
 
 def package_plugin(version=APP_VERSION):
     """plugin/ フォルダの資材を整理し、VRCBeacon用プラグインZIPパッケージを生成"""
@@ -685,6 +756,7 @@ def build(version=APP_VERSION):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build and Package VRC_Media_Streamer")
     parser.add_argument("--version", "-v", type=str, default=APP_VERSION, help=f"Release version string (default: {APP_VERSION})")
+    parser.add_argument("--gstreamer-root", type=str, default="", help="Path to GStreamer runtime source directory")
     parser.add_argument("--package-only", action="store_true", help="Skip PyInstaller build and only package existing dist/ files")
     parser.add_argument("--plugin-only", action="store_true", help="Package only the VRCBeacon plugin")
     args = parser.parse_args()

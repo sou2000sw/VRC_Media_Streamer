@@ -1,4 +1,4 @@
-﻿==================================================
+==================================================
  VRC_Media_Streamer — 第三者ソフトウェアのライセンス表記
 ==================================================
 
@@ -140,6 +140,15 @@ Source  : https://github.com/Remix-Design/RemixIcon
 Copyright (c) Dailymotion (video-dev community)
 License : Apache License, Version 2.0
 Source  : https://github.com/video-dev/hls.js
+
+--------------------------------------------------
+18. GStreamer Bundle  （GStreamer ベータ版に同梱 / gstreamer-bundle v1.28.6）
+--------------------------------------------------
+Copyright (c) GStreamer developers & PyPI gstreamer-bundle packagers
+License : LGPL v2.1+ / GPL v2+ (plugins / restricted plugins)
+Source  : https://gstreamer.freedesktop.org / https://pypi.org/project/gstreamer-bundle/
+Note    : 約 331 MiB のランタイム。ベータ版ビルドとして分離同梱されています。
+
 
 ==================================================
  MIT / BSD ライセンスの全文について
