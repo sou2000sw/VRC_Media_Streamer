@@ -420,14 +420,14 @@
                                             <i class="ri-volume-up-line text-sm"></i>
                                         </button>
                                     </div>
-                                    <select id="liveAudioMicDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
+                                    <select id="liveAudioMicDevice" onchange="markLiveAudioMixerDirty()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
                                         <option value="">（使用しない）</option>
                                     </select>
                                     <div class="h-1.5 bg-zinc-800 rounded overflow-hidden">
                                         <div id="liveAudioMicMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
                                     </div>
                                     <div class="flex items-center gap-2">
-                                        <input type="range" id="liveAudioMicVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                                        <input type="range" id="liveAudioMicVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels();markLiveAudioMixerDirty()" class="flex-1 accent-emerald-400">
                                         <span id="liveAudioMicMeterText" class="w-14 text-right text-[10px] text-zinc-500 font-mono">未選択</span>
                                     </div>
                                 </div>
@@ -441,14 +441,14 @@
                                             <i class="ri-volume-up-line text-sm"></i>
                                         </button>
                                     </div>
-                                    <select id="liveAudioLoopbackDevice" onchange="applyLiveAudioSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
+                                    <select id="liveAudioLoopbackDevice" onchange="markLiveAudioMixerDirty()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
                                         <option value="">（使用しない）</option>
                                     </select>
                                     <div class="h-1.5 bg-zinc-800 rounded overflow-hidden">
                                         <div id="liveAudioLoopbackMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
                                     </div>
                                     <div class="flex items-center gap-2">
-                                        <input type="range" id="liveAudioLoopbackVolume" min="0" max="2" step="0.05" value="0.7" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioSettings()" class="flex-1 accent-emerald-400">
+                                        <input type="range" id="liveAudioLoopbackVolume" min="0" max="2" step="0.05" value="0.7" oninput="updateLiveAudioVolumeLabels();markLiveAudioMixerDirty()" class="flex-1 accent-emerald-400">
                                         <span id="liveAudioLoopbackMeterText" class="w-14 text-right text-[10px] text-zinc-500 font-mono">未選択</span>
                                     </div>
                                     <p id="liveAudioLoopbackHint" class="hidden text-[10px] text-amber-400/90">
@@ -458,26 +458,31 @@
 
                                 <div id="mixChanApp" class="p-2.5 flex flex-col gap-1.5 border-b border-border">
                                     <div class="flex items-center gap-1.5">
-                                        <input type="checkbox" id="liveAudioAppEnabled" onchange="applyLiveAudioAppSettings()" class="accent-emerald-400" title="アプリ単位の音声（選んだウィンドウの音だけ）">
+                                        <input type="checkbox" id="liveAudioAppEnabled" onchange="markLiveAudioMixerDirty()" class="accent-emerald-400" title="アプリ単位の音声（選んだウィンドウの音だけ）">
                                         <span class="text-xs text-zinc-200">アプリ音声</span>
                                         <span id="liveAudioAppVolumeLabel" class="ml-auto text-[11px] text-zinc-400 font-mono">1.00</span>
                                         <button id="liveAudioAppMuteBtn" onclick="obsToggleMute('app')" class="w-6 h-6 flex items-center justify-center rounded transition text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800" title="ミュート">
                                             <i class="ri-volume-up-line text-sm"></i>
                                         </button>
                                     </div>
-                                    <select id="liveAudioAppWindow" onchange="applyLiveAudioAppSettings()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
+                                    <select id="liveAudioAppWindow" onchange="markLiveAudioMixerDirty()" class="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-[11px] text-zinc-200 focus:outline-none focus:border-primary">
                                         <option value="">（選択してください）</option>
                                     </select>
                                     <div class="h-1.5 bg-zinc-800 rounded overflow-hidden">
                                         <div id="liveAudioAppMeterBar" style="width:0%;background-color:#52525b" class="h-full transition-all duration-100"></div>
                                     </div>
                                     <div class="flex items-center gap-2">
-                                        <input type="range" id="liveAudioAppVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels()" onchange="applyLiveAudioAppSettings()" class="flex-1 accent-emerald-400">
+                                        <input type="range" id="liveAudioAppVolume" min="0" max="2" step="0.05" value="1" oninput="updateLiveAudioVolumeLabels();markLiveAudioMixerDirty()" class="flex-1 accent-emerald-400">
                                         <span id="liveAudioAppMeterText" class="w-14 text-right text-[10px] text-zinc-500 font-mono">停止中</span>
                                     </div>
                                     <p id="liveAudioAppUnavailable" class="hidden text-[10px] text-amber-400/90">
                                         ⚠️ アプリ単位の音声取り込みに必要な補助プログラム（app_audio_capture.exe）が見つかりません。有効にしても、従来のPC出力音声／マイクだけで配信されます。
                                     </p>
+                                </div>
+
+                                <div id="liveAudioMixerApplyBar" class="hidden px-2.5 py-2 border-b border-border bg-amber-500/10 items-center gap-2">
+                                    <span class="text-[10px] text-amber-300">変更はまだ配信に反映されていません</span>
+                                    <button id="liveAudioMixerApplyBtn" onclick="applyLiveAudioMixerSettings()" class="ml-auto px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-[10px] transition">配信へ反映</button>
                                 </div>
 
                                 <!-- 素材（動画・ラジオ）の音量。動画の音声はコピー経路でも AAC へ焼き直して
@@ -530,6 +535,10 @@
                                 <span>追加</span>
                             </button>
                         </div>
+                        <label id="hostVideoDownloadOption" class="hidden flex items-center gap-2 text-[11px] text-zinc-400">
+                            <input id="downloadVideoUrl" type="checkbox" disabled class="accent-emerald-400">
+                            <span>ダウンロードして再生（終了時に削除）</span>
+                        </label>
                         <div class="flex flex-col gap-0.5 text-[11px] text-zinc-500">
                             <div class="flex items-center gap-1.5">
                                 <i class="ri-information-line"></i>
@@ -2548,6 +2557,8 @@
 
         // 見た目の更新のみ（サーバー状態の反映にも使う）
         function setAddMode(mode) {
+            const downloadChoice = document.getElementById('downloadVideoUrl');
+            if (downloadChoice) downloadChoice.disabled = !isLocalEnvironment() || mode === 'radio';
             currentAddMode = mode;
             const desc = document.getElementById('modeDescription');
 
@@ -2701,8 +2712,7 @@
             }
             updateLiveAudioVolumeLabels();
             if (cfg.apply === 'media') { applyMediaVolume(); }
-            else if (cfg.isApp) { applyLiveAudioAppSettings(); }
-            else { applyLiveAudioSettings(); }
+            else { markLiveAudioMixerDirty(); }
         }
 
         function obsUpdateMuteIcons() {
@@ -2843,6 +2853,10 @@
             const btnShuffleQueue = document.getElementById('btnShuffleQueue');
             const btnClearQueue = document.getElementById('btnClearQueue');
             const btnAddUrl = document.getElementById('btnAddUrl');
+            const downloadOption = document.getElementById('hostVideoDownloadOption');
+            const downloadChoice = document.getElementById('downloadVideoUrl');
+            if (downloadOption) downloadOption.classList.toggle('hidden', !isLocal);
+            if (downloadChoice) downloadChoice.disabled = !isLocal || !permAdd || currentAddMode === 'radio';
             const selectRadioBg = document.getElementById('selectRadioBg');
             const selectDuration = document.getElementById('selectDuration');
 
@@ -2852,7 +2866,7 @@
             if (selectRadioBg) selectRadioBg.disabled = !permPlayback;
             if (selectDuration) selectDuration.disabled = !permPlayback;
 
-            if (btnAddUrl) btnAddUrl.disabled = !permAdd;
+            if (btnAddUrl) btnAddUrl.disabled = !permAdd || urlAdditionPending;
             if (btnShuffleQueue) btnShuffleQueue.disabled = !permEdit;
             if (btnClearQueue) btnClearQueue.disabled = !isLocal; // Full clear is always local-only
 
@@ -3451,21 +3465,26 @@
         }
 
         // API Actions
+        let urlAdditionPending = false;
         async function addVideoUrl() {
             const input = document.getElementById('inputVideoUrl');
             const url = input.value.trim();
             if (!url) return;
 
             const btn = document.getElementById('btnAddUrl');
+            if (btn.disabled) return;
+            urlAdditionPending = true;
+            const download = isLocalEnvironment() && currentAddMode !== 'radio'
+                && document.getElementById('downloadVideoUrl').checked;
             btn.disabled = true;
-            btn.innerHTML = `<i class="ri-loader-4-line animate-spin text-sm"></i>`;
+            btn.innerHTML = `<i class="ri-loader-4-line animate-spin text-sm"></i>${download ? '<span>ダウンロード中…</span>' : ''}`;
 
             try {
                 // 追加モードは毎回サーバーへ反映する。
                 // 以前は radio のときだけ enabled:true を送り、video のときは何も送っていなかったため、
                 // 一度でもラジオを使うと radio_mode が true のまま固定され「通常動画」を選んでも
                 // 音声のみのラジオ再生になっていた（config の radio_mode 既定が true なので初回から発生）。
-                await fetch(`${apiBase}/api/control`, {
+                if (!download) await fetch(`${apiBase}/api/control`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ action: 'set_radio_mode', enabled: currentAddMode === 'radio' })
@@ -3474,7 +3493,7 @@
                 const res = await fetch(`${apiBase}/api/queue`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: url })
+                    body: JSON.stringify(download ? { url: url, download: true } : { url: url })
                 });
 
                 if (res.ok) {
@@ -3488,6 +3507,7 @@
             } catch (e) {
                 showToast('APIサーバーと通信できませんでした', 'danger');
             } finally {
+                urlAdditionPending = false;
                 btn.disabled = false;
                 btn.innerHTML = `<i class="ri-add-line text-sm"></i><span>追加</span>`;
             }
@@ -3608,6 +3628,46 @@
         // ステータスポーリングから毎回叩かないよう、呼ぶのは初回とユーザー操作時だけにする。
         let liveAudioDevicesLoaded = false;
         let liveAudioUserChangedAt = 0;
+        let liveAudioMixerDirty = false;
+
+        function markLiveAudioMixerDirty() {
+            liveAudioUserChangedAt = Date.now();
+            liveAudioMixerDirty = true;
+            const bar = document.getElementById('liveAudioMixerApplyBar');
+            if (bar) { bar.classList.remove('hidden'); bar.classList.add('flex'); }
+        }
+
+        async function applyLiveAudioMixerSettings() {
+            const micSel = document.getElementById('liveAudioMicDevice');
+            const loopSel = document.getElementById('liveAudioLoopbackDevice');
+            const micVol = document.getElementById('liveAudioMicVolume');
+            const loopVol = document.getElementById('liveAudioLoopbackVolume');
+            const appEnabled = document.getElementById('liveAudioAppEnabled');
+            const appWindow = document.getElementById('liveAudioAppWindow');
+            const appVol = document.getElementById('liveAudioAppVolume');
+            const btn = document.getElementById('liveAudioMixerApplyBtn');
+            if (!micSel || !loopSel || !micVol || !loopVol || !appEnabled || !appWindow || !appVol) return;
+            if (btn) btn.disabled = true;
+            try {
+                const res = await fetch(`${apiBase}/api/control`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'set_live_audio_mixer', mic_device: micSel.value,
+                        loopback_device: loopSel.value, mic_volume: Number(micVol.value),
+                        loopback_volume: Number(loopVol.value), app_enabled: appEnabled.checked,
+                        app_window_title: appWindow.value, app_volume: Number(appVol.value)
+                    })
+                });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                liveAudioMixerDirty = false;
+                const bar = document.getElementById('liveAudioMixerApplyBar');
+                if (bar) { bar.classList.add('hidden'); bar.classList.remove('flex'); }
+                showToast('音声ミキサーを反映しました（配信再接続は1回のみ）', 'success');
+                checkServerHealth(true);
+            } catch (e) {
+                showToast('音声ミキサーの反映に失敗しました', 'danger');
+            } finally { if (btn) btn.disabled = false; }
+        }
 
         function updateLiveAudioVolumeLabels() {
             const mic = document.getElementById('liveAudioMicVolume');
@@ -3755,7 +3815,7 @@
             //   スライダーを触っている最中に値を巻き戻さないためのもので、
             //   読み取り専用のゲージには当てはまらない（止まると壊れて見える）。
             updateAppAudioMeter(data);
-            if (Date.now() - liveAudioUserChangedAt < 4000) return;
+            if (liveAudioMixerDirty || Date.now() - liveAudioUserChangedAt < 4000) return;
             const micSel = document.getElementById('liveAudioMicDevice');
             const loopSel = document.getElementById('liveAudioLoopbackDevice');
             const micVol = document.getElementById('liveAudioMicVolume');
@@ -3918,7 +3978,7 @@
 
         function syncLiveAudioAppFromStatus(data) {
             if (!data) return;
-            if (Date.now() - liveAudioUserChangedAt < 4000) return;
+            if (liveAudioMixerDirty || Date.now() - liveAudioUserChangedAt < 4000) return;
             const en = document.getElementById('liveAudioAppEnabled');
             const win = document.getElementById('liveAudioAppWindow');
             const vol = document.getElementById('liveAudioAppVolume');

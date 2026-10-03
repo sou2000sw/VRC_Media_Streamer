@@ -25,10 +25,13 @@ REQUIRED_GSTREAMER_ELEMENTS = [
     "audiomixer",
     "audioconvert",
     "audioresample",
+    "volume",
     "avenc_aac",
     "h264parse",
     "aacparse",
     "hlssink2",
+    "splitmuxsink",
+    "mpegtsmux",
     "flvmux",
     "rtmpsink",
 ]
@@ -109,6 +112,63 @@ def get_gst_launch_path(runtime_dir: str) -> Optional[str]:
 def get_gst_inspect_path(runtime_dir: str) -> Optional[str]:
     """Resolves path to gst-inspect-1.0.exe, preferring gstreamer_cli/bin/."""
     return resolve_gstreamer_binary(runtime_dir, "gst-inspect-1.0.exe")
+
+
+def get_gst_device_monitor_path(runtime_dir: str) -> Optional[str]:
+    """Resolves gst-device-monitor, used to map UI device names to WASAPI IDs."""
+    return resolve_gstreamer_binary(runtime_dir, "gst-device-monitor-1.0.exe")
+
+
+def parse_wasapi_capture_devices(output_text: str) -> Dict[str, str]:
+    """Returns {friendly name: endpoint id} from gst-device-monitor output."""
+    devices: Dict[str, str] = {}
+    for block in re.split(r"\bDevice found:\s*", str(output_text or "")):
+        name_match = re.search(r"(?m)^\s*name\s*:\s*(.+?)\s*$", block)
+        id_match = re.search(r"(?m)^\s*device\.id\s*=\s*(.+?)\s*$", block)
+        api_match = re.search(r"(?m)^\s*device\.api\s*=\s*(.+?)\s*$", block)
+        loopback_match = re.search(
+            r"(?m)^\s*wasapi2\.device\.loopback\s*=\s*(true|false)", block,
+            flags=re.IGNORECASE,
+        )
+        if not (name_match and id_match and api_match):
+            continue
+        if api_match.group(1).strip().casefold() != "wasapi2":
+            continue
+        if loopback_match and loopback_match.group(1).casefold() == "true":
+            continue
+        devices[name_match.group(1).strip()] = id_match.group(1).strip()
+    return devices
+
+
+def resolve_wasapi_capture_device_id(runtime_dir: str, friendly_name: str) -> Optional[str]:
+    """Maps the DirectShow-friendly UI name to a WASAPI capture endpoint ID."""
+    monitor = get_gst_device_monitor_path(runtime_dir)
+    env = get_gstreamer_env(runtime_dir)
+    wanted = str(friendly_name or "").strip()
+    if not monitor or not env or not wanted:
+        return None
+    creation_flags = 0x08000000 if sys.platform == "win32" else 0
+    try:
+        proc = subprocess.run(
+            [monitor, "Audio/Source"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+            timeout=15,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout or b""
+    for encoding in ("utf-8", "cp932"):
+        text = raw.decode(encoding, errors="replace")
+        devices = parse_wasapi_capture_devices(text)
+        for name, endpoint_id in devices.items():
+            if name.casefold() == wanted.casefold():
+                return endpoint_id
+    return None
 
 
 def get_gstreamer_runtime_dir(override_path: Optional[str] = None) -> Optional[str]:
@@ -203,20 +263,25 @@ def validate_gstreamer_runtime(runtime_dir: str) -> Tuple[bool, str]:
 
     creation_flags = 0x08000000 if sys.platform == "win32" else 0
     try:
-        proc = subprocess.run(
-            [gst_inspect],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
-            timeout=15,
-        )
-        if proc.returncode != 0:
-            res = (False, f"gst-inspect-1.0 exited with code {proc.returncode}")
-            _VALIDATION_CACHE[norm_dir] = res
-            return res
-        inspect_out = proc.stdout.decode("utf-8", errors="ignore")
-        missing_elements = [elem for elem in REQUIRED_GSTREAMER_ELEMENTS if elem not in inspect_out]
+        # A bare gst-inspect walks the complete registry.  On the packaged Windows
+        # runtime that can spend more than 15 seconds probing unrelated plugins,
+        # which incorrectly disabled the direct-capture backend.  Inspect only the
+        # elements this pipeline actually needs; each lookup is fast after the
+        # first registry initialization and gives an exact missing-element result.
+        missing_elements = []
+        for index, elem in enumerate(REQUIRED_GSTREAMER_ELEMENTS):
+            proc = subprocess.run(
+                [gst_inspect, elem],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags,
+                # The first lookup may have to create the Windows plugin registry.
+                # Subsequent targeted lookups should stay quick.
+                timeout=60 if index == 0 else 15,
+            )
+            if proc.returncode != 0:
+                missing_elements.append(elem)
         if missing_elements:
             res = (False, f"Missing required GStreamer elements: {', '.join(missing_elements)}")
             _VALIDATION_CACHE[norm_dir] = res
@@ -327,9 +392,20 @@ def build_gstreamer_screen_capture_plan(
         active_audio_sources.append(app_src)
 
     if mic_device and str(mic_device).strip():
-        escaped_mic = escape_gst_prop_string(str(mic_device).strip())
+        mic_name = str(mic_device).strip()
+        mic_wasapi_id = resolve_wasapi_capture_device_id(runtime_dir, mic_name)
+        if mic_wasapi_id:
+            mic_element = [
+                "wasapi2src", f"device={escape_gst_prop_string(mic_wasapi_id)}",
+                "low-latency=true", "continue-on-error=true", "do-timestamp=true",
+            ]
+        else:
+            mic_element = [
+                "dshowaudiosrc", f"device-name={escape_gst_prop_string(mic_name)}",
+                "do-timestamp=true",
+            ]
         mic_src = [
-            "dshowaudiosrc", f"device-name={escaped_mic}", "do-timestamp=true",
+            *mic_element,
             "!", "queue", "max-size-buffers=0", "max-size-bytes=0", "max-size-time=2000000000", "leaky=downstream",
             "!", "audioconvert",
             "!", "audioresample",
@@ -339,9 +415,20 @@ def build_gstreamer_screen_capture_plan(
         active_audio_sources.append(mic_src)
 
     if loopback_device and str(loopback_device).strip():
-        escaped_loopback = escape_gst_prop_string(str(loopback_device).strip())
+        loopback_name = str(loopback_device).strip()
+        loopback_wasapi_id = resolve_wasapi_capture_device_id(runtime_dir, loopback_name)
+        if loopback_wasapi_id:
+            loopback_element = [
+                "wasapi2src", f"device={escape_gst_prop_string(loopback_wasapi_id)}",
+                "low-latency=true", "continue-on-error=true", "do-timestamp=true",
+            ]
+        else:
+            loopback_element = [
+                "dshowaudiosrc", f"device-name={escape_gst_prop_string(loopback_name)}",
+                "do-timestamp=true",
+            ]
         loopback_src = [
-            "dshowaudiosrc", f"device-name={escaped_loopback}", "do-timestamp=true",
+            *loopback_element,
             "!", "queue", "max-size-buffers=0", "max-size-bytes=0", "max-size-time=2000000000", "leaky=downstream",
             "!", "audioconvert",
             "!", "audioresample",

@@ -21,6 +21,7 @@ import collections
 import yt_dlp
 import qrcode
 import uuid
+from temporary_video import TemporaryVideoDownloads, VideoDownloadError
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
@@ -196,6 +197,7 @@ DEFAULT_CONFIG = {
     "standby_image_path": "",
     "web_password": "",
     "max_video_upload_mb": 200,
+    "max_video_download_mb": 2048,
     "max_video_height": 1080,
     # ホスト画面の種類。"web" = Webリモコンと同じモダンUIを WebView2 で表示、
     # "classic" = 従来の CustomTkinter 画面。WebView2 が使えない環境では
@@ -223,6 +225,9 @@ DEFAULT_CONFIG = {
     "rtmp_video_height": 720,
     "rtmp_fps": 30,
     "rtmp_gop_seconds": 2,
+    # RTMP経路では映像・音声の二重再エンコード差で音声がわずかに遅れる。
+    # 最終シンクで映像を同量遅らせ、口パクと打音を合わせる。
+    "rtmp_video_sync_delay_ms": 150,
     "rtmp_fallback_to_hls": True,
     "rtmp_fallback_after_failures": 3,
     "rtmp_retry_backoff_max_seconds": 300,
@@ -2779,6 +2784,9 @@ class StreamerCore:
         os.makedirs(HLS_DIR, exist_ok=True)
         self.clean_hls_dir(all_files=True, preserve_images=False)
 
+        self.video_downloads = TemporaryVideoDownloads(
+            os.path.join(VIDEO_STORAGE_DIR, "downloads"), is_safe_url)
+
         # プロセスと同期
         self.hls_proc = None
         self.send_proc = None
@@ -2872,7 +2880,8 @@ class StreamerCore:
         二重管理にすると、片方で変えたのに片方に出ない、という食い違いが必ず起きる。
         """
         device = str(self.config.get("live_audio_mic_device", "")).strip()
-        if request_level:
+        direct_capture = bool(getattr(self, "_direct_capture_active", False))
+        if request_level and not direct_capture:
             # capture=None: 見るだけの呼び出しで取り込みモードを変えない。
             # ここで capture=False にすると、参加者へ配っているホストの演奏が
             # 卓を開いた瞬間に切れる。
@@ -2906,7 +2915,8 @@ class StreamerCore:
         """
         mic_device = str(self.config.get("live_audio_mic_device", "")).strip()
         loop_device = str(self.config.get("live_audio_loopback_device", "")).strip()
-        if request_level:
+        direct_capture = bool(getattr(self, "_direct_capture_active", False))
+        if request_level and not direct_capture:
             # マイクは卓と共用。capture=None で取り込みモードには触らない。
             self.host_mic_monitor.request(mic_device, capture=None)
             self.loopback_monitor.request(loop_device)
@@ -3519,6 +3529,15 @@ class StreamerCore:
             log_print(f"[Core] Invalid playback mode: {mode}")
             return self.get_playback_mode()
 
+        # The web UI sends the selected add mode immediately before every queue
+        # addition.  Re-applying "video" while a video is already playing must
+        # be a no-op; save_config() rebuilds an active stream, so the old code
+        # interrupted playback on every enqueue even though nothing changed.
+        if (self.get_playback_mode() == mode
+                and bool(self.config.get("radio_mode", False)) == (mode == "radio")):
+            log_print(f"[Core] Playback mode unchanged ({mode}); stream reload skipped.")
+            return mode
+
         self.config["playback_mode"] = mode
         self.config["radio_mode"] = (mode == "radio")
         self.save_config()
@@ -3966,7 +3985,14 @@ class StreamerCore:
             fps = int(self.config.get("rtmp_fps", 30))
             gop_sec = max(1, int(self.config.get("rtmp_gop_seconds", 2)))
             gop = str(fps * gop_sec)
+            try:
+                sync_delay_ms = float(self.config.get("rtmp_video_sync_delay_ms", 150) or 0)
+            except (TypeError, ValueError):
+                sync_delay_ms = 150.0
+            sync_delay_ms = max(0.0, min(1000.0, sync_delay_ms))
+            sync_delay_sec = sync_delay_ms / 1000.0
             vf = (
+                f"setpts=PTS+{sync_delay_sec:.3f}/TB,"
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
             )
@@ -4205,6 +4231,7 @@ class StreamerCore:
         base_pts = None
         current_stream_pos = 0.0
         max_relative_pts = 0.0
+        last_reported_duration = 0.0
         start_wall_time = time.time()
 
         try:
@@ -4226,6 +4253,15 @@ class StreamerCore:
                         current_stream_pos = stream_pos
                         if current_stream_pos > max_relative_pts:
                             max_relative_pts = current_stream_pos
+                            # Keep transition PTS current while this sender is
+                            # active.  Updating only in finally raced with the
+                            # monitor: Skip could consume the previous sender's
+                            # duration and create a large timestamp jump.
+                            if max_relative_pts - last_reported_duration >= 0.5:
+                                with self.process_lock:
+                                    if self.send_proc is proc_to_read:
+                                        self.last_stream_duration = max_relative_pts
+                                last_reported_duration = max_relative_pts
 
                 # PTSの抽出と再生進捗の更新（ペーシング有効時）
                 if is_paced:
@@ -4250,18 +4286,32 @@ class StreamerCore:
             pass
         finally:
             dur = max_relative_pts if max_relative_pts > 0 else (time.time() - start_wall_time)
-            self.last_stream_duration = max(1.0, dur)
-            if not stop_event.is_set():
-                self.video_done_event.set()
+            with self.process_lock:
+                if self.send_proc is proc_to_read:
+                    self.last_stream_duration = max(1.0, dur)
+            # Completion is decided by watch_send_proc(), which can inspect the
+            # sender return code and verify that this is still the active sender.
+            # EOF here can also mean a broken pipe or a superseded process.
 
     def watch_send_proc(self, proc, stop_event):
         try:
-            proc.wait()
+            return_code = proc.wait()
         except Exception:
-            pass
-        if not stop_event.is_set():
+            return_code = None
+
+        # A sender from an older playback can finish after a reload/new item has
+        # already installed another process.  The completion event is shared by
+        # the monitor loop, so allowing that stale watcher to set it can advance
+        # the *new* video.  Also, a broken pipe/network failure is not a natural
+        # end-of-file and must not be treated as one.
+        with self.process_lock:
+            is_current_sender = self.send_proc is proc
+        if not stop_event.is_set() and is_current_sender and return_code == 0:
             log_print("[Monitor] Video finished naturally.")
             self.video_done_event.set()
+        elif not stop_event.is_set() and is_current_sender:
+            log_print(f"[Monitor] Sender exited abnormally (rc={return_code}); reloading current item.")
+            self.request_stream_reload()
 
     def get_base_ydl_opts(self):
         """yt-dlp の基本共通オプションを生成（JSチャレンジ問題回避・安定したクライアントフォールバック）"""
@@ -5007,6 +5057,10 @@ class StreamerCore:
                 "url": url,
                 "duration": duration
             }
+            # Keep the monitor's original queue item in sync with the fresh
+            # metadata resolved at playback time.
+            video_info["title"] = title
+            video_info["duration"] = duration
             self.current_video_start_time = time.time() - max(0, seek_seconds)
             log_print(f"[Player] Now Playing: {title} (seek: {int(seek_seconds)}s, pts_offset: {self.accumulated_pts:.2f}s)")
         except Exception as e:
@@ -5278,6 +5332,37 @@ class StreamerCore:
             self.play_queue.append(item)
         log_print(f"[Core] Added local video to queue: {title} (id: {video_id}, {duration:.1f}s)")
         return item
+
+    def download_video_to_queue(self, url):
+        """取得完了した一時動画を既存のローカル動画配信経路へ渡す。"""
+        with self.queue_lock:
+            if len(self.play_queue) >= MAX_QUEUE_CAPACITY:
+                raise VideoDownloadError("キューが満杯です。")
+
+        source_url = url
+
+        def resolve(media_url):
+            opts = self.get_base_ydl_opts()
+            opts.update({"format": self.build_format_selector(), "noplaylist": True,
+                         "socket_timeout": 10, "retries": 0, "extractor_retries": 0})
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(media_url, download=False)
+
+        def enqueue(path, title, duration):
+            with self.queue_lock:
+                if self.video_downloads.cancelled.is_set() or len(self.play_queue) >= MAX_QUEUE_CAPACITY:
+                    return None
+                item = {"id": f"v_{uuid.uuid4().hex[:8]}", "type": "local_video",
+                        "title": title, "url": os.path.abspath(path), "path": os.path.abspath(path),
+                        "source_url": source_url, "original_filename": os.path.basename(path),
+                        "duration": duration, "is_local": True, "is_uploaded": False,
+                        "is_downloaded": True}
+                self.play_queue.append(item)
+                return item
+
+        return self.video_downloads.prepare(
+            url, resolve, self.config.get("max_video_download_mb", 2048),
+            get_ffmpeg_cmd(), get_ffprobe_cmd(), enqueue)
 
     def add_video_bytes(self, video_bytes, original_filename="video.mp4"):
         """アップロードされた動画バイナリを videos フォルダに保存してキューに追加"""
@@ -5691,6 +5776,39 @@ class StreamerCore:
             "live_audio_loopback_device": self.config.get("live_audio_loopback_device", ""),
             "live_audio_mic_volume": self.config.get("live_audio_mic_volume", 1.0),
             "live_audio_loopback_volume": self.config.get("live_audio_loopback_volume", 0.7),
+        }
+
+    def set_live_audio_mixer(self, mic_device=None, loopback_device=None,
+                             mic_volume=None, loopback_volume=None,
+                             app_enabled=None, app_window_title=None,
+                             app_volume=None):
+        """音声ミキサー全体を保存し、配信の張り直しを1回だけ要求する。"""
+        if mic_device is not None:
+            self.config["live_audio_mic_device"] = str(mic_device)
+        if loopback_device is not None:
+            self.config["live_audio_loopback_device"] = str(loopback_device)
+        for key, value in (("live_audio_mic_volume", mic_volume),
+                           ("live_audio_loopback_volume", loopback_volume),
+                           ("live_audio_app_volume", app_volume)):
+            if value is not None:
+                try:
+                    self.config[key] = max(0.0, min(2.0, float(value)))
+                except (TypeError, ValueError):
+                    pass
+        if app_enabled is not None:
+            self.config["live_audio_app_enabled"] = bool(app_enabled)
+        if app_window_title is not None:
+            self.config["live_audio_app_window_title"] = str(app_window_title)
+        self.save_config()
+        self.request_stream_reload()
+        return {
+            "live_audio_mic_device": self.config.get("live_audio_mic_device", ""),
+            "live_audio_loopback_device": self.config.get("live_audio_loopback_device", ""),
+            "live_audio_mic_volume": self.config.get("live_audio_mic_volume", 1.0),
+            "live_audio_loopback_volume": self.config.get("live_audio_loopback_volume", 0.7),
+            "live_audio_app_enabled": bool(self.config.get("live_audio_app_enabled", False)),
+            "live_audio_app_window_title": self.config.get("live_audio_app_window_title", ""),
+            "live_audio_app_volume": self.config.get("live_audio_app_volume", 1.0),
         }
 
     def set_live_audio_bg_source(self, source: str):
@@ -6159,6 +6277,14 @@ class StreamerCore:
             self.gstreamer_fallback_reason = reason
             self.active_screen_capture_backend = "ffmpeg"
             return None
+
+        # The VU meters use small FFmpeg processes that open the same DirectShow
+        # devices.  Some microphones (including the Seiren V3 Mini) cannot feed
+        # both readers reliably: dshowaudiosrc then aborts with an internal stream
+        # error.  Direct capture owns these devices for its lifetime; API polling
+        # above is also gated by _direct_capture_active so it cannot reopen them.
+        self.host_mic_monitor.stop()
+        self.loopback_monitor.stop()
 
         # 7. Close persistent sink under process_lock and start process
         with self.process_lock:
@@ -7502,6 +7628,9 @@ class StreamerCore:
                 self.current_video = next_item
                 self.skip_event.clear()
                 self.video_done_event.clear()
+                # relay_stream_data updates this for the active sender.  Reset
+                # it before launch so Skip cannot reuse a previous video's value.
+                self.last_stream_duration = 0.0
 
                 self.status = "buffering"
                 self.status_detail = f"Loading {'[Radio]' if is_radio else ''}: {next_item.get('title')}..."
@@ -7556,10 +7685,20 @@ class StreamerCore:
                     with self.process_lock:
                         h_proc = self.hls_proc
                     if h_proc and h_proc.poll() is not None:
-                        log_print("[Monitor] Receiver FFmpeg crashed or exited.")
-                        self.status = "error"
-                        self.status_detail = "Offline (Receiver Error)"
-                        break
+                        # The destination watchdog may replace the sink, but this
+                        # playback loop used to break immediately and therefore
+                        # consume the next queue item.  Recover the sink and
+                        # rebuild the *current* sender instead.
+                        log_print("[Monitor] Receiver FFmpeg crashed or exited; recovering current video.")
+                        self.status = "buffering"
+                        self.status_detail = "Reconnecting destination..."
+                        if self.ensure_stream_sink():
+                            self.request_stream_reload()
+                        else:
+                            self.status = "error"
+                            self.status_detail = "Offline (Receiver Error — retrying)"
+                        self.video_done_event.wait(timeout=0.5)
+                        continue
 
                     item_dur = float(next_item.get("duration") or 0)
                     elapsed_play = (time.time() - self.current_video_start_time) if self.current_video_start_time else 0
@@ -7678,6 +7817,9 @@ class StreamerCore:
 
     def shutdown(self):
         log_print("[Core] Shutting down StreamerCore...")
+        with self.queue_lock:
+            self.video_downloads.cancelled.set()
+        self.video_downloads.close()
         self.is_running = False
         # タスク27: 参加者の接続とミキサを畳む。名前付きパイプのハンドルが
         # 残ったままだと、次回起動時に同名で作れず（作れても掴めず）に詰まる。

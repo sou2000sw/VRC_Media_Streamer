@@ -278,6 +278,29 @@ def test_set_live_audio_bg_source(monkeypatch):
         core.shutdown()
 
 
+def test_set_live_audio_mixer_requests_only_one_reload(monkeypatch):
+    core = _live_core()
+    try:
+        reloads = []
+        monkeypatch.setattr(core, "save_config", lambda: None)
+        monkeypatch.setattr(core, "request_stream_reload", lambda: reloads.append(True))
+        result = core.set_live_audio_mixer(
+            mic_device="Mic A", loopback_device="PC A",
+            mic_volume=0.5, loopback_volume=0.6,
+            app_enabled=True, app_window_title="App A", app_volume=0.7,
+        )
+        assert reloads == [True]
+        assert result["live_audio_mic_device"] == "Mic A"
+        assert result["live_audio_loopback_device"] == "PC A"
+        assert result["live_audio_mic_volume"] == 0.5
+        assert result["live_audio_loopback_volume"] == 0.6
+        assert result["live_audio_app_enabled"] is True
+        assert result["live_audio_app_window_title"] == "App A"
+        assert result["live_audio_app_volume"] == 0.7
+    finally:
+        core.shutdown()
+
+
 def test_live_audio_uses_slideshow_when_selected(monkeypatch, tmp_path):
     """スライドショー指定かつ写真があるなら concat + stream_loop で送る。
 
@@ -442,6 +465,7 @@ class _LevelCore:
         self.host_mic_monitor = streamer_core.HostMicMonitor(label="HostMic")
         self.loopback_monitor = streamer_core.HostMicMonitor(label="Loopback")
         self.routed = False
+        self._direct_capture_active = False
 
     def karaoke_host_mic_is_routed(self):
         return self.routed
@@ -476,6 +500,17 @@ def test_live_audio_levels_do_not_touch_devices_until_asked():
     lv = c.levels(request_level=False)
     assert lv["mic"]["monitoring"] is False
     assert lv["loopback"]["monitoring"] is False
+
+
+def test_level_polling_does_not_open_devices_during_direct_capture():
+    """GStreamer が所有中の音声デバイスをVU監視が二重に開かないこと。"""
+    c = _LevelCore(mic="Mic A", loopback="Stereo Mix")
+    c._direct_capture_active = True
+    with patch.object(c.host_mic_monitor, "request") as mic_request, \
+         patch.object(c.loopback_monitor, "request") as loop_request:
+        c.levels(request_level=True)
+    mic_request.assert_not_called()
+    loop_request.assert_not_called()
 
 
 def test_level_polling_does_not_cut_karaoke_host_mic():

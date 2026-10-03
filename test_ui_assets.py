@@ -121,6 +121,14 @@ def test_script_tags_are_balanced():
         assert opens == closes, f"{path}: {opens} '<script' vs {closes} closing tags"
 
 
+def test_live_audio_mixer_batches_changes_until_apply():
+    html = _read_ui_html()
+    assert 'id="liveAudioMixerApplyBtn"' in html
+    assert "action: 'set_live_audio_mixer'" in html
+    assert 'onchange="applyLiveAudioSettings()"' not in html
+    assert 'onchange="applyLiveAudioAppSettings()"' not in html
+
+
 def test_remixicon_css_only_references_bundled_fonts():
     """CSS が同梱していない eot/ttf/svg を参照していないこと（404を撃ち続けるため）。"""
     with io.open(os.path.join(VENDOR_DIR, "remixicon.css"), encoding="utf-8") as f:

@@ -136,23 +136,48 @@ def test_validate_gstreamer_runtime_and_caching(tmp_path, monkeypatch):
     fake_env = {"PATH": "C:\\fake\\bin"}
     monkeypatch.setattr(gstreamer_backend, "get_gstreamer_env", lambda d: fake_env)
 
-    mock_run = MagicMock()
-    mock_run.returncode = 0
-    mock_run.stdout = b"d3d11screencapturesrc d3d11convert"
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: mock_run)
+    inspected = []
+
+    def fake_run(cmd, **kwargs):
+        inspected.append(cmd)
+        result = MagicMock()
+        result.returncode = 0 if cmd[1] in {"d3d11screencapturesrc", "d3d11convert"} else 1
+        return result
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     ok, err = validate_gstreamer_runtime(str(rt_dir))
     assert ok is False
     assert "Missing required GStreamer elements" in err
 
     clear_validation_cache()
-    all_elems = " ".join(gstreamer_backend.REQUIRED_GSTREAMER_ELEMENTS)
-    mock_run.stdout = all_elems.encode("utf-8")
+    inspected.clear()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: MagicMock(returncode=0))
 
     ok, err = validate_gstreamer_runtime(str(rt_dir))
     assert ok is True
     assert err == "OK"
     assert validate_gstreamer_runtime(str(rt_dir)) == (True, "OK")
+
+
+def test_validate_gstreamer_runtime_inspects_elements_individually(tmp_path, monkeypatch):
+    clear_validation_cache()
+    bin_dir = tmp_path / "gst_rt" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "gst-launch-1.0.exe").touch()
+    (bin_dir / "gst-inspect-1.0.exe").touch()
+    monkeypatch.setattr(gstreamer_backend, "get_gstreamer_env", lambda d: {"PATH": "C:\\fake"})
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return MagicMock(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert validate_gstreamer_runtime(str(tmp_path / "gst_rt")) == (True, "OK")
+    assert [cmd[1] for cmd in calls] == gstreamer_backend.REQUIRED_GSTREAMER_ELEMENTS
+    assert all(len(cmd) == 2 for cmd in calls)
+    assert calls and calls[0][1] == "d3d11screencapturesrc"
 
 
 def test_argv_token_packing_and_caps_structure():
@@ -193,6 +218,43 @@ def test_argv_token_packing_and_caps_structure():
     assert len(caps_tokens) > 0
     for caps in caps_tokens:
         assert not any(c.isspace() for c in caps), f"Caps token '{caps}' contains whitespace!"
+
+
+def test_parse_wasapi_capture_devices_filters_render_endpoints():
+    output = """
+Device found:
+    name  : Microphone Test
+    properties:
+        device.api = wasapi2
+        device.id = {capture-id}
+        wasapi2.device.loopback = false (gboolean)
+Device found:
+    name  : Speakers Test
+    properties:
+        device.api = wasapi2
+        device.id = {render-id}
+        wasapi2.device.loopback = true (gboolean)
+"""
+    assert gstreamer_backend.parse_wasapi_capture_devices(output) == {
+        "Microphone Test": "{capture-id}",
+    }
+
+
+def test_build_plan_uses_resolved_wasapi_device_for_microphone(monkeypatch):
+    monkeypatch.setattr(
+        gstreamer_backend,
+        "resolve_wasapi_capture_device_id",
+        lambda runtime_dir, name: "{wasapi-mic-id}",
+    )
+    plan = build_gstreamer_screen_capture_plan(
+        runtime_dir="C:/gst",
+        mic_device="Microphone Test",
+        output_mode="hls",
+        hls_dir="C:/tmp/hls",
+    )
+    assert "wasapi2src" in plan.cmd
+    assert 'device="{wasapi-mic-id}"' in plan.cmd
+    assert "dshowaudiosrc" not in plan.cmd
 
 
 def test_rtmp_output_mode_mapping_and_bitrate(monkeypatch, tmp_path):

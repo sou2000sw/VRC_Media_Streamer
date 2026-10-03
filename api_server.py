@@ -11,6 +11,7 @@ import hmac
 from urllib.parse import urlparse, parse_qs
 from streamer_core import BASE_PATH, HLS_DIR, StreamerCore, log_print, is_video_url_or_file, is_image_url_or_file, enumerate_dshow_audio_devices, enumerate_capture_displays, enumerate_capture_windows
 from version import APP_VERSION
+from temporary_video import VideoDownloadError
 
 def _ui_html_candidates():
     """
@@ -1273,7 +1274,19 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_response(500, {"success": False, "message": "Streamer core not available"})
                 return
 
-            items = self.streamer_core.add_to_queue(url)
+            download = body_json.get("download", False)
+            if not isinstance(download, bool):
+                self.send_json_response(400, {"success": False, "message": "download must be a boolean"})
+                return
+            if download and not self.is_local_request():
+                self.send_json_response(403, {"success": False, "message": "動画のダウンロードはホストPCからのみ利用できます。"})
+                return
+            try:
+                items = (self.streamer_core.download_video_to_queue(url) if download
+                         else self.streamer_core.add_to_queue(url))
+            except VideoDownloadError as exc:
+                self.send_json_response(400, {"success": False, "message": str(exc)})
+                return
             log_print(f"[APIServer] add_to_queue returned {len(items)} items")
             if items:
                 self.send_json_response(200, {
@@ -1306,7 +1319,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
             is_local = self.is_local_request()
 
             # 破壊的・全消去操作は常にローカルホスト限定
-            if action in ("clear_queue", "clear_photos", "stop", "set_live_audio",
+            if action in ("clear_queue", "clear_photos", "stop", "set_live_audio", "set_live_audio_mixer",
                           "set_live_audio_app", "set_live_audio_bg_source",
                           "set_media_volume",
                           "set_screen_capture") and not is_local:
@@ -1326,7 +1339,7 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     return
 
             # 再生制御操作の権限チェック
-            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode", "set_live_audio", "set_live_audio_app", "set_live_audio_bg_source", "set_media_volume", "set_screen_capture") and not is_local:
+            if action in ("skip", "prev", "set_loop", "set_shuffle", "shuffle", "toggle_image_pause", "set_image_pause", "set_image_duration", "set_image_auto_advance", "set_radio_mode", "set_radio_bg_source", "set_playback_mode", "set_live_audio", "set_live_audio_mixer", "set_live_audio_app", "set_live_audio_bg_source", "set_media_volume", "set_screen_capture") and not is_local:
                 if not self.streamer_core.config.get("allow_web_playback_control", True):
                     self.send_json_response(403, {
                         "success": False,
@@ -1374,6 +1387,21 @@ class APIAndHLSHandler(http.server.SimpleHTTPRequestHandler):
                     "success": True,
                     "live_audio_app": res,
                     "message": "App audio capture settings updated."
+                })
+            elif action == "set_live_audio_mixer":
+                res = self.streamer_core.set_live_audio_mixer(
+                    mic_device=body_json.get("mic_device"),
+                    loopback_device=body_json.get("loopback_device"),
+                    mic_volume=body_json.get("mic_volume"),
+                    loopback_volume=body_json.get("loopback_volume"),
+                    app_enabled=body_json.get("app_enabled"),
+                    app_window_title=body_json.get("app_window_title"),
+                    app_volume=body_json.get("app_volume"),
+                )
+                self.send_json_response(200, {
+                    "success": True,
+                    "live_audio_mixer": res,
+                    "message": "Live audio mixer settings updated with one reload."
                 })
             elif action == "set_media_volume":
                 res = self.streamer_core.set_media_volume(body_json.get("volume"))

@@ -149,6 +149,12 @@ def test_topaz_sink_command_reencodes_within_limits():
     # 解像度・fps 固定でアイテム切替時のパラメータ変化を消す
     vf = cmd[cmd.index("-vf") + 1]
     assert "scale=1280:720" in vf and "fps=30" in vf
+    assert "setpts=PTS+0.150/TB" in vf, "音声のエンコード遅延ぶん映像を遅らせる"
+
+    core.config["rtmp_video_sync_delay_ms"] = 275
+    adjusted_cmd, _ = core.build_sink_command("topaz")
+    adjusted_vf = adjusted_cmd[adjusted_cmd.index("-vf") + 1]
+    assert "setpts=PTS+0.275/TB" in adjusted_vf
 
     # GOP は fps * gop_seconds で固定
     assert cmd[cmd.index("-g") + 1] == "60"
